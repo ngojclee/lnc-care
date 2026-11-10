@@ -9,6 +9,7 @@
         "lnc-portainer",
         "lnc-ssh",
         "lnc-internal-domain-config",
+        "lnc-caddy-fleet",
         "lnc-icon",
         "lnm-ui-ux",
         "lnm-care",

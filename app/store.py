@@ -476,6 +476,113 @@ CREATE TABLE IF NOT EXISTS delegation_nonces (
     PRIMARY KEY (organization_id, nonce)
 );
 
+CREATE TABLE IF NOT EXISTS bridge_nonces (
+    organization_id TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (organization_id, nonce)
+);
+
+CREATE TABLE IF NOT EXISTS hub_connection_links (
+    organization_id TEXT NOT NULL,
+    connection_id INTEGER NOT NULL,
+    hub_connection_id TEXT NOT NULL,
+    hub_revision INTEGER NOT NULL DEFAULT 1,
+    leased_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (organization_id, connection_id),
+    UNIQUE (organization_id, hub_connection_id),
+    FOREIGN KEY (organization_id, connection_id) REFERENCES provider_connections(organization_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS shop_connection_bindings (
+    organization_id TEXT NOT NULL,
+    shop_id INTEGER NOT NULL,
+    connection_id INTEGER NOT NULL,
+    PRIMARY KEY (organization_id, shop_id, connection_id),
+    FOREIGN KEY (organization_id, shop_id) REFERENCES shops(organization_id, id),
+    FOREIGN KEY (organization_id, connection_id) REFERENCES provider_connections(organization_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organization_id TEXT NOT NULL REFERENCES organizations(id),
+    channel_id INTEGER NOT NULL,
+    external_id TEXT NOT NULL,
+    participant_id TEXT NOT NULL DEFAULT '',
+    participant_name TEXT NOT NULL DEFAULT 'Customer',
+    status TEXT NOT NULL DEFAULT 'open'
+      CHECK (status IN ('open', 'pending_reply', 'replied', 'handed_off', 'closed')),
+    assigned_to TEXT NOT NULL DEFAULT '',
+    last_message_preview TEXT NOT NULL DEFAULT '',
+    unread_count INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (organization_id, channel_id, external_id),
+    UNIQUE (organization_id, id),
+    FOREIGN KEY (organization_id, channel_id) REFERENCES channels(organization_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organization_id TEXT NOT NULL REFERENCES organizations(id),
+    conversation_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    external_id TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'inbound'
+      CHECK (direction IN ('inbound', 'outbound')),
+    sender_id TEXT NOT NULL DEFAULT '',
+    sender_name TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'delivered',
+    created_at INTEGER NOT NULL,
+    UNIQUE (organization_id, channel_id, external_id),
+    UNIQUE (organization_id, id),
+    FOREIGN KEY (organization_id, conversation_id) REFERENCES conversations(organization_id, id),
+    FOREIGN KEY (organization_id, channel_id) REFERENCES channels(organization_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organization_id TEXT NOT NULL REFERENCES organizations(id),
+    shop_id INTEGER,
+    channel_id INTEGER,
+    source TEXT NOT NULL DEFAULT 'comment'
+      CHECK (source IN ('comment', 'dm', 'meta_lead_ad', 'manual')),
+    external_id TEXT NOT NULL DEFAULT '',
+    customer_name TEXT NOT NULL,
+    contact_handle TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL DEFAULT '',
+    intent_score REAL NOT NULL DEFAULT 80.0,
+    status TEXT NOT NULL DEFAULT 'new'
+      CHECK (status IN ('new', 'qualified', 'contacted', 'converted', 'archived')),
+    notes TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (organization_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS ticket_handoffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organization_id TEXT NOT NULL REFERENCES organizations(id),
+    shop_id INTEGER,
+    channel_id INTEGER,
+    comment_id INTEGER,
+    conversation_id INTEGER,
+    priority TEXT NOT NULL DEFAULT 'normal'
+      CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+    assignee TEXT NOT NULL DEFAULT 'care-team',
+    summary TEXT NOT NULL,
+    context_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'open'
+      CHECK (status IN ('open', 'acknowledged', 'resolved')),
+    created_by TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (organization_id, id)
+);
+
 CREATE TABLE IF NOT EXISTS write_operations (
     organization_id TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
@@ -893,13 +1000,160 @@ def inbox_summary(db: sqlite3.Connection, organization_id: str, shop_id: int | N
             (organization_id,),
         ).fetchall()
     ]
+    conv_where = "WHERE cv.organization_id=? AND cv.status IN ('open', 'pending_reply')"
+    conv_params: list = [organization_id]
+    if shop_id is not None:
+        conv_where += """ AND EXISTS (
+            SELECT 1 FROM channel_shop_bindings b
+            WHERE b.organization_id=cv.organization_id AND b.channel_id=cv.channel_id AND b.shop_id=?
+        )"""
+        conv_params.append(shop_id)
+    conversations_open = db.execute(
+        f"SELECT COUNT(*) AS cnt FROM conversations cv {conv_where}",
+        tuple(conv_params),
+    ).fetchone()["cnt"]
+
+    lead_where = "WHERE organization_id=? AND status IN ('new', 'qualified')"
+    lead_params: list = [organization_id]
+    if shop_id is not None:
+        lead_where += " AND shop_id=?"
+        lead_params.append(shop_id)
+    leads_new = db.execute(
+        f"SELECT COUNT(*) AS cnt FROM leads {lead_where}",
+        tuple(lead_params),
+    ).fetchone()["cnt"]
+
+    handoff_where = "WHERE organization_id=? AND status IN ('open', 'acknowledged')"
+    handoff_params: list = [organization_id]
+    if shop_id is not None:
+        handoff_where += " AND shop_id=?"
+        handoff_params.append(shop_id)
+    handoffs_open = db.execute(
+        f"SELECT COUNT(*) AS cnt FROM ticket_handoffs {handoff_where}",
+        tuple(handoff_params),
+    ).fetchone()["cnt"]
+
     return {
         "total": sum(by_status.values()),
         "by_status": by_status,
         "by_bucket": by_bucket,
         "assignment": assignment,
         "by_channel": by_channel,
+        "conversations_open": conversations_open,
+        "leads_new": leads_new,
+        "handoffs_open": handoffs_open,
     }
+
+
+def conversations_list(
+    db: sqlite3.Connection,
+    organization_id: str,
+    *,
+    shop_id: int | None = None,
+    channel_id: int | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    query = """
+        SELECT cv.*, c.name AS channel_name, c.provider, c.kind AS channel_kind, c.adapter, c.reply_policy
+        FROM conversations cv
+        JOIN channels c ON c.id=cv.channel_id AND c.organization_id=cv.organization_id
+        WHERE cv.organization_id=?
+    """
+    params: list = [organization_id]
+    if shop_id is not None:
+        query += """ AND EXISTS (
+            SELECT 1 FROM channel_shop_bindings b
+            WHERE b.organization_id=cv.organization_id AND b.channel_id=cv.channel_id AND b.shop_id=?
+        )"""
+        params.append(shop_id)
+    if channel_id is not None:
+        query += " AND cv.channel_id=?"
+        params.append(channel_id)
+    if status:
+        query += " AND cv.status=?"
+        params.append(status)
+    query += " ORDER BY cv.updated_at DESC, cv.id DESC LIMIT ?"
+    params.append(max(1, min(100, int(limit))))
+    return [dict(r) for r in db.execute(query, tuple(params)).fetchall()]
+
+
+def messages_list(
+    db: sqlite3.Connection,
+    organization_id: str,
+    conversation_id: int,
+    *,
+    limit: int = 50,
+) -> list[dict]:
+    rows = db.execute(
+        """SELECT m.*
+           FROM messages m
+           WHERE m.organization_id=? AND m.conversation_id=?
+           ORDER BY m.created_at ASC, m.id ASC LIMIT ?""",
+        (organization_id, conversation_id, max(1, min(200, int(limit)))),
+    ).fetchall()
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["attachments"] = json.loads(item.pop("attachments_json", "[]") or "[]")
+        out.append(item)
+    return out
+
+
+def leads_list(
+    db: sqlite3.Connection,
+    organization_id: str,
+    *,
+    shop_id: int | None = None,
+    channel_id: int | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    query = "SELECT * FROM leads WHERE organization_id=?"
+    params: list = [organization_id]
+    if shop_id is not None:
+        query += " AND shop_id=?"
+        params.append(shop_id)
+    if channel_id is not None:
+        query += " AND channel_id=?"
+        params.append(channel_id)
+    if status:
+        query += " AND status=?"
+        params.append(status)
+    query += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+    params.append(max(1, min(100, int(limit))))
+    out = []
+    for r in db.execute(query, tuple(params)).fetchall():
+        item = dict(r)
+        item["metadata"] = json.loads(item.pop("metadata_json", "{}") or "{}")
+        out.append(item)
+    return out
+
+
+def handoffs_list(
+    db: sqlite3.Connection,
+    organization_id: str,
+    *,
+    shop_id: int | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    query = "SELECT * FROM ticket_handoffs WHERE organization_id=?"
+    params: list = [organization_id]
+    if shop_id is not None:
+        query += " AND shop_id=?"
+        params.append(shop_id)
+    if status:
+        query += " AND status=?"
+        params.append(status)
+    query += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+    params.append(max(1, min(100, int(limit))))
+    out = []
+    for r in db.execute(query, tuple(params)).fetchall():
+        item = dict(r)
+        item["context"] = json.loads(item.pop("context_json", "{}") or "{}")
+        out.append(item)
+    return out
 
 
 def stats_series(

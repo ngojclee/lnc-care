@@ -14,9 +14,10 @@ from .vault import Vault
 
 
 class Connections:
-    def __init__(self, path: Path, org: str, vault: Vault, *, transport=None):
+    def __init__(self, path: Path, org: str, vault: Vault, *, transport=None, hub_client=None):
         self.path, self.org, self.vault = path, org, vault
         self.providers = Providers(transport)
+        self.hub_client = hub_client
         self._locks: dict[int, threading.RLock] = {}
         self._lock = threading.Lock()
 
@@ -141,6 +142,8 @@ class Connections:
                 provider,
                 {"revision": revision, "connections_invalidated": len(connected)},
             )
+        if self.hub_client is not None:
+            self.hub_client.try_push_app(self.path, self.org, provider, self.vault)
         return {"ok": True, "revision": revision}
 
     def start(self, connection_id: int, session_hash: str, base: str) -> dict:
@@ -267,6 +270,8 @@ class Connections:
                     str(connection["id"]),
                     {"provider": provider},
                 )
+            if self.hub_client is not None:
+                self.hub_client.try_push_connection(self.path, self.org, connection["id"], self.vault)
 
     def _disconnect(self, db, connection_id: int) -> None:
         db.execute(
@@ -296,14 +301,35 @@ class Connections:
 
     def discover(self, connection_id: int) -> dict:
         with self.lock(connection_id):
+            if self.hub_client is not None:
+                self.hub_client.ensure_fresh_token(self.path, self.org, self.vault, connection_id)
             with store.connect_readonly(self.path) as db:
                 connection = self.connection(db, connection_id)
+                link = db.execute(
+                    "SELECT hub_connection_id FROM hub_connection_links WHERE organization_id=? AND connection_id=?",
+                    (self.org, connection_id),
+                ).fetchone()
+                token = self.vault.get(db, self.org, "connection", str(connection_id))
+                if (
+                    not token
+                    and link
+                    and str(link["hub_connection_id"]).startswith("ads_bridge:")
+                    and self.hub_client is not None
+                    and self.hub_client.ads_bridge is not None
+                ):
+                    cached = [
+                        json.loads(r["channel_json"])
+                        for r in db.execute(
+                            "SELECT channel_json FROM discovered_channels WHERE organization_id=? AND connection_id=? ORDER BY external_id",
+                            (self.org, connection_id),
+                        ).fetchall()
+                    ]
+                    return {"channels": cached, "truncated": False}
                 app, secret = self.app(db, connection["provider"])
                 runtime = db.execute(
                     "SELECT * FROM connection_runtime WHERE organization_id=? AND connection_id=?",
                     (self.org, connection_id),
                 ).fetchone()
-                token = self.vault.get(db, self.org, "connection", str(connection_id))
                 if connection["state"] != "verified" or not token or not runtime:
                     raise ProviderError("reauthorization_required", 409)
                 revision = runtime["revision"]
@@ -455,6 +481,148 @@ class Connections:
             )
         return {"ok": True, "channel_id": channel_id}
 
+    def _fetch_posts_via_bridge(
+        self, shop_name: str, remote_cid: int, kind: str, external_id: str, limit: int
+    ) -> list[dict]:
+        assert self.hub_client is not None and self.hub_client.ads_bridge is not None
+        now = int(time.time())
+        if kind == "fb_page":
+            resp = self.hub_client.ads_bridge.platform_call(
+                shop=shop_name,
+                connection_id=remote_cid,
+                method="GET",
+                path=f"{external_id}/published_posts",
+                params={
+                    "fields": "id,message,permalink_url,created_time,attachments{media_type,url,media}",
+                    "limit": max(1, min(50, limit)),
+                },
+                use_page_token=True,
+                page_id=external_id,
+            )
+            rows = (resp.get("data") or {}).get("data") or []
+            out = []
+            for r in rows:
+                media = []
+                for att in (r.get("attachments") or {}).get("data") or []:
+                    img = ((att.get("media") or {}).get("image") or {}).get("src") or att.get("url")
+                    if img:
+                        media.append({"type": att.get("media_type", "photo"), "url": img})
+                out.append(
+                    {
+                        "external_id": str(r["id"]),
+                        "caption": r.get("message") or "",
+                        "permalink": r.get("permalink_url") or "",
+                        "kind": "post",
+                        "published_at": now,
+                        "media": media,
+                    }
+                )
+            return out
+        if kind == "ig_account":
+            resp = self.hub_client.ads_bridge.platform_call(
+                shop=shop_name,
+                connection_id=remote_cid,
+                method="GET",
+                path=f"{external_id}/media",
+                params={
+                    "fields": "id,caption,media_type,media_url,thumbnail_url,permalink,timestamp,like_count,comments_count",
+                    "limit": max(1, min(50, limit)),
+                },
+                use_page_token=False,
+            )
+            rows = (resp.get("data") or {}).get("data") or []
+            out = []
+            for r in rows:
+                m_url = r.get("media_url") or r.get("thumbnail_url")
+                media = [{"type": (r.get("media_type") or "IMAGE").lower(), "url": m_url}] if m_url else []
+                out.append(
+                    {
+                        "external_id": str(r["id"]),
+                        "caption": r.get("caption") or "",
+                        "permalink": r.get("permalink") or "",
+                        "kind": "reel" if r.get("media_type") == "VIDEO" else "post",
+                        "published_at": now,
+                        "media": media,
+                        "likes": int(r.get("like_count") or 0),
+                        "comments_count": int(r.get("comments_count") or 0),
+                    }
+                )
+            return out
+        return []
+
+    def _fetch_comments_via_bridge(
+        self,
+        shop_name: str,
+        remote_cid: int,
+        kind: str,
+        channel_external_id: str,
+        post_external_id: str,
+        limit: int,
+    ) -> list[dict]:
+        assert self.hub_client is not None and self.hub_client.ads_bridge is not None
+        now = int(time.time())
+        if kind == "fb_page":
+            resp = self.hub_client.ads_bridge.platform_call(
+                shop=shop_name,
+                connection_id=remote_cid,
+                method="GET",
+                path=f"{post_external_id}/comments",
+                params={
+                    "fields": "id,from,message,created_time,parent,is_hidden,comment_count,like_count",
+                    "filter": "stream",
+                    "limit": max(1, min(100, limit)),
+                },
+                use_page_token=True,
+                page_id=channel_external_id,
+            )
+            rows = (resp.get("data") or {}).get("data") or []
+            out = []
+            for r in rows:
+                frm = r.get("from") or {}
+                parent = (r.get("parent") or {}).get("id")
+                out.append(
+                    {
+                        "external_id": str(r["id"]),
+                        "parent_external_id": str(parent) if parent else None,
+                        "author_external_id": str(frm.get("id") or ""),
+                        "author_name": frm.get("name") or "Facebook User",
+                        "text": r.get("message") or "",
+                        "is_hidden": bool(r.get("is_hidden")),
+                        "like_count": int(r.get("like_count") or 0),
+                        "reply_count": int(r.get("comment_count") or 0),
+                        "created_at": now,
+                    }
+                )
+            return out
+        if kind == "ig_account":
+            resp = self.hub_client.ads_bridge.platform_call(
+                shop=shop_name,
+                connection_id=remote_cid,
+                method="GET",
+                path=f"{post_external_id}/comments",
+                params={
+                    "fields": "id,text,username,timestamp,hidden,like_count",
+                    "limit": max(1, min(100, limit)),
+                },
+                use_page_token=False,
+            )
+            rows = (resp.get("data") or {}).get("data") or []
+            return [
+                {
+                    "external_id": str(r["id"]),
+                    "parent_external_id": None,
+                    "author_external_id": str(r.get("username") or ""),
+                    "author_name": f"@{r['username']}" if r.get("username") else "Instagram User",
+                    "text": r.get("text") or "",
+                    "is_hidden": bool(r.get("hidden")),
+                    "like_count": int(r.get("like_count") or 0),
+                    "reply_count": 0,
+                    "created_at": now,
+                }
+                for r in rows
+            ]
+        return []
+
     def sync_channel(self, channel_id: int, *, post_limit: int = 10, comment_limit: int = 30) -> dict:
         """Bounded poller for a channel's posts, comments, snapshots, and AI evaluations."""
         with store.connect_readonly(self.path) as db:
@@ -467,18 +635,55 @@ class Connections:
             ch = dict(ch)
             if ch["adapter"] != "meta_api":
                 raise ProviderError("channel_adapter_requires_worker_lane", 409)
+
+        if ch["connection_id"] and self.hub_client is not None:
+            self.hub_client.ensure_fresh_token(
+                self.path, self.org, self.vault, int(ch["connection_id"])
+            )
+
+        token: str | None = None
+        bridge_ctx: tuple[str, int] | None = None
+        with store.connect_readonly(self.path) as db:
             tok_env = self.vault.get(
                 db, self.org, "channel_token", f"{ch['provider']}:{ch['external_id']}"
             )
             if not tok_env and ch["connection_id"]:
                 tok_env = self.vault.get(db, self.org, "connection", str(ch["connection_id"]))
-            if not tok_env or not tok_env.get("access_token"):
-                raise ProviderError("channel_token_missing", 409)
-            token = tok_env["access_token"]
+            if tok_env and tok_env.get("access_token"):
+                token = tok_env["access_token"]
+            elif (
+                ch["connection_id"]
+                and self.hub_client is not None
+                and self.hub_client.ads_bridge is not None
+            ):
+                link = db.execute(
+                    "SELECT hub_connection_id FROM hub_connection_links WHERE organization_id=? AND connection_id=?",
+                    (self.org, ch["connection_id"]),
+                ).fetchone()
+                srow = db.execute(
+                    """SELECT s.name FROM shops s
+                       JOIN channel_shop_bindings csb
+                         ON csb.organization_id=s.organization_id AND csb.shop_id=s.id
+                       WHERE csb.organization_id=? AND csb.channel_id=?
+                       ORDER BY s.id LIMIT 1""",
+                    (self.org, channel_id),
+                ).fetchone()
+                if link and str(link["hub_connection_id"]).startswith("ads_bridge:") and srow:
+                    remote_cid = int(str(link["hub_connection_id"]).split(":", 1)[1])
+                    bridge_ctx = (str(srow["name"]), remote_cid)
 
-        fetched_posts = self.providers.fetch_channel_posts(
-            ch["kind"], ch["external_id"], token, limit=post_limit
-        )
+        if not token and not bridge_ctx:
+            raise ProviderError("channel_token_missing", 409)
+
+        if token:
+            fetched_posts = self.providers.fetch_channel_posts(
+                ch["kind"], ch["external_id"], token, limit=post_limit
+            )
+        else:
+            assert bridge_ctx is not None
+            fetched_posts = self._fetch_posts_via_bridge(
+                bridge_ctx[0], bridge_ctx[1], ch["kind"], ch["external_id"], post_limit
+            )
         now = int(time.time())
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         posts_saved = 0
@@ -517,9 +722,20 @@ class Connections:
                 post_id = post_row["id"]
                 posts_saved += 1
 
-                fetched_comments = self.providers.fetch_post_comments(
-                    ch["kind"], p["external_id"], token, limit=comment_limit
-                )
+                if token:
+                    fetched_comments = self.providers.fetch_post_comments(
+                        ch["kind"], p["external_id"], token, limit=comment_limit
+                    )
+                else:
+                    assert bridge_ctx is not None
+                    fetched_comments = self._fetch_comments_via_bridge(
+                        bridge_ctx[0],
+                        bridge_ctx[1],
+                        ch["kind"],
+                        ch["external_id"],
+                        p["external_id"],
+                        comment_limit,
+                    )
                 db.execute(
                     """INSERT INTO post_snapshots
                        (organization_id, post_id, snapshot_date, reactions, comments_count, captured_at)
@@ -978,6 +1194,56 @@ def seed_demo_workspace(db, organization_id: str, actor: str = "owner") -> dict:
                ON CONFLICT(organization_id, adapter, runtime_profile_id) DO UPDATE SET
                 label=excluded.label, updated_at=excluded.updated_at""",
             (organization_id, shop_id, label, platform, role, adapter, prof_id, ip, country, health, r_budget, w_budget, now),
+        )
+
+    # Seed omnichannel conversations, messages, leads, and handoff tickets
+    db.execute(
+        """INSERT INTO conversations
+           (organization_id, channel_id, external_id, participant_id, participant_name,
+            status, assigned_to, last_message_preview, unread_count, updated_at)
+           VALUES (?, ?, 'conv_9001', '10008911201', 'Nguyen Hoang Oanh', 'open', '',
+                   'Shop ơi tư vấn thêm cho mình mẫu Almond size S nhé!', 1, ?)
+           ON CONFLICT(organization_id, channel_id, external_id) DO UPDATE SET
+            updated_at=excluded.updated_at""",
+        (organization_id, fb_cid, now - 600),
+    )
+    conv_id = db.execute(
+        "SELECT id FROM conversations WHERE organization_id=? AND channel_id=? AND external_id='conv_9001'",
+        (organization_id, fb_cid),
+    ).fetchone()["id"]
+    db.execute(
+        """INSERT INTO messages
+           (organization_id, conversation_id, channel_id, external_id, direction,
+            sender_id, sender_name, text, created_at)
+           VALUES (?, ?, ?, 'msg_9001_1', 'inbound', '10008911201', 'Nguyen Hoang Oanh',
+                   'Shop ơi tư vấn thêm cho mình mẫu Almond size S nhé!', ?)
+           ON CONFLICT(organization_id, channel_id, external_id) DO NOTHING""",
+        (organization_id, conv_id, fb_cid, now - 600),
+    )
+    if not db.execute(
+        "SELECT 1 FROM leads WHERE organization_id=? AND external_id='lead_demo_01'",
+        (organization_id,),
+    ).fetchone():
+        db.execute(
+            """INSERT INTO leads
+               (organization_id, shop_id, channel_id, source, external_id, customer_name,
+                contact_handle, intent_score, status, notes, created_at, updated_at)
+               VALUES (?, ?, ?, 'comment', 'lead_demo_01', 'Nguyen Hoang Oanh',
+                       'fb:10008911201', 92.5, 'qualified',
+                       'Interested in Royal Fantasy Almond size S + Paris 48h shipping', ?, ?)""",
+            (organization_id, shop_id, fb_cid, now, now),
+        )
+    if not db.execute(
+        "SELECT 1 FROM ticket_handoffs WHERE organization_id=? AND comment_id=?",
+        (organization_id, comment_ids[3]),
+    ).fetchone():
+        db.execute(
+            """INSERT INTO ticket_handoffs
+               (organization_id, shop_id, channel_id, comment_id, conversation_id, priority,
+                assignee, summary, status, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, NULL, 'high', 'fulfillment-eu',
+                       'Order #LC4829 tracking & thumb size exchange request', 'open', ?, ?, ?)""",
+            (organization_id, shop_id, fb_cid, comment_ids[3], actor, now, now),
         )
 
     # Seed one forensic evidence case from the hostile comment

@@ -224,3 +224,214 @@ def test_mcp_tools_execution_and_browser_write_guard(tmp_path, monkeypatch):
         ev_payload = json.loads(ev_res["result"]["content"][0]["text"])
         assert ev_payload["ok"] is True
         assert len(ev_payload["manifest_sha256"]) == 64
+
+
+def make_hub_headers(
+    scopes: list[str],
+    *,
+    client_id: str = "agent-care",
+    app_id: str = "",
+    aud: str = "lnc-care",
+    nonce: str | None = None,
+    secret: str = DEL_SECRET,
+) -> dict[str, str]:
+    ts = str(int(time.time()))
+    sorted_scopes = sorted(set(scopes))
+    n = nonce or f"hub_nonce_{secrets.token_urlsafe(18)}"
+    envelope = (
+        f"v4\n{aud}\n{client_id}\n{app_id}\n{ts}\n{n}\n{','.join(sorted_scopes)}"
+        if app_id
+        else f"v3\n{aud}\n{client_id}\n{ts}\n{n}\n{','.join(sorted_scopes)}"
+    )
+    sig = hmac.new(secret.encode(), envelope.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "Authorization": f"Bearer {BEARER}",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "x-mcp-hub-client-id": client_id,
+        "x-mcp-hub-client-scopes": ",".join(sorted_scopes),
+        "x-mcp-hub-client-timestamp": ts,
+        "x-mcp-hub-client-nonce": n,
+        "x-mcp-hub-client-signature": sig,
+    }
+    if app_id:
+        headers["x-mcp-hub-app-id"] = app_id
+    return headers
+
+
+def test_mcp_hub_wire_headers_v3_v4_no_trailing_slash_and_omnichannel_tools(tmp_path, monkeypatch):
+    import httpx
+    from app.mcp_gateway import McpGatewayConfig
+
+    monkeypatch.setenv("PROVIDER_WRITES_ENABLED", "true")
+
+    def fake_gw_handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "http://10.21.4.101:8380/mcp"
+        assert request.headers.get("authorization") == "Bearer lnc_k_care_svc_key"
+        rpc = json.loads(request.content.decode())
+        assert rpc["method"] == "tools/call"
+        assert rpc["params"]["name"] == "ads__page_posts_list"
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": rpc["id"],
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {"shop": "LuxeClaw", "posts": [{"id": "235513372986478_901", "ad_id": "ad_77"}]}
+                            ),
+                        }
+                    ]
+                },
+            },
+        )
+
+    app = create_app(
+        db_path=tmp_path / "mcp_hub.db",
+        master_key=KEY,
+        management_key=MGMT,
+        mcp_bearer_token=BEARER,
+        delegation_secret=DEL_SECRET,
+        mcp_gateway_config=McpGatewayConfig(
+            gateway_url="http://10.21.4.101:8380/mcp",
+            api_key="lnc_k_care_svc_key",
+        ),
+        mcp_gateway_transport=httpx.MockTransport(fake_gw_handler),
+    )
+
+    with TestClient(app) as client:
+        csrf = client.post("/api/auth/login", json={"key": MGMT}).json()["csrf"]
+        all_scopes = [
+            "care:read",
+            "care:read:meta",
+            "care:write",
+            "care:write:meta",
+        ]
+        client.post(
+            "/api/settings",
+            headers={"X-CSRF-Token": csrf},
+            json={"mcp_max_scopes": all_scopes},
+        )
+        client.post("/api/admin/seed-demo", headers={"X-CSRF-Token": csrf})
+
+        # 1. POST /mcp (NO trailing slash!) responds 200 directly with Business MCP Hub v3 headers
+        fixed_nonce = "hub_v3_replay_nonce_1234567890"
+        r_v3 = client.post(
+            "/mcp",
+            headers=make_hub_headers(["care:read"], nonce=fixed_nonce),
+            json={"jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": {}},
+            follow_redirects=False,
+        )
+        assert r_v3.status_code == 200
+        read_tools = {t["name"] for t in r_v3.json()["result"]["tools"]}
+        assert {
+            "shops_list",
+            "channels_list",
+            "conversations_list",
+            "messages_list",
+            "leads_list",
+            "handoffs_list",
+            "ads_context_lookup",
+        }.issubset(read_tools)
+
+        # Replay of same Hub nonce is rejected with 403
+        r_replay = client.post(
+            "/mcp",
+            headers=make_hub_headers(["care:read"], nonce=fixed_nonce),
+            json={"jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {}},
+        )
+        assert r_replay.status_code == 403
+
+        # 2. Business MCP Hub v4 headers (`x-mcp-hub-app-id`) + omnichannel & cross-app tools
+        convs_resp = client.post(
+            "/mcp",
+            headers=make_hub_headers(all_scopes, app_id="lnc-agent-hub"),
+            json={"jsonrpc": "2.0", "id": 12, "method": "tools/call", "params": {"name": "conversations_list", "arguments": {}}},
+        ).json()
+        convs = json.loads(convs_resp["result"]["content"][0]["text"])["conversations"]
+        assert len(convs) >= 1
+        conv_id = convs[0]["id"]
+
+        msg_rep = client.post(
+            "/mcp",
+            headers=make_hub_headers(all_scopes, app_id="lnc-agent-hub"),
+            json={
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "tools/call",
+                "params": {
+                    "name": "message_reply",
+                    "arguments": {
+                        "conversation_id": conv_id,
+                        "text": "Bonjour ! Voici le guide des tailles Almond S.",
+                        "idempotency_key": "idem-msg-001",
+                    },
+                },
+            },
+        ).json()
+        assert json.loads(msg_rep["result"]["content"][0]["text"])["ok"] is True
+
+        lead_res = client.post(
+            "/mcp",
+            headers=make_hub_headers(all_scopes, app_id="lnc-agent-hub"),
+            json={
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "tools/call",
+                "params": {
+                    "name": "lead_upsert",
+                    "arguments": {
+                        "customer_name": "Claire Dubois",
+                        "source": "dm",
+                        "contact_handle": "@claire.paris",
+                        "status": "qualified",
+                    },
+                },
+            },
+        ).json()
+        assert json.loads(lead_res["result"]["content"][0]["text"])["ok"] is True
+
+        handoff_res = client.post(
+            "/mcp",
+            headers=make_hub_headers(all_scopes, app_id="lnc-agent-hub"),
+            json={
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "tools/call",
+                "params": {
+                    "name": "ticket_handoff",
+                    "arguments": {
+                        "summary": "VIP custom bridal press-on sizing consultation",
+                        "priority": "high",
+                        "conversation_id": conv_id,
+                    },
+                },
+            },
+        ).json()
+        assert json.loads(handoff_res["result"]["content"][0]["text"])["ok"] is True
+
+        # 3. Cross-app `ads__*` lookup routed strictly via `LNC_MCP_GATEWAY_URL`
+        ads_res = client.post(
+            "/mcp",
+            headers=make_hub_headers(["care:read"], app_id="lnc-agent-hub"),
+            json={
+                "jsonrpc": "2.0",
+                "id": 16,
+                "method": "tools/call",
+                "params": {
+                    "name": "ads_context_lookup",
+                    "arguments": {
+                        "tool_name": "ads__page_posts_list",
+                        "arguments": {"shop": "LuxeClaw"},
+                    },
+                },
+            },
+        ).json()
+        ads_payload = json.loads(ads_res["result"]["content"][0]["text"])
+        assert ads_payload["ok"] is True
+        assert ads_payload["data"]["shop"] == "LuxeClaw"
+        assert ads_payload["data"]["posts"][0]["ad_id"] == "ad_77"
+

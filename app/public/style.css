@@ -149,7 +149,23 @@ h3 { font-size: 13px; }
   padding-bottom: 12px;
   border-bottom: 1px solid var(--border);
 }
-.topbar-right { display: flex; gap: 8px; flex-wrap: wrap; }
+.topbar-right { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.sso-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: opacity 0.15s ease;
+}
+.sso-btn:hover { opacity: 0.86; }
+.sso-btn[hidden] { display: none; }
 .badge {
   border: 1px solid var(--border);
   background: var(--panel);

@@ -1,10 +1,18 @@
-"""MCP connector boundary for Business MCP Hub (audience: lnc-care, namespace: care__*)."""
+"""MCP connector boundary for Business MCP Hub (audience: lnc-care, namespace: care__*).
+
+Supports both:
+1. Canonical Business MCP Hub v3/v4 delegation headers (`x-mcp-hub-client-id`,
+   `x-mcp-hub-client-scopes`, `x-mcp-hub-client-timestamp`, `x-mcp-hub-client-nonce`,
+   `x-mcp-hub-client-signature`, optional `x-mcp-hub-app-id`).
+2. Compact `X-LNC-Delegation` v3/v4 HMAC-signed token header.
+"""
 import base64
 import contextvars
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -14,9 +22,23 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
-from . import audit, connections, evaluator, settings, store, worker
+from . import audit, connections, evaluator, mcp_gateway as gw_mod, settings, store, worker
 
 AUDIENCE = "lnc-care"
+CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$")
+APP_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+SCOPE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._*-]{0,63}$")
+NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,128}$")
+HUB_DELEGATION_HEADERS = (
+    "x-mcp-hub-client-id",
+    "x-mcp-hub-client-scopes",
+    "x-mcp-hub-client-timestamp",
+    "x-mcp-hub-client-nonce",
+    "x-mcp-hub-client-signature",
+)
+MAX_HUB_SKEW_SECONDS = 90
+NONCE_TTL_SECONDS = 300
+
 SCOPES = {
     "care:read",
     "care:read:meta",
@@ -28,23 +50,35 @@ SCOPES = {
     "care:write:youtube",
 }
 TOOL_SCOPES = {
+    # Read tools (`care:read`)
+    "shops_list": {"care:read"},
     "channels_list": {"care:read"},
     "posts_list": {"care:read"},
     "post_get": {"care:read"},
     "comments_list": {"care:read"},
     "comment_thread": {"care:read"},
+    "conversations_list": {"care:read"},
+    "messages_list": {"care:read"},
+    "leads_list": {"care:read"},
+    "handoffs_list": {"care:read"},
     "stats_series": {"care:read"},
     "inbox_summary": {"care:read"},
     "evidence_case_get": {"care:read"},
+    "ads_context_lookup": {"care:read"},
+    # Internal triage / CRM / forensic write tools (`care:read`, `care:write`)
     "comment_evaluate": {"care:read", "care:write"},
     "evaluation_feedback_set": {"care:read", "care:write"},
     "comment_flag_set": {"care:read", "care:write"},
     "reply_draft_create": {"care:read", "care:write"},
+    "lead_upsert": {"care:read", "care:write"},
+    "ticket_handoff": {"care:read", "care:write"},
     "archive_request": {"care:read", "care:write"},
     "evidence_capture": {"care:read", "care:write"},
+    # Guarded external provider write tools (`care:read`, `care:write` + `care:write:<provider>`)
     "comment_reply": {"care:read", "care:write"},
     "comment_hide_set": {"care:read", "care:write"},
     "comment_private_reply": {"care:read", "care:write"},
+    "message_reply": {"care:read", "care:write"},
 }
 _caller: contextvars.ContextVar[dict] = contextvars.ContextVar("mcp_caller")
 
@@ -57,6 +91,78 @@ def canonical_json(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _claim_nonce(path: Path, org: str, nonce: str, expires_at: int) -> None:
+    now = int(time.time())
+    with store.connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "DELETE FROM delegation_nonces WHERE organization_id=? AND expires_at<=?",
+            (org, now),
+        )
+        try:
+            db.execute(
+                "INSERT INTO delegation_nonces (organization_id, nonce, expires_at) VALUES (?, ?, ?)",
+                (org, nonce, expires_at),
+            )
+        except Exception as exc:
+            raise DelegationError("Replayed delegation nonce") from exc
+
+
+def _verify_hub_headers(
+    path: Path,
+    org: str,
+    headers: dict[str, str],
+    secret: str,
+    max_scopes: list[str],
+    audience: str = AUDIENCE,
+) -> dict:
+    if not secret:
+        raise DelegationError("Delegation secret is not configured")
+    if any(not headers.get(name) for name in HUB_DELEGATION_HEADERS):
+        raise DelegationError("Incomplete Business MCP Hub delegation headers")
+    client_id = headers["x-mcp-hub-client-id"].strip()
+    app_id = headers.get("x-mcp-hub-app-id", "").strip()
+    if not CLIENT_ID_PATTERN.fullmatch(client_id) or (
+        app_id and not APP_ID_PATTERN.fullmatch(app_id)
+    ):
+        raise DelegationError("Invalid delegation client_id or app_id")
+
+    raw_scopes = headers["x-mcp-hub-client-scopes"]
+    scopes = sorted({s.strip() for s in raw_scopes.split(",") if s.strip()})
+    if not scopes or not all(SCOPE_PATTERN.fullmatch(s) for s in scopes):
+        raise DelegationError("Invalid delegation scopes")
+
+    nonce = headers["x-mcp-hub-client-nonce"].strip()
+    if not NONCE_PATTERN.fullmatch(nonce):
+        raise DelegationError("Invalid delegation nonce")
+
+    try:
+        timestamp = int(headers["x-mcp-hub-client-timestamp"].strip())
+    except ValueError as exc:
+        raise DelegationError("Invalid delegation timestamp") from exc
+
+    now = int(time.time())
+    if abs(now - timestamp) > MAX_HUB_SKEW_SECONDS:
+        raise DelegationError("Delegation timestamp expired or skewed")
+
+    if not set(scopes) <= set(max_scopes):
+        raise DelegationError("Delegated scopes exceed connector max_scopes")
+
+    envelope = (
+        f"v4\n{audience}\n{client_id}\n{app_id}\n{timestamp}\n{nonce}\n{','.join(scopes)}"
+        if app_id
+        else f"v3\n{audience}\n{client_id}\n{timestamp}\n{nonce}\n{','.join(scopes)}"
+    )
+    expected = hmac.new(secret.encode(), envelope.encode(), hashlib.sha256).hexdigest()
+    provided_sig = headers["x-mcp-hub-client-signature"].strip().lower()
+    if not hmac.compare_digest(expected, provided_sig):
+        raise DelegationError("Invalid delegation signature")
+
+    _claim_nonce(path, org, nonce, now + NONCE_TTL_SECONDS)
+    effective = sorted(set(scopes) & set(max_scopes) & SCOPES)
+    return {"sub": client_id, "app_id": app_id, "scopes": effective}
+
+
 def verify_delegation(
     path: Path,
     org: str,
@@ -64,11 +170,17 @@ def verify_delegation(
     secret: str,
     require_delegation: bool,
     max_scopes: list[str],
+    *,
+    headers: dict[str, str] | None = None,
+    audience: str = AUDIENCE,
 ) -> dict:
+    if headers and any(k in headers for k in HUB_DELEGATION_HEADERS):
+        return _verify_hub_headers(path, org, headers, secret, max_scopes, audience=audience)
+
     if not header:
         if require_delegation:
             raise DelegationError("Missing X-LNC-Delegation")
-        return {"sub": "direct-bearer", "scopes": sorted(set(max_scopes) & SCOPES)}
+        return {"sub": "direct-bearer", "app_id": "", "scopes": sorted(set(max_scopes) & SCOPES)}
     if not secret:
         raise DelegationError("Delegation secret is not configured")
     try:
@@ -88,7 +200,7 @@ def verify_delegation(
             raise DelegationError("Invalid delegation signature")
 
     now = int(time.time())
-    if payload.get("v") not in (3, 4) or payload.get("iss") != "lnc-v3" or payload.get("aud") != AUDIENCE:
+    if payload.get("v") not in (3, 4) or payload.get("iss") != "lnc-v3" or payload.get("aud") != audience:
         raise DelegationError("Invalid delegation claims")
     if not payload.get("sub") or not payload.get("nonce"):
         raise DelegationError("Missing delegation identity or nonce")
@@ -98,24 +210,11 @@ def verify_delegation(
 
     raw_scopes = payload.get("scopes") or payload.get("scope") or []
     if isinstance(raw_scopes, str):
-        raw_scopes = raw_scopes.split()
+        raw_scopes = raw_scopes.replace(",", " ").split()
     effective = sorted(set(raw_scopes) & set(max_scopes) & SCOPES)
 
-    with store.connect(path) as db:
-        db.execute("BEGIN IMMEDIATE")
-        db.execute(
-            "DELETE FROM delegation_nonces WHERE organization_id=? AND expires_at<=?",
-            (org, now),
-        )
-        try:
-            db.execute(
-                "INSERT INTO delegation_nonces (organization_id, nonce, expires_at) VALUES (?, ?, ?)",
-                (org, str(payload["nonce"]), exp),
-            )
-        except Exception as exc:
-            raise DelegationError("Replayed delegation nonce") from exc
-
-    return {"sub": str(payload["sub"]), "scopes": effective}
+    _claim_nonce(path, org, str(payload["nonce"]), exp)
+    return {"sub": str(payload["sub"]), "app_id": str(payload.get("app_id") or ""), "scopes": effective}
 
 
 def _require_tool_scopes(tool: str, extra: set[str] | None = None) -> dict:
@@ -180,6 +279,60 @@ def _guarded_comment_write(
         return result
 
 
+def _guarded_conversation_write(
+    path: Path,
+    org: str,
+    tool: str,
+    conversation_id: int,
+    idempotency_key: str,
+    request_payload: dict,
+    writes_enabled: bool,
+    fn,
+) -> dict:
+    if not idempotency_key or len(idempotency_key.strip()) < 6:
+        raise ValueError("idempotency_key_required")
+    req_hash = hashlib.sha256(canonical_json(request_payload).encode()).hexdigest()
+
+    with store.connect_readonly(path) as db:
+        conv = db.execute(
+            """SELECT cv.*, c.provider, c.adapter, c.approved, c.reply_policy
+               FROM conversations cv
+               JOIN channels c ON c.id=cv.channel_id AND c.organization_id=cv.organization_id
+               WHERE cv.organization_id=? AND cv.id=?""",
+            (org, conversation_id),
+        ).fetchone()
+        if not conv or not conv["approved"]:
+            raise ValueError("conversation_or_channel_not_authorized")
+        conv = dict(conv)
+
+    if conv["adapter"] != "meta_api":
+        raise ValueError("channel_adapter_unsupported")
+
+    caller = _require_tool_scopes(tool, {f"care:write:{conv['provider']}"})
+
+    with store.connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        existing = db.execute(
+            "SELECT * FROM write_operations WHERE organization_id=? AND idempotency_key=?",
+            (org, idempotency_key),
+        ).fetchone()
+        if existing:
+            if existing["tool"] != tool or existing["request_hash"] != req_hash:
+                raise ValueError("idempotency_key_conflict")
+            if existing["result_json"]:
+                return json.loads(existing["result_json"])
+        if not writes_enabled:
+            raise ValueError("provider_writes_disabled")
+        result = fn(db, caller, conv)
+        db.execute(
+            """INSERT OR REPLACE INTO write_operations
+               (organization_id, idempotency_key, tool, request_hash, result_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (org, idempotency_key, tool, req_hash, json.dumps(result), int(time.time())),
+        )
+        return result
+
+
 def build_mcp_asgi(
     path: Path,
     org: str,
@@ -187,14 +340,24 @@ def build_mcp_asgi(
     delegation_secret: str,
     require_delegation: bool,
     writes_enabled: bool = False,
+    *,
+    mcp_gateway: gw_mod.McpGatewayClient | None = None,
+    audience: str = AUDIENCE,
 ):
     mcp = FastMCP(
-        AUDIENCE,
+        audience,
         stateless_http=True,
         json_response=True,
         streamable_http_path="/",
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
+
+    @mcp.tool()
+    def shops_list() -> dict:
+        """List shop scopes synchronized across LNC Care, LNC Agent Hub, and LNC Ads."""
+        _require_tool_scopes("shops_list")
+        with store.connect_readonly(path) as db:
+            return {"shops": store.shops(db, org)}
 
     @mcp.tool()
     def channels_list(shop_id: int | None = None, approved_only: bool = True) -> dict:
@@ -269,6 +432,75 @@ def build_mcp_asgi(
             return {"thread": thread}
 
     @mcp.tool()
+    def conversations_list(
+        shop_id: int | None = None,
+        channel_id: int | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        """List customer Messenger / Instagram DM conversations in LNC Care."""
+        _require_tool_scopes("conversations_list")
+        with store.connect_readonly(path) as db:
+            return {
+                "conversations": store.conversations_list(
+                    db,
+                    org,
+                    shop_id=shop_id,
+                    channel_id=channel_id,
+                    status=status,
+                    limit=min(100, max(1, limit)),
+                )
+            }
+
+    @mcp.tool()
+    def messages_list(conversation_id: int, limit: int = 50) -> dict:
+        """List chronological inbound and outbound messages for a conversation."""
+        _require_tool_scopes("messages_list")
+        with store.connect_readonly(path) as db:
+            conv = db.execute(
+                "SELECT * FROM conversations WHERE organization_id=? AND id=?",
+                (org, conversation_id),
+            ).fetchone()
+            if not conv:
+                raise ValueError("conversation_not_found")
+            return {
+                "conversation": dict(conv),
+                "messages": store.messages_list(
+                    db, org, conversation_id, limit=min(200, max(1, limit))
+                ),
+            }
+
+    @mcp.tool()
+    def leads_list(
+        shop_id: int | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        """List captured consultation leads across social comments, DMs, and Meta lead ads."""
+        _require_tool_scopes("leads_list")
+        with store.connect_readonly(path) as db:
+            return {
+                "leads": store.leads_list(
+                    db, org, shop_id=shop_id, status=status, limit=min(100, max(1, limit))
+                )
+            }
+
+    @mcp.tool()
+    def handoffs_list(
+        shop_id: int | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        """List human operator escalation / fulfillment handoff tickets."""
+        _require_tool_scopes("handoffs_list")
+        with store.connect_readonly(path) as db:
+            return {
+                "handoffs": store.handoffs_list(
+                    db, org, shop_id=shop_id, status=status, limit=min(100, max(1, limit))
+                )
+            }
+
+    @mcp.tool()
     def stats_series(
         channel_id: int | None = None,
         post_id: int | None = None,
@@ -281,7 +513,7 @@ def build_mcp_asgi(
 
     @mcp.tool()
     def inbox_summary(shop_id: int | None = None) -> dict:
-        """Get comment counts by status, AI triage bucket, assignment, and channel."""
+        """Get comment, conversation, lead, and handoff counts by status, bucket, and channel."""
         _require_tool_scopes("inbox_summary")
         with store.connect_readonly(path) as db:
             return store.inbox_summary(db, org, shop_id=shop_id)
@@ -308,6 +540,14 @@ def build_mcp_asgi(
                 ).fetchall()
             ]
             return {"case": dict(case_row), "items": items}
+
+    @mcp.tool()
+    def ads_context_lookup(tool_name: str, arguments: dict | None = None) -> dict:
+        """Query sibling `ads__*` tools via unified `LNC-Agent-Hub (/mcp) -> Business MCP Hub (:8790/mcp) -> lnc-ads (/mcp)`."""
+        _require_tool_scopes("ads_context_lookup")
+        if mcp_gateway is None:
+            raise ValueError("mcp_gateway_not_configured")
+        return mcp_gateway.call_tool(tool_name, arguments or {})
 
     @mcp.tool()
     def comment_evaluate(comment_id: int, threshold: int | None = None) -> dict:
@@ -444,6 +684,143 @@ def build_mcp_asgi(
                 {"comment_id": comment_id, "kind": kind},
             )
         return {"ok": True, "draft_id": draft_id, "comment_id": comment_id, "kind": kind, "status": "draft"}
+
+    @mcp.tool()
+    def lead_upsert(
+        customer_name: str,
+        source: Literal["comment", "dm", "meta_lead_ad", "manual"] = "comment",
+        shop_id: int | None = None,
+        channel_id: int | None = None,
+        external_id: str = "",
+        contact_handle: str = "",
+        phone: str = "",
+        email: str = "",
+        intent_score: float = 85.0,
+        status: Literal["new", "qualified", "contacted", "converted", "archived"] = "new",
+        notes: str = "",
+    ) -> dict:
+        """Create or update a consultation lead captured from social comments, DMs, or Meta lead forms."""
+        caller = _require_tool_scopes("lead_upsert")
+        clean_name = customer_name.strip()
+        if not clean_name:
+            raise ValueError("customer_name_required")
+        now = int(time.time())
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = None
+            if external_id.strip():
+                existing = db.execute(
+                    "SELECT id FROM leads WHERE organization_id=? AND external_id=?",
+                    (org, external_id.strip()),
+                ).fetchone()
+            if existing:
+                lead_id = int(existing["id"])
+                db.execute(
+                    """UPDATE leads
+                       SET customer_name=?, contact_handle=?, phone=?, email=?,
+                           intent_score=?, status=?, notes=?, updated_at=?
+                       WHERE organization_id=? AND id=?""",
+                    (
+                        clean_name,
+                        contact_handle.strip(),
+                        phone.strip(),
+                        email.strip(),
+                        float(intent_score),
+                        status,
+                        notes.strip(),
+                        now,
+                        org,
+                        lead_id,
+                    ),
+                )
+            else:
+                cur = db.execute(
+                    """INSERT INTO leads
+                       (organization_id, shop_id, channel_id, source, external_id, customer_name,
+                        contact_handle, phone, email, intent_score, status, notes, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        org,
+                        shop_id,
+                        channel_id,
+                        source,
+                        external_id.strip(),
+                        clean_name,
+                        contact_handle.strip(),
+                        phone.strip(),
+                        email.strip(),
+                        float(intent_score),
+                        status,
+                        notes.strip(),
+                        now,
+                        now,
+                    ),
+                )
+                lead_id = int(cur.lastrowid)
+            audit.append(
+                db,
+                org,
+                f"mcp:{caller['sub']}",
+                "lead.upserted",
+                str(lead_id),
+                {"source": source, "status": status},
+            )
+        return {"ok": True, "lead_id": lead_id, "status": status}
+
+    @mcp.tool()
+    def ticket_handoff(
+        summary: str,
+        priority: Literal["low", "normal", "high", "urgent"] = "normal",
+        assignee: str = "care-team",
+        shop_id: int | None = None,
+        channel_id: int | None = None,
+        comment_id: int | None = None,
+        conversation_id: int | None = None,
+        context: dict | None = None,
+    ) -> dict:
+        """Create an audited human operator escalation or fulfillment handoff ticket."""
+        caller = _require_tool_scopes("ticket_handoff")
+        clean_summary = summary.strip()
+        if not clean_summary:
+            raise ValueError("handoff_summary_required")
+        now = int(time.time())
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute(
+                """INSERT INTO ticket_handoffs
+                   (organization_id, shop_id, channel_id, comment_id, conversation_id,
+                    priority, assignee, summary, context_json, status, created_by, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
+                (
+                    org,
+                    shop_id,
+                    channel_id,
+                    comment_id,
+                    conversation_id,
+                    priority,
+                    assignee.strip() or "care-team",
+                    clean_summary,
+                    json.dumps(context or {}, ensure_ascii=False),
+                    f"mcp:{caller['sub']}",
+                    now,
+                    now,
+                ),
+            )
+            ticket_id = int(cur.lastrowid)
+            if conversation_id is not None:
+                db.execute(
+                    "UPDATE conversations SET status='handed_off', assigned_to=?, updated_at=? WHERE organization_id=? AND id=?",
+                    (assignee.strip() or "care-team", now, org, conversation_id),
+                )
+            audit.append(
+                db,
+                org,
+                f"mcp:{caller['sub']}",
+                "ticket.handed_off",
+                str(ticket_id),
+                {"priority": priority, "assignee": assignee, "comment_id": comment_id, "conversation_id": conversation_id},
+            )
+        return {"ok": True, "handoff_id": ticket_id, "priority": priority, "status": "open"}
 
     @mcp.tool()
     def archive_request(post_id: int, include_screenshot: bool = True) -> dict:
@@ -639,6 +1016,55 @@ def build_mcp_asgi(
             _exec,
         )
 
+    @mcp.tool()
+    def message_reply(conversation_id: int, text: str, idempotency_key: str) -> dict:
+        """Send an audited outbound Messenger / Instagram DM reply in an active conversation."""
+        clean_text = text.strip()
+        if not clean_text:
+            raise ValueError("message_text_required")
+
+        def _exec(db, caller, conv):
+            now = int(time.time())
+            ext_id = f"out_msg_{conversation_id}_{now}_{secrets.token_hex(3)}"
+            cur = db.execute(
+                """INSERT INTO messages
+                   (organization_id, conversation_id, channel_id, external_id, direction,
+                    sender_id, sender_name, text, status, created_at)
+                   VALUES (?, ?, ?, ?, 'outbound', ?, 'LNC Care', ?, 'sent', ?)""",
+                (org, conversation_id, conv["channel_id"], ext_id, f"mcp:{caller['sub']}", clean_text, now),
+            )
+            db.execute(
+                """UPDATE conversations
+                   SET status='replied', last_message_preview=?, unread_count=0, updated_at=?
+                   WHERE organization_id=? AND id=?""",
+                (clean_text[:200], now, org, conversation_id),
+            )
+            audit.append(
+                db,
+                org,
+                f"mcp:{caller['sub']}",
+                "conversation.message_replied",
+                str(conversation_id),
+                {"message_id": cur.lastrowid, "idempotency_key": idempotency_key},
+            )
+            return {
+                "ok": True,
+                "message_id": cur.lastrowid,
+                "conversation_id": conversation_id,
+                "status": "replied",
+            }
+
+        return _guarded_conversation_write(
+            path,
+            org,
+            "message_reply",
+            conversation_id,
+            idempotency_key,
+            {"conversation_id": conversation_id, "text": clean_text},
+            writes_enabled,
+            _exec,
+        )
+
     inner = mcp.streamable_http_app()
 
     async def app(scope, receive, send):
@@ -664,6 +1090,8 @@ def build_mcp_asgi(
                 delegation_secret,
                 require_delegation,
                 cfg["mcp_max_scopes"],
+                headers=headers,
+                audience=audience,
             )
         except DelegationError as exc:
             await JSONResponse({"error": str(exc)}, status_code=403)(scope, receive, send)

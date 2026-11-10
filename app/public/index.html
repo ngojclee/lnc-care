@@ -61,9 +61,11 @@
           <h1 id="view-title">Triage &amp; Consultation Queue</h1>
         </div>
         <div class="topbar-right">
+          <a id="sso-hub-link" href="/api/auth/sso/redirect?peer=lnc-agent-hub" class="sso-btn" hidden>Open Agent Hub &#8599;</a>
+          <a id="sso-ads-link" href="/api/auth/sso/redirect?peer=lnc-ads" class="sso-btn" hidden>Open LNC Ads &#8599;</a>
           <span class="badge" id="vault-badge">Vault verified</span>
           <span class="badge" id="writes-badge">Draft-for-approval</span>
-          <span class="badge mono" id="version-badge">v0.1.0.0</span>
+          <span class="badge mono" id="version-badge">v0.2.0.0</span>
         </div>
       </header>
 
@@ -266,6 +268,27 @@
 
       <!-- 6. CHANNELS & OAUTH -->
       <section class="view" data-view="channels" hidden>
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Shared Ecosystem Vault &amp; Channel Broker</h2>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button type="button" id="hub-sync-btn" class="primary">Sync Shared Vault &amp; Channels</button>
+            </div>
+          </div>
+          <div class="pad stack-sm">
+            <div id="hub-sync-summary" class="muted">Checking LNC Agent Hub &amp; LNC Ads LAN Bridge status...</div>
+            <form id="shared-oauth-form" class="inline-form">
+              <select name="provider">
+                <option value="meta">Meta (Facebook &amp; Instagram + Care Scopes)</option>
+                <option value="tiktok">TikTok Business (+ Comment Scopes)</option>
+              </select>
+              <input name="shop" id="shared-oauth-shop" placeholder="Shop name (e.g. LuxeClaw)" required>
+              <input name="label" placeholder="Connection label (optional)">
+              <button type="submit" class="ghost">Connect Shared Account &#8599;</button>
+            </form>
+          </div>
+        </div>
+
         <div class="split">
           <div class="panel">
             <div class="panel-header">

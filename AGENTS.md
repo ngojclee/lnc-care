@@ -1,6 +1,6 @@
 # LNC Care project instructions
 
-Status: LIVE ON PORTAINER `10.21.4.101:8482` (2026-11-10, `VERSION 0.1.0.1`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, 11/11 `pytest` passing). Read `.docs/handoff.md` first, then `.docs/plan.md`, `.docs/multi-account-antidetect-plan.md`, and `.docs/task.md`.
+Status: LIVE ON PORTAINER `10.21.4.101:8482` & `https://care-mcp.lengoc.me` (2026-11-10, `VERSION 0.2.0.0`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, FR Caddy Fleet + FR/VN Unbound DNS live, LNC-Agent-Hub + Business MCP Hub + LNC Ads v1.2.0 ecosystem-aligned, 15/15 `pytest` passing). Read `.docs/handoff.md` first, then `.docs/plan.md`, `.docs/multi-account-antidetect-plan.md`, and `.docs/task.md`.
 
 Purpose: care console for OWNED social channels (Facebook Pages, Instagram
 professional accounts, later TikTok business accounts and YouTube): ingest

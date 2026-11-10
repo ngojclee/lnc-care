@@ -7,12 +7,23 @@ import os
 import secrets
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
-from starlette.datastructures import Headers
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
+import httpx
 
-from . import audit, connections as conn_mod, evaluator, settings, store, worker
+from . import (
+    agent_hub,
+    audit,
+    connections as conn_mod,
+    evaluator,
+    internal_bridge,
+    mcp_gateway,
+    settings,
+    store,
+    worker,
+)
 from .connections import Connections
 from .mcp_server import AUDIENCE, SCOPES, TOOL_SCOPES, build_mcp_asgi
 from .providers import ProviderError
@@ -20,7 +31,7 @@ from .vault import Vault, VaultError
 
 ROOT = Path(__file__).resolve().parent.parent
 PUBLIC = Path(__file__).resolve().parent / "public"
-VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "0.1.0.0"
+VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "0.2.0.0"
 
 
 def _session_cookie_value(key: str, sid: str, exp: int) -> str:
@@ -52,6 +63,12 @@ def create_app(
     mcp_bearer_token: str | None = None,
     delegation_secret: str | None = None,
     transport=None,
+    bridge_config: internal_bridge.BridgeConfig | None = None,
+    hub_config: agent_hub.AgentHubConfig | None = None,
+    mcp_gateway_config: mcp_gateway.McpGatewayConfig | None = None,
+    agent_hub_transport=None,
+    ads_bridge_transport=None,
+    mcp_gateway_transport=None,
 ) -> FastAPI:
     env = os.environ
     default_db = (
@@ -87,6 +104,11 @@ def create_app(
             or ""
         )
     )
+    audience = (
+        env.get("CONNECTOR_AUDIENCE")
+        or env.get("LNC_MCP_AUDIENCE")
+        or AUDIENCE
+    ).strip() or AUDIENCE
     require_delegation = env.get("MCP_REQUIRE_DELEGATION", "true").lower() != "false"
     writes_enabled = env.get("PROVIDER_WRITES_ENABLED", "false").lower() == "true"
 
@@ -99,9 +121,49 @@ def create_app(
     )
     with store.connect(path) as db:
         vault.verify_master(db, org)
-    conns = Connections(path, org, vault, transport=transport)
+
+    bridge = bridge_config if bridge_config is not None else internal_bridge.bridge_config(env)
+    ads_bridge = (
+        internal_bridge.AdsBridgeClient(bridge, transport=ads_bridge_transport)
+        if bridge is not None
+        else None
+    )
+    eff_hub_cfg = hub_config if hub_config is not None else agent_hub.agent_hub_config(env)
+    if eff_hub_cfg is None and ads_bridge is not None:
+        eff_hub_cfg = agent_hub.AgentHubConfig(
+            url="",
+            public_url="",
+            api_key="",
+            self_id=bridge.self_id if bridge else "lnc-care",
+        )
+    hub_client = (
+        agent_hub.AgentHubClient(
+            eff_hub_cfg, ads_bridge=ads_bridge, transport=agent_hub_transport
+        )
+        if eff_hub_cfg is not None
+        else None
+    )
+    eff_gw_cfg = (
+        mcp_gateway_config
+        if mcp_gateway_config is not None
+        else mcp_gateway.mcp_gateway_config(env)
+    )
+    gw_client = (
+        mcp_gateway.McpGatewayClient(eff_gw_cfg, transport=mcp_gateway_transport)
+        if eff_gw_cfg is not None
+        else None
+    )
+
+    conns = Connections(path, org, vault, transport=transport, hub_client=hub_client)
     mcp_asgi, mcp_lifespan = build_mcp_asgi(
-        path, org, bearer, del_secret, require_delegation, writes_enabled=writes_enabled
+        path,
+        org,
+        bearer,
+        del_secret,
+        require_delegation,
+        writes_enabled=writes_enabled,
+        mcp_gateway=gw_client,
+        audience=audience,
     )
 
     app = FastAPI(title="LNC Care", version=VERSION, lifespan=mcp_lifespan)
@@ -130,13 +192,81 @@ def create_app(
                 raise HTTPException(403, "CSRF token required")
         return session_hash
 
+    def _issue_admin_cookies(request: Request, response: Response) -> str:
+        sid, csrf = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+        secure = (
+            request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto", "").lower() == "https"
+        )
+        response.set_cookie(
+            "lnc_care_session",
+            _session_cookie_value(mgmt_key, sid, int(time.time()) + 43200),
+            httponly=True,
+            samesite="lax",
+            secure=secure,
+            path="/",
+        )
+        response.set_cookie(
+            "lnc_care_csrf", csrf, httponly=False, samesite="lax", secure=secure, path="/"
+        )
+        return csrf
+
+    def _bridge_summary() -> dict:
+        if bridge is None:
+            return {
+                "enabled": False,
+                "self_id": "lnc-care",
+                "peers": {},
+                "ads_internal_url": None,
+            }
+        return {
+            "enabled": True,
+            "self_id": bridge.self_id,
+            "peers": dict(bridge.peers),
+            "ads_internal_url": bridge.ads_internal_url,
+        }
+
+    def _hub_summary(*, force: bool = False) -> dict:
+        if hub_client is None:
+            return {
+                "configured": False,
+                "has_api_key": False,
+                "url": "",
+                "public_url": "",
+                "reachable": False,
+                "platform_api_ready": False,
+                "bridge_fallback_ready": False,
+                "mode": "standalone_local_vault",
+                "sso_path": None,
+                "last_sync_at": None,
+                "last_sync_source": None,
+                "last_warning": None,
+            }
+        return hub_client.status_summary(force=force)
+
+    def _gateway_summary() -> dict:
+        if gw_client is None:
+            return {
+                "configured": False,
+                "has_api_key": False,
+                "gateway_url": "",
+                "route": "lnc-care -> LNC-Agent-Hub (/mcp) -> Business MCP Hub (:8790/mcp) -> lnc-ads (/mcp)",
+                "allowed_prefixes": list(mcp_gateway.ALLOWED_CROSS_APP_PREFIXES),
+            }
+        return gw_client.status_summary()
+
     @app.middleware("http")
     async def host_gate(request: Request, call_next):
-        if request.url.path not in ("/health", "/webhooks/meta"):
+        req_path = request.url.path
+        if req_path not in ("/health", "/webhooks/meta"):
             cfg = current_settings()
             host = (request.headers.get("host") or "").split(":")[0].lower()
             allowed = {h.lower() for h in cfg["allowed_hosts"]} | {"testserver"}
-            if host and host not in allowed:
+            if req_path.startswith("/api/internal/bridge/"):
+                allowed = allowed | (
+                    bridge.internal_hosts if bridge else internal_bridge.DEFAULT_INTERNAL_HOSTS
+                )
+            if "*" not in allowed and host and host not in allowed:
                 return Response(
                     content=json.dumps({"detail": "Disallowed host"}),
                     status_code=421,
@@ -160,11 +290,35 @@ def create_app(
             media_type="application/json",
         )
 
+    @app.exception_handler(agent_hub.AgentHubError)
+    async def handle_hub_error(_: Request, exc: agent_hub.AgentHubError):
+        return Response(
+            content=json.dumps({"detail": exc.code}),
+            status_code=exc.status,
+            media_type="application/json",
+        )
+
+    @app.exception_handler(mcp_gateway.McpGatewayError)
+    async def handle_mcp_gateway_error(_: Request, exc: mcp_gateway.McpGatewayError):
+        return Response(
+            content=json.dumps({"detail": exc.code}),
+            status_code=exc.status,
+            media_type="application/json",
+        )
+
+    @app.exception_handler(internal_bridge.BridgeClientError)
+    async def handle_bridge_client_error(_: Request, exc: internal_bridge.BridgeClientError):
+        return Response(
+            content=json.dumps({"detail": exc.code}),
+            status_code=exc.status,
+            media_type="application/json",
+        )
+
     @app.get("/health")
     def health():
         return {
             "status": "ok",
-            "service": AUDIENCE,
+            "service": audience,
             "version": VERSION,
             "writes_enabled": writes_enabled,
         }
@@ -192,20 +346,37 @@ def create_app(
     async def meta_webhook_receive(request: Request):
         raw_body = await request.body()
         sig_header = request.headers.get("x-hub-signature-256", "")
+        if not sig_header.startswith("sha256="):
+            raise HTTPException(403, "webhook_signature_missing")
+
         with store.connect_readonly(path) as db:
             secret_env = vault.get(db, org, "app", "meta")
-        app_secret = (
+        env_secret = env.get("META_APP_SECRET", "")
+        local_secret = (
             secret_env.get("client_secret", "")
-            if secret_env
-            else env.get("META_APP_SECRET", "")
+            if secret_env and secret_env.get("client_secret")
+            else env_secret
         )
-        if not app_secret or not sig_header.startswith("sha256="):
-            raise HTTPException(403, "webhook_signature_missing")
-        expected_sig = (
-            "sha256=" + hmac.new(app_secret.encode(), raw_body, hashlib.sha256).hexdigest()
-        )
-        if not hmac.compare_digest(sig_header, expected_sig):
-            raise HTTPException(403, "webhook_signature_invalid")
+
+        if hub_client is not None:
+            has_verifier = bool(
+                local_secret or hub_client.cfg.api_key or hub_client.ads_bridge is not None
+            )
+            if not has_verifier:
+                raise HTTPException(403, "webhook_signature_missing")
+            valid = hub_client.verify_meta_webhook(
+                path, org, vault, raw_body, sig_header, env_secret=env_secret
+            )
+            if not valid:
+                raise HTTPException(403, "webhook_signature_invalid")
+        else:
+            if not local_secret:
+                raise HTTPException(403, "webhook_signature_missing")
+            expected_sig = (
+                "sha256=" + hmac.new(local_secret.encode(), raw_body, hashlib.sha256).hexdigest()
+            )
+            if not hmac.compare_digest(sig_header, expected_sig):
+                raise HTTPException(403, "webhook_signature_invalid")
 
         payload = json.loads(raw_body.decode("utf-8") or "{}")
         dedupe_key = hashlib.sha256(raw_body).hexdigest()
@@ -228,12 +399,12 @@ def create_app(
             for entry in payload.get("entry") or []:
                 for change in entry.get("changes") or []:
                     val = change.get("value") or {}
-                    if change.get("field") in ("feed", "comments", "mentions"):
+                    if change.get("field") in ("feed", "comments", "mentions", "messages"):
                         worker.enqueue_job(
                             db,
                             org,
                             "fetch_comments",
-                            {"entry_id": entry.get("id"), "value": val},
+                            {"entry_id": entry.get("id"), "field": change.get("field"), "value": val},
                         )
                         enqueued += 1
         return {"ok": True, "deduplicated": False, "enqueued": enqueued}
@@ -255,19 +426,7 @@ def create_app(
         key = str(body.get("key") or body.get("password") or "")
         if not mgmt_key or not secrets.compare_digest(key, mgmt_key):
             raise HTTPException(401, "Invalid management key")
-        sid, csrf = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
-        secure = request.url.scheme == "https"
-        response.set_cookie(
-            "lnc_care_session",
-            _session_cookie_value(mgmt_key, sid, int(time.time()) + 43200),
-            httponly=True,
-            samesite="lax",
-            secure=secure,
-            path="/",
-        )
-        response.set_cookie(
-            "lnc_care_csrf", csrf, httponly=False, samesite="lax", secure=secure, path="/"
-        )
+        csrf = _issue_admin_cookies(request, response)
         with store.connect(path) as db:
             audit.append(db, org, "owner", "auth.login", "admin_session", {})
         return {"authenticated": True, "csrf": csrf}
@@ -277,6 +436,225 @@ def create_app(
         response.delete_cookie("lnc_care_session", path="/")
         response.delete_cookie("lnc_care_csrf", path="/")
         return {"ok": True}
+
+    # --- 3-Way Universal Operator SSO (`LNC Agent Hub` <-> `LNC Care` <-> `LNC Ads`) ---
+
+    @app.get("/api/auth/sso/redirect")
+    def sso_redirect(
+        request: Request,
+        peer: str,
+        next: str = "/admin/#overview",
+        session_hash: str = Depends(require_admin),
+    ):
+        check_rate(f"sso_mint:{session_hash}", 20)
+        target_peer = peer.strip().lower()
+
+        if target_peer == "lnc-agent-hub":
+            if hub_client is None:
+                raise HTTPException(503, "agent_hub_not_configured")
+            safe_hub_next = internal_bridge.safe_relative_next(next, default="/")
+            target_url = hub_client.mint_sso_redirect_url(
+                audience="lnc-agent-hub", next_path=safe_hub_next, subject="owner"
+            )
+            with store.connect(path) as db:
+                db.execute("BEGIN IMMEDIATE")
+                audit.append(
+                    db,
+                    org,
+                    "owner",
+                    "sso.ticket_minted",
+                    target_peer,
+                    {"via": "lnc-agent-hub"},
+                )
+            return RedirectResponse(target_url, status_code=303)
+
+        safe_next = internal_bridge.safe_relative_next(next, default="/admin/#overview")
+        if hub_client is not None and hub_client.cfg.api_key:
+            st = hub_client.status_summary()
+            if st.get("platform_api_ready"):
+                target_url = hub_client.mint_sso_redirect_url(
+                    audience=target_peer, next_path=safe_next, subject="owner"
+                )
+                with store.connect(path) as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    audit.append(
+                        db,
+                        org,
+                        "owner",
+                        "sso.ticket_minted",
+                        target_peer,
+                        {"via": "lnc-agent-hub"},
+                    )
+                return RedirectResponse(target_url, status_code=303)
+
+        ticket = internal_bridge.mint_sso_ticket(bridge, audience=target_peer, subject="owner")
+        assert bridge is not None
+        peer_origin = bridge.peers[target_peer]
+        consume_url = f"{peer_origin}/api/auth/sso/consume?{urlencode({'ticket': ticket, 'next': safe_next})}"
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            audit.append(
+                db,
+                org,
+                "owner",
+                "sso.ticket_minted",
+                target_peer,
+                {"via": "internal_bridge"},
+            )
+        return RedirectResponse(consume_url, status_code=303)
+
+    @app.get("/api/auth/sso/consume")
+    def sso_consume(
+        request: Request,
+        ticket: str,
+        next: str = "/admin/#inbox",
+    ):
+        check_rate(f"sso_consume:{request.client.host if request.client else 'local'}", 20)
+        if not mgmt_key:
+            raise HTTPException(503, "management_key_not_configured")
+
+        clean_ticket = ticket.strip()
+        if clean_ticket.startswith("lnc_sso_"):
+            if hub_client is None:
+                raise HTTPException(503, "agent_hub_not_configured")
+            claims = hub_client.redeem_sso_ticket(clean_ticket)
+            via = "lnc-agent-hub"
+        else:
+            claims = internal_bridge.consume_sso_ticket(bridge, clean_ticket, path, org)
+            via = "internal_bridge"
+
+        safe_dest = internal_bridge.safe_relative_next(next, default="/admin/#inbox")
+        redirect = RedirectResponse(safe_dest, status_code=303)
+        _issue_admin_cookies(request, redirect)
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            audit.append(
+                db,
+                org,
+                str(claims.get("sub") or "owner"),
+                "sso.ticket_consumed",
+                str(claims.get("iss") or via),
+                {"via": via, "next": safe_dest},
+            )
+        return redirect
+
+    # --- Inbound Server-to-Server LAN Bridge (`/api/internal/bridge/*`) ---
+
+    @app.get("/api/internal/bridge/status")
+    async def inbound_bridge_status(request: Request):
+        raw = await request.body()
+        peer = internal_bridge.authenticate(bridge, request, raw, path, org)
+        assert bridge is not None
+        return {
+            "ok": True,
+            "service": "LNC Care",
+            "self_id": bridge.self_id,
+            "caller_peer": peer,
+            "organization": org,
+            "version": VERSION,
+            "vault_ready": True,
+        }
+
+    @app.get("/api/internal/bridge/shops")
+    async def inbound_bridge_shops(request: Request):
+        raw = await request.body()
+        internal_bridge.authenticate(bridge, request, raw, path, org)
+        with store.connect_readonly(path) as db:
+            return {"shops": store.shops(db, org)}
+
+    @app.get("/api/internal/bridge/channels")
+    async def inbound_bridge_channels(request: Request, shop: str | None = None):
+        raw = await request.body()
+        internal_bridge.authenticate(bridge, request, raw, path, org)
+        with store.connect_readonly(path) as db:
+            shop_id = None
+            if shop:
+                srow = db.execute(
+                    "SELECT id FROM shops WHERE organization_id=? AND LOWER(name)=LOWER(?)",
+                    (org, shop.strip()),
+                ).fetchone()
+                if srow:
+                    shop_id = int(srow["id"])
+                else:
+                    return {"shop": shop, "channels": []}
+            return {
+                "shop": shop,
+                "shop_id": shop_id,
+                "channels": store.channels(db, org, shop_id=shop_id, approved_only=True),
+            }
+
+    # --- Admin Hub, Shared Vault Sync, Shared OAuth & MCP Gateway ---
+
+    @app.get("/api/admin/hub/status")
+    def get_hub_status(refresh: bool = False, _: str = Depends(require_admin)):
+        return {
+            "agent_hub": _hub_summary(force=refresh),
+            "bridge": _bridge_summary(),
+            "mcp_gateway": _gateway_summary(),
+        }
+
+    @app.post("/api/admin/hub/sync")
+    def trigger_hub_sync(session_hash: str = Depends(require_admin)):
+        check_rate(f"hub_sync:{session_hash}", 12)
+        if hub_client is None:
+            raise HTTPException(409, "agent_hub_or_bridge_not_configured")
+        return hub_client.sync(path, org, vault)
+
+    @app.post("/api/admin/oauth/shared/start")
+    async def start_shared_oauth_endpoint(
+        request: Request, session_hash: str = Depends(require_admin)
+    ):
+        check_rate(f"shared_oauth:{session_hash}", 10)
+        if hub_client is None:
+            raise HTTPException(409, "agent_hub_or_bridge_not_configured")
+        body = await request.json()
+        provider = str(body.get("provider", "meta")).strip()
+        shop = str(body.get("shop", "")).strip()
+        label = str(body.get("label", "")).strip()
+        extra_scopes = str(body.get("extra_scopes", "")).strip()
+        if provider not in store.PROVIDERS or not shop:
+            raise HTTPException(422, "Valid provider and shop name are required")
+        cfg = current_settings()
+        base = cfg["public_base_url"] or f"{request.url.scheme}://{request.headers.get('host', 'localhost')}"
+        return_to = str(body.get("return_to") or f"{base}/admin/#channels").strip()
+        started = hub_client.start_shared_oauth(
+            provider=provider,
+            shop=shop,
+            label=label,
+            return_to=return_to,
+            extra_scopes=extra_scopes,
+        )
+        if not started:
+            raise HTTPException(503, "shared_oauth_broker_unavailable")
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            audit.append(
+                db,
+                org,
+                "owner",
+                "oauth.shared_started",
+                provider,
+                {"shop": shop, "via": started.get("via")},
+            )
+        return started
+
+    @app.get("/api/admin/mcp-gateway/status")
+    def get_mcp_gateway_status(_: str = Depends(require_admin)):
+        return _gateway_summary()
+
+    @app.post("/api/admin/mcp-gateway/call")
+    async def call_mcp_gateway_endpoint(
+        request: Request, session_hash: str = Depends(require_admin)
+    ):
+        check_rate(f"mcp_gw:{session_hash}", 20)
+        if gw_client is None:
+            raise HTTPException(409, "mcp_gateway_not_configured")
+        body = await request.json()
+        tool_name = str(body.get("tool") or body.get("name") or "").strip()
+        arguments = body.get("arguments") or {}
+        if not tool_name:
+            raise HTTPException(422, "tool name is required")
+        return gw_client.call_tool(tool_name, arguments)
 
     @app.get("/api/admin/overview")
     def overview(shop_id: int | None = None, _: str = Depends(require_admin)):
@@ -304,6 +682,9 @@ def create_app(
                     "healthy": sum(1 for r in fleet_rows if r["health_status"] == "healthy"),
                     "runtimes": fleet_rows,
                 },
+                "agent_hub": _hub_summary(),
+                "bridge": _bridge_summary(),
+                "mcp_gateway": _gateway_summary(),
                 "rubric_labels": [
                     {"key": k, "label_vi": vi, "label_en": en, "polarity": pol}
                     for k, vi, en, pol in evaluator.RUBRIC_LABELS
@@ -328,7 +709,10 @@ def create_app(
                 "INSERT INTO shops (organization_id, name) VALUES (?, ?)", (org, name)
             )
             audit.append(db, org, "owner", "shop.created", str(cur.lastrowid), {"name": name})
-            return {"id": cur.lastrowid, "name": name}
+            shop_id = cur.lastrowid
+        if hub_client is not None:
+            hub_client.try_push_shop(name)
+        return {"id": shop_id, "name": name}
 
     @app.get("/api/admin/integrations")
     def get_integrations(_: str = Depends(require_admin)):
@@ -444,6 +828,59 @@ def create_app(
                 {"reply_policy": policy, "auto_suggest_threshold": threshold},
             )
         return {"ok": True, "channel_id": channel_id, "reply_policy": policy, "auto_suggest_threshold": threshold}
+
+    @app.get("/api/admin/conversations")
+    def list_conversations(
+        shop_id: int | None = None,
+        channel_id: int | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        _: str = Depends(require_admin),
+    ):
+        with store.connect_readonly(path) as db:
+            return {
+                "conversations": store.conversations_list(
+                    db, org, shop_id=shop_id, channel_id=channel_id, status=status, limit=limit
+                )
+            }
+
+    @app.get("/api/admin/conversations/{conversation_id}/messages")
+    def list_conversation_messages(
+        conversation_id: int, limit: int = 100, _: str = Depends(require_admin)
+    ):
+        with store.connect_readonly(path) as db:
+            conv = db.execute(
+                "SELECT * FROM conversations WHERE organization_id=? AND id=?",
+                (org, conversation_id),
+            ).fetchone()
+            if not conv:
+                raise HTTPException(404, "Conversation not found")
+            return {
+                "conversation": dict(conv),
+                "messages": store.messages_list(db, org, conversation_id, limit=limit),
+            }
+
+    @app.get("/api/admin/leads")
+    def list_leads_endpoint(
+        shop_id: int | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        _: str = Depends(require_admin),
+    ):
+        with store.connect_readonly(path) as db:
+            return {"leads": store.leads_list(db, org, shop_id=shop_id, status=status, limit=limit)}
+
+    @app.get("/api/admin/handoffs")
+    def list_handoffs_endpoint(
+        shop_id: int | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        _: str = Depends(require_admin),
+    ):
+        with store.connect_readonly(path) as db:
+            return {
+                "handoffs": store.handoffs_list(db, org, shop_id=shop_id, status=status, limit=limit)
+            }
 
     @app.get("/api/admin/posts")
     def list_posts(
@@ -832,7 +1269,7 @@ def create_app(
     def connector_info(_: str = Depends(require_admin)):
         cfg = current_settings()
         return {
-            "audience": AUDIENCE,
+            "audience": audience,
             "namespace": "care__*",
             "endpoint": (cfg["public_base_url"] or "") + "/mcp",
             "transport": "streamable-http",
@@ -843,6 +1280,7 @@ def create_app(
             "max_scopes": cfg["mcp_max_scopes"],
             "available_scopes": sorted(SCOPES),
             "tools": {k: sorted(v) for k, v in TOOL_SCOPES.items()},
+            "mcp_gateway": _gateway_summary(),
         }
 
     @app.get("/api/admin/audit")
@@ -913,19 +1351,39 @@ def create_app(
     def app_js():
         return FileResponse(PUBLIC / "app.js", media_type="application/javascript")
 
-    async def mcp_root_redirect(scope, receive, send):
-        if scope["type"] == "http" and scope.get("path") == "/mcp":
-            headers = Headers(scope=scope)
-            if not headers.get("authorization"):
-                await JSONResponse({"error": "Invalid MCP bearer token"}, status_code=401)(
-                    scope, receive, send
-                )
-                return
-            scope = {**scope, "path": "/mcp/", "raw_path": b"/mcp/"}
-        await app(scope, receive, send)
+    # Zero-redirect MCP routes: both `/mcp` (Business MCP Hub & LNC-Agent-Hub) and `/mcp/` respond 200 directly.
+    @app.api_route("/mcp", methods=["GET", "POST", "DELETE"])
+    @app.api_route("/mcp/", methods=["GET", "POST", "DELETE"], include_in_schema=False)
+    async def connector_mcp(request: Request):
+        fwd_headers = {
+            name: value
+            for name, value in request.headers.items()
+            if name.lower() not in ("host", "content-length", "connection", "transfer-encoding")
+        }
+        raw_body = await request.body()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_asgi),
+            base_url="http://lnc-care.internal",
+        ) as mcp_http:
+            upstream = await mcp_http.request(
+                request.method,
+                "/",
+                headers=fwd_headers,
+                params=request.query_params,
+                content=raw_body,
+            )
+        passthrough = {
+            name: value
+            for name, value in upstream.headers.items()
+            if name.lower()
+            in ("content-type", "mcp-session-id", "mcp-protocol-version", "cache-control")
+        }
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            headers=passthrough,
+        )
 
-    app.mount("/mcp", mcp_asgi)
-    app.mcp_entry = mcp_root_redirect  # type: ignore[attr-defined]
     return app
 
 

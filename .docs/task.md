@@ -1,6 +1,6 @@
 # LNC Care: task checklist
 
-Status: Phase 1 COMPLETED & VERIFIED locally (2026-11-10, `VERSION 0.1.0.0`, `pytest` 11/11 passed). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
+Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-10, `VERSION 0.2.0.0`, `pytest` 15/15 passed). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
 
 ## Phase 0: evidence and decisions
 
@@ -148,9 +148,9 @@ Status: Phase 1 COMPLETED & VERIFIED locally (2026-11-10, `VERSION 0.1.0.0`, `py
 - [x] gitea `apps/lnc-care` + github mirror `ngojclee/lnc-care` (push-mirror active); row marked `active` in
   `lnc-internal-apps/README.md`, `PORTS.md`, and `registry.json` (`8482` on `10.21.4.101`).
 - [x] Host prep `/home/Docker/lnc-care` (uid `10001:10001`, `archive/` and `evidence/` subdirs),
-  Portainer repo-stack `#59` (`lnc-care` on `portainer-fr4` endpoint `4` `paris3`, two services `lnc-care` + `lnc-care-worker`), env block, `/health` (`200 OK`) and `/mcp/` (`200 OK`, 17 tools) verified.
-- [ ] NPM/Caddy FR host + LE cert (`care-mcp.lengoc.me`); access list on `/admin`, `/api`, `/mcp` only;
-  `/webhooks/*` open; internal DNS.
+  Portainer repo-stack `#59` (`lnc-care` on `portainer-fr4` endpoint `4` `paris3`, two services `lnc-care` + `lnc-care-worker`), env block, `/health` (`200 OK`) and `/mcp` (`200 OK`, 26 `care__*` tools, Business MCP Hub v3/v4 headers) verified.
+- [x] FR Caddy Fleet (`automations/edge-fleet` `0088114`) + Let's Encrypt cert (`care-mcp.lengoc.me`) + FR/VN Unbound internal DNS (`internal-dns` `2e1c799`) live (`HTTP=200 SSL=0` from LAN, `403` outside `@acl_2`).
+- [x] Ecosystem alignment (`VERSION 0.2.0.0`, `15/15 pytest`): `app/agent_hub.py` (`/v1/platform/*` + encrypted local SQLite Vault cache `TTL=900s` + automatic LAN fallback to `lnc-ads` `:8480`), `app/internal_bridge.py` (`LNC_INTERNAL_BRIDGE_SECRET` HMAC + 3-way Universal SSO `/api/auth/sso/{redirect,consume}`), and `app/mcp_gateway.py` (`LNC_MCP_GATEWAY_URL=http://10.21.4.101:8380/mcp` for `ads__*`).
 - [ ] Hub managed connector `lnc-care`, pairing, scopes, grants; live
   discovery shows `care__*`.
 - [ ] Update skill `lnm-care` (tool surface, inbox workflow, reply policy,

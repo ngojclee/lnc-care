@@ -1,7 +1,6 @@
-# Portainer Repository mode: git source, Compose path stack.yml (build: ., no image:).
-# Prepared for staging only. Production deployment is gated in .docs/plan.md.
+# Portainer Repository mode: git source https://gitea.lengoc.me/apps/lnc-care.git, Compose path stack.yml (build: ., no image:).
 # Pre-create ${DATA_DIR}/lnc-care on the Docker host, owned by uid:gid 10001:10001.
-# Proposed port: 8482 on 10.21.4.101, domain care-mcp.lengoc.me via NPM FR.
+# Deployed on 10.21.4.101:8482, domain https://care-mcp.lengoc.me via FR Caddy Fleet.
 services:
   lnc-care:
     build: .
@@ -22,12 +21,21 @@ services:
       MANAGEMENT_KEY: ${MANAGEMENT_KEY:?set-management-key}
       SESSION_SECRET: ${SESSION_SECRET:?set-session-secret}
       LNC_MASTER_KEY: ${LNC_MASTER_KEY:?set-64-hex-master-key}
+      LNC_PREVIOUS_MASTER_KEY: ${LNC_PREVIOUS_MASTER_KEY:-}
       ORGANIZATION_ID: ${ORGANIZATION_ID:?set-organization-id}
       ORGANIZATION_NAME: ${ORGANIZATION_NAME:-}
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
-      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
-      PROVIDER_WRITES_ENABLED: "false"
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://care-mcp.lengoc.me}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,10.21.4.101,care-mcp.lengoc.me}
+      PROVIDER_WRITES_ENABLED: ${PROVIDER_WRITES_ENABLED:-false}
       FORWARDED_ALLOW_IPS: "10.21.0.3"
+      META_WEBHOOK_VERIFY_TOKEN: ${META_WEBHOOK_VERIFY_TOKEN:-}
+      META_APP_SECRET: ${META_APP_SECRET:-}
+      # LNC Agent Hub Control Plane, Shared Vault & Unified MCP Gateway (svc:lnc-care)
+      LNC_AGENT_HUB_URL: ${LNC_AGENT_HUB_URL:-http://10.21.4.101:8380}
+      LNC_AGENT_HUB_PUBLIC_URL: ${LNC_AGENT_HUB_PUBLIC_URL:-}
+      LNC_AGENT_HUB_API_KEY: ${LNC_AGENT_HUB_API_KEY:-}
+      LNC_MCP_GATEWAY_URL: ${LNC_MCP_GATEWAY_URL:-http://10.21.4.101:8380/mcp}
+      # Business MCP Hub Connector Pairing (exposing care__* to Business MCP Hub :8790)
       CONNECTOR_BEARER: ${CONNECTOR_BEARER:-}
       DELEGATION_SECRET: ${DELEGATION_SECRET:-}
       CONNECTOR_AUDIENCE: ${CONNECTOR_AUDIENCE:-lnc-care}
@@ -36,6 +44,14 @@ services:
       LNC_DELEGATION_SECRET: ${LNC_DELEGATION_SECRET:-}
       LNC_MCP_AUDIENCE: ${LNC_MCP_AUDIENCE:-lnc-care}
       LNC_MCP_MAX_SCOPES: ${LNC_MCP_MAX_SCOPES:-}
+      MCP_REQUIRE_DELEGATION: ${MCP_REQUIRE_DELEGATION:-true}
+      # Sibling LAN Bridge & SSO Fallback with LNC Ads (:8480)
+      LNC_INTERNAL_BRIDGE_SECRET: ${LNC_INTERNAL_BRIDGE_SECRET:-}
+      LNC_INTERNAL_BRIDGE_SELF_ID: ${LNC_INTERNAL_BRIDGE_SELF_ID:-lnc-care}
+      LNC_INTERNAL_BRIDGE_PEERS: ${LNC_INTERNAL_BRIDGE_PEERS:-lnc-ads=https://ads-mcp.lengoc.me}
+      LNC_INTERNAL_BRIDGE_HOSTS: ${LNC_INTERNAL_BRIDGE_HOSTS:-}
+      LNC_ADS_INTERNAL_URL: ${LNC_ADS_INTERNAL_URL:-http://10.21.4.101:8480}
+      LNC_ADS_PUBLIC_URL: ${LNC_ADS_PUBLIC_URL:-https://ads-mcp.lengoc.me}
     volumes:
       - type: bind
         source: ${DATA_DIR:-/home/Docker}/lnc-care
@@ -70,9 +86,15 @@ services:
       DATA_DIR: /data
       TZ: ${TZ:-Europe/Paris}
       LNC_MASTER_KEY: ${LNC_MASTER_KEY:?set-64-hex-master-key}
+      LNC_PREVIOUS_MASTER_KEY: ${LNC_PREVIOUS_MASTER_KEY:-}
       ORGANIZATION_ID: ${ORGANIZATION_ID:?set-organization-id}
       ORGANIZATION_NAME: ${ORGANIZATION_NAME:-}
-      PROVIDER_WRITES_ENABLED: "false"
+      PROVIDER_WRITES_ENABLED: ${PROVIDER_WRITES_ENABLED:-false}
+      LNC_AGENT_HUB_URL: ${LNC_AGENT_HUB_URL:-http://10.21.4.101:8380}
+      LNC_AGENT_HUB_API_KEY: ${LNC_AGENT_HUB_API_KEY:-}
+      LNC_INTERNAL_BRIDGE_SECRET: ${LNC_INTERNAL_BRIDGE_SECRET:-}
+      LNC_INTERNAL_BRIDGE_SELF_ID: ${LNC_INTERNAL_BRIDGE_SELF_ID:-lnc-care}
+      LNC_ADS_INTERNAL_URL: ${LNC_ADS_INTERNAL_URL:-http://10.21.4.101:8480}
     volumes:
       - type: bind
         source: ${DATA_DIR:-/home/Docker}/lnc-care

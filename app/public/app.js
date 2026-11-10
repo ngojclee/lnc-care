@@ -86,7 +86,17 @@ async function api(path, options = {}) {
 }
 
 function setView() {
-  const view = (location.hash || "#inbox").slice(1) || "inbox";
+  const rawHash = (location.hash || "#inbox").slice(1) || "inbox";
+  const [view, hashQuery] = rawHash.split("?");
+  if (hashQuery) {
+    const qp = new URLSearchParams(hashQuery);
+    if (qp.get("oauth_status") === "connected") {
+      banner(`Shared ${qp.get("provider") || "OAuth"} account connected! Syncing shared channels...`);
+      api("/api/admin/hub/sync", { method: "POST" }).then(() => refreshOverview()).catch(() => {});
+    } else if (qp.get("oauth_error")) {
+      banner(`OAuth error: ${qp.get("oauth_error")}`, "error");
+    }
+  }
   document.querySelectorAll(".view").forEach((section) => {
     section.hidden = section.dataset.view !== view;
   });
@@ -110,6 +120,30 @@ function renderOverview() {
   document.getElementById("org-label").textContent = `${o.organization.name} (${o.organization.id})`;
   document.getElementById("version-badge").textContent = `v${o.version}`;
   document.getElementById("writes-badge").textContent = o.writes_enabled ? "Writes enabled" : "Draft-for-approval";
+
+  const hub = o.agent_hub || {};
+  const br = o.bridge || {};
+  const ssoHubLink = document.getElementById("sso-hub-link");
+  const ssoAdsLink = document.getElementById("sso-ads-link");
+  if (ssoHubLink) {
+    ssoHubLink.hidden = !hub.sso_path;
+  }
+  if (ssoAdsLink) {
+    ssoAdsLink.hidden = !((br.enabled && br.peers && br.peers["lnc-ads"]) || hub.sso_path);
+  }
+  const vaultBadge = document.getElementById("vault-badge");
+  if (vaultBadge) {
+    if (hub.mode === "vault_synced") {
+      vaultBadge.textContent = "Hub Vault synced";
+      vaultBadge.className = "badge good";
+    } else if (hub.mode === "ads_bridge_fallback") {
+      vaultBadge.textContent = "LNC Ads bridge active";
+      vaultBadge.className = "badge good";
+    } else {
+      vaultBadge.textContent = "Local Vault verified";
+      vaultBadge.className = "badge";
+    }
+  }
 
   const shopSelect = document.getElementById("shop-select");
   shopSelect.innerHTML = `<option value="">All shops</option>` + o.shops.map((s) =>
@@ -623,6 +657,24 @@ async function loadFleet() {
 function renderChannelsView() {
   const o = state.overview;
   if (!o) return;
+  const hub = o.agent_hub || {};
+  const br = o.bridge || {};
+  const gw = o.mcp_gateway || {};
+  const hubSummaryEl = document.getElementById("hub-sync-summary");
+  if (hubSummaryEl) {
+    hubSummaryEl.innerHTML = `
+      <div><strong>Vault Mode:</strong> <code>${esc(hub.mode || "standalone_local_vault")}</code>
+      · <strong>Agent Hub:</strong> <code>${esc(hub.url || "not set")}</code> (${hub.reachable ? "reachable" : "offline"})
+      · <strong>LNC Ads LAN Bridge:</strong> <code>${esc(br.ads_internal_url || "not set")}</code> (${hub.bridge_fallback_ready ? "ready" : (br.enabled ? "configured" : "disabled")})
+      · <strong>MCP Gateway:</strong> <code>${esc(gw.gateway_url || "not set")}</code></div>
+    `;
+  }
+  const sharedShopInput = document.getElementById("shared-oauth-shop");
+  if (sharedShopInput && !sharedShopInput.value && o.shops.length) {
+    const selectedShop = o.shops.find((s) => String(s.id) === String(state.shopId)) || o.shops[0];
+    sharedShopInput.value = selectedShop.name;
+  }
+
   const provider = document.getElementById("app-provider").value || "meta";
   const appCfg = o.integrations.apps[provider] || {};
   const appForm = document.getElementById("app-form");
@@ -917,6 +969,47 @@ document.getElementById("connection-form").onsubmit = async (e) => {
   banner("Connection added");
   await refreshOverview();
 };
+
+const hubSyncBtn = document.getElementById("hub-sync-btn");
+if (hubSyncBtn) {
+  hubSyncBtn.onclick = async () => {
+    try {
+      hubSyncBtn.disabled = true;
+      const res = await api("/api/admin/hub/sync", { method: "POST" });
+      banner(`Synced via ${res.source}: +${res.pulled_shops} shops, +${res.pulled_connections} connections, +${res.pulled_channels || 0} channels`);
+      await refreshOverview();
+    } catch (err) {
+      banner(err.message, "error");
+    } finally {
+      hubSyncBtn.disabled = false;
+    }
+  };
+}
+
+const sharedOauthForm = document.getElementById("shared-oauth-form");
+if (sharedOauthForm) {
+  sharedOauthForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      const res = await api("/api/admin/oauth/shared/start", {
+        method: "POST",
+        body: {
+          provider: fd.get("provider"),
+          shop: fd.get("shop"),
+          label: fd.get("label")
+        }
+      });
+      if (res.authorization_url) {
+        location.assign(res.authorization_url);
+      } else {
+        banner("Shared OAuth started");
+      }
+    } catch (err) {
+      banner(err.message, "error");
+    }
+  };
+}
 
 document.getElementById("rule-form").onsubmit = async (e) => {
   e.preventDefault();
