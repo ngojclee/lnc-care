@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LNC Care — Social Triage, AI Consultation & Forensic Evidence</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="icon" type="image/png" href="/icon.png">
+  <link rel="alternate icon" href="/favicon.ico">
+  <link rel="apple-touch-icon" href="/icon.png">
+  <link rel="stylesheet" href="/style.css">
+  <script>
+    (() => {
+      const saved = localStorage.getItem("lnc-care-theme");
+      document.documentElement.dataset.theme = saved || "light";
+    })();
+  </script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="/icon.svg" alt="LNC Care" class="brand-icon">
+        <div>
+          <div class="eyebrow">care__*</div>
+          <strong>LNC Care</strong>
+        </div>
+      </div>
+
+      <label class="shop-picker">
+        <span>Shop scope</span>
+        <select id="shop-select"></select>
+      </label>
+
+      <nav id="nav">
+        <a href="#inbox" data-view="inbox">Triage Inbox</a>
+        <a href="#overview" data-view="overview">Overview</a>
+        <a href="#posts" data-view="posts">Posts &amp; Archives</a>
+        <a href="#evidence" data-view="evidence">Evidence Vault</a>
+        <a href="#fleet" data-view="fleet">Account Fleet</a>
+        <a href="#channels" data-view="channels">Channels &amp; OAuth</a>
+        <a href="#rules" data-view="rules">Triage Rules</a>
+        <a href="#connector" data-view="connector">MCP Connector</a>
+        <a href="#audit" data-view="audit">Audit Log</a>
+        <a href="#settings" data-view="settings">Settings</a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button id="seed-demo-btn" type="button" class="ghost full">Load Demo Workspace</button>
+        <div class="sidebar-footer-row">
+          <button id="theme-toggle" type="button" class="ghost">Theme</button>
+          <button id="logout" type="button" class="ghost">Sign out</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow" id="org-label">Organization</div>
+          <h1 id="view-title">Triage &amp; Consultation Queue</h1>
+        </div>
+        <div class="topbar-right">
+          <span class="badge" id="vault-badge">Vault verified</span>
+          <span class="badge" id="writes-badge">Draft-for-approval</span>
+          <span class="badge mono" id="version-badge">v0.1.0.0</span>
+        </div>
+      </header>
+
+      <div id="banner" class="alert" hidden></div>
+
+      <!-- 1. TRIAGE & CONSULTATION SPLIT-PANE INBOX -->
+      <section class="view" data-view="inbox">
+        <div class="triage-bucket-bar" id="triage-bucket-bar"></div>
+
+        <div class="triage-split">
+          <!-- Left Queue Pane -->
+          <div class="triage-queue-pane">
+            <div class="triage-queue-controls">
+              <div class="triage-subtabs" id="triage-assignment-tabs"></div>
+              <div class="triage-filters-row">
+                <select id="inbox-channel-filter">
+                  <option value="">All channels</option>
+                </select>
+                <input id="inbox-search" type="search" placeholder="Search comment or author...">
+              </div>
+              <div class="triage-sort-row">
+                <span class="muted small">Prompt-injection isolated collector</span>
+                <span class="mono small">↓ Highest score</span>
+              </div>
+            </div>
+            <div class="triage-queue-list" id="triage-queue-list"></div>
+          </div>
+
+          <!-- Right Evaluation & Consultation Detail Pane -->
+          <div class="triage-detail-pane" id="triage-detail-pane">
+            <div class="empty-state">Select a comment from the queue or click "Load Demo Workspace" in the sidebar to inspect AI rubric evaluation and consultation reasoning.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. OVERVIEW -->
+      <section class="view" data-view="overview" hidden>
+        <div class="kpi-grid" id="overview-kpis"></div>
+        <div class="split">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Approved Channels</h2>
+              <span class="muted">Official API &amp; Read-Only Browser Channels</span>
+            </div>
+            <table class="table" id="overview-channels">
+              <thead><tr><th>Channel</th><th>Provider</th><th>Adapter</th><th>Followers</th><th>Posts</th><th>Comments</th><th>Policy</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Create Shop Scope</h2>
+              <span class="muted">Isolate channels and consultation playbooks</span>
+            </div>
+            <form id="shop-form" class="pad">
+              <label>Shop name <input name="name" placeholder="LuxeClaw EU Store" required></label>
+              <button type="submit" class="primary">Create shop</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. POSTS & ARCHIVES -->
+      <section class="view" data-view="posts" hidden>
+        <div class="split">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Ingested Posts &amp; Reels</h2>
+              <span class="muted">Click a post to inspect daily metric series &amp; media archive</span>
+            </div>
+            <table class="table" id="posts-table">
+              <thead><tr><th>Channel</th><th>Kind</th><th>Caption</th><th>Reactions</th><th>Comments</th><th>Archives</th><th>Action</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="panel" id="post-detail-panel">
+            <div class="panel-header">
+              <h2>Post Snapshot Series &amp; Archive</h2>
+              <span class="muted">Daily metrics + SHA-256 media &amp; screenshot archive</span>
+            </div>
+            <div class="pad" id="post-detail-content">
+              <p class="muted">Select a post from the table to view its 5-day metric trend and archived files.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. EVIDENCE VAULT (LẬP VI BẰNG SỐ) -->
+      <section class="view" data-view="evidence" hidden>
+        <div class="split">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Capture Forensic Evidence ("Lập vi bằng số")</h2>
+              <span class="muted">5-Layer Preservation + SHA-256 Manifest + 6h/24h/72h Watchdog</span>
+            </div>
+            <form id="evidence-form" class="pad">
+              <label>Case title <input name="title" placeholder="Defamation / Brand Impersonation Report"></label>
+              <label>Target Post or Comment Permalink URL <input name="target_url" placeholder="https://www.facebook.com/.../posts/..." required></label>
+              <label>Linked Comment ID (optional) <input name="comment_id" type="number" placeholder="e.g. 6"></label>
+              <button type="submit" class="primary">Seal 5-Layer Forensic Snapshot</button>
+            </form>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h2>5-Layer Forensic Standard</h2>
+              <span class="muted">Admissible digital preservation checklist</span>
+            </div>
+            <div class="pad stack-sm">
+              <div><strong>Layer 1 — Immutable Graph IDs:</strong> Numerical <code>actor_uid</code>, <code>post_id</code>, and <code>comment_id</code> survive handle renames.</div>
+              <div><strong>Layer 2 — Full Thread Expansion:</strong> <code>ALL_COMMENTS</code> mode + expanded nested replies &amp; <code>See more</code>.</div>
+              <div><strong>Layer 3 — Visual &amp; Network Replay:</strong> Full-page PNG + single-file <code>.mhtml</code> DOM + Playwright <code>.har</code> network trace with UTC headers.</div>
+              <div><strong>Layer 4 — Original Media:</strong> Highest-bitrate video and full-resolution image downloads.</div>
+              <div><strong>Layer 5 — Cryptographic Seal &amp; Watchdog:</strong> Canonical <code>manifest.json</code> SHA-256 digest + <code>+6h / +24h / +72h</code> deletion detection.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Sealed Evidence Cases</h2>
+            <span class="muted">Cryptographically hashed forensic bundles</span>
+          </div>
+          <table class="table" id="evidence-table">
+            <thead><tr><th>Case ID</th><th>Title</th><th>Subject &amp; Immutable UID</th><th>Target URL</th><th>SHA-256 Seal</th><th>Watchdog</th><th>Bundle</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 5. MULTI-ACCOUNT FLEET -->
+      <section class="view" data-view="fleet" hidden>
+        <div class="split">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Register Account Runtime</h2>
+              <span class="muted">Tier 1 Meta API · Tier 2 VeilBrowser (Camoufox 152) · Tier 3 Orbine ARM64</span>
+            </div>
+            <form id="fleet-form" class="pad">
+              <div class="form-row-2">
+                <label>Runtime label <input name="label" placeholder="Care Consultant #03" required></label>
+                <label>Platform
+                  <select name="platform">
+                    <option value="facebook">Facebook</option>
+                    <option value="instagram">Instagram</option>
+                    <option value="tiktok">TikTok</option>
+                    <option value="youtube">YouTube</option>
+                  </select>
+                </label>
+              </div>
+              <div class="form-row-2">
+                <label>Account Role
+                  <select name="account_role">
+                    <option value="care_consultant">care_consultant (Consultation / Seeding)</option>
+                    <option value="personal_main">personal_main (Strict Read-Only)</option>
+                    <option value="evidence_scout">evidence_scout (Forensic Capture)</option>
+                    <option value="friend_hygiene">friend_hygiene (Friend Audit)</option>
+                    <option value="owned_page">owned_page (Official Graph API)</option>
+                  </select>
+                </label>
+                <label>Runtime Adapter
+                  <select name="adapter">
+                    <option value="veilbrowser">veilbrowser (Camoufox 152 + Xray TUN)</option>
+                    <option value="orbine_mobile">orbine_mobile (Physical ARM64 + TPROXY)</option>
+                    <option value="meta_api">meta_api (Official Graph API)</option>
+                    <option value="scrapling_public">scrapling_public (Public URL Capture)</option>
+                  </select>
+                </label>
+              </div>
+              <div class="form-row-2">
+                <label>Profile / Device ID <input name="runtime_profile_id" placeholder="vb_prof_consult_03" required></label>
+                <label>Expected Sticky Exit IP <input name="expected_exit_ip" placeholder="91.168.42.90"></label>
+              </div>
+              <button type="submit" class="primary">Save Account Runtime</button>
+            </form>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Fleet Isolation Guardrails</h2>
+              <span class="muted">Reusable Antidetect + VeilBrowser + Orbine architecture</span>
+            </div>
+            <div class="pad stack-sm">
+              <div><strong>1 Account = 1 Sticky Residential Proxy = 1 Fingerprint Seed:</strong> Pre-flight check verifies exit IP &amp; ASN before navigating.</div>
+              <div><strong>Personal Main Protection:</strong> Any runtime with <code>account_role=personal_main</code> or browser adapter structurally forces <code>daily_write_budget=0</code> and blocks MCP provider writes (<code>channel_adapter_unsupported</code>).</div>
+              <div><strong>Circuit Breaker:</strong> Checkpoint/CAPTCHA detection immediately transitions runtime to <code>checkpointed</code> and pauses automated jobs.</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Active Account Runtime Pool</h2>
+            <span class="muted">1:1 isolated profiles across VeilBrowser, Orbine ARM64, and Official Graph APIs</span>
+          </div>
+          <table class="table" id="fleet-table">
+            <thead><tr><th>ID</th><th>Label</th><th>Platform</th><th>Role</th><th>Adapter</th><th>Profile ID</th><th>Exit IP</th><th>Health</th><th>Read / Write Budget</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 6. CHANNELS & OAUTH -->
+      <section class="view" data-view="channels" hidden>
+        <div class="split">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>OAuth App Credentials</h2>
+              <span class="muted">Encrypted in SQLite Vault with LNC_MASTER_KEY</span>
+            </div>
+            <form id="app-form" class="pad">
+              <label>Provider
+                <select name="provider" id="app-provider">
+                  <option value="meta">Meta (Facebook Pages + Instagram)</option>
+                  <option value="tiktok">TikTok Business</option>
+                  <option value="youtube">YouTube Data API</option>
+                </select>
+              </label>
+              <label>App / Client ID <input name="client_id" required></label>
+              <label>Client Secret <input name="client_secret" type="password" placeholder="********"></label>
+              <label>Webhook Verify Token <input name="webhook_verify_token" placeholder="meta_verify_token"></label>
+              <label class="check"><input name="confirm_replace" type="checkbox"> Replace existing credentials &amp; require channel re-approval</label>
+              <button type="submit" class="primary">Save Encrypted Credentials</button>
+            </form>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Provider Connections</h2>
+              <span class="muted">Authorize OAuth and discover owned channels</span>
+            </div>
+            <form id="connection-form" class="pad inline-form">
+              <select name="provider">
+                <option value="meta">Meta</option>
+                <option value="tiktok">TikTok</option>
+                <option value="youtube">YouTube</option>
+              </select>
+              <input name="label" placeholder="LuxeClaw Meta Business" required>
+              <button type="submit" class="primary">Add Connection</button>
+            </form>
+            <table class="table" id="connections-table">
+              <thead><tr><th>ID</th><th>Provider</th><th>Label</th><th>State</th><th>Actions</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Discovered &amp; Approved Channels</h2>
+            <span class="muted">Bind channels to a shop and configure reply policy</span>
+          </div>
+          <table class="table" id="channels-table">
+            <thead><tr><th>Channel</th><th>Provider</th><th>Kind</th><th>Adapter</th><th>Reply Policy</th><th>Threshold</th><th>Approved</th><th>Actions</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 7. TRIAGE RULES -->
+      <section class="view" data-view="rules" hidden>
+        <div class="split">
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Create Triage Rule</h2>
+              <span class="muted">Deterministic keyword/regex/author pre-routing</span>
+            </div>
+            <form id="rule-form" class="pad">
+              <label>Rule name <input name="name" placeholder="VIP Repeat Buyer Escalation" required></label>
+              <label>Pattern <input name="pattern" placeholder="đơn #|mã vận đơn|đổi size" required></label>
+              <div class="form-row-2">
+                <label>Match kind
+                  <select name="match_kind">
+                    <option value="keyword">keyword</option>
+                    <option value="regex">regex</option>
+                    <option value="author">author</option>
+                  </select>
+                </label>
+                <label>Auto Bucket
+                  <select name="auto_bucket">
+                    <option value="should_consult">should_consult</option>
+                    <option value="complaint">complaint</option>
+                    <option value="praise">praise</option>
+                    <option value="spam_clone">spam_clone</option>
+                    <option value="evidence">evidence</option>
+                    <option value="needs_review">needs_review</option>
+                  </select>
+                </label>
+              </div>
+              <button type="submit" class="primary">Save Triage Rule</button>
+            </form>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h2>Configured Rules</h2>
+              <span class="muted">Evaluated alongside the 12-label AI rubric</span>
+            </div>
+            <table class="table" id="rules-table">
+              <thead><tr><th>Name</th><th>Kind</th><th>Pattern</th><th>Bucket</th><th>Status</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 8. MCP CONNECTOR -->
+      <section class="view" data-view="connector" hidden>
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Business MCP Hub Connector</h2>
+            <span class="muted">Audience: lnc-care · Namespace: care__* · HMAC-SHA256 v3/v4</span>
+          </div>
+          <div id="connector-details" class="pad"></div>
+          <table class="table" id="tools-table">
+            <thead><tr><th>MCP Tool</th><th>Required Scopes</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 9. AUDIT LOG -->
+      <section class="view" data-view="audit" hidden>
+        <div class="panel">
+          <div class="panel-header">
+            <h2>SHA-256 Hash-Chained Audit Log</h2>
+            <span id="audit-verify" class="badge"></span>
+          </div>
+          <table class="table" id="audit-table">
+            <thead><tr><th>#</th><th>Time (UTC)</th><th>Actor</th><th>Action</th><th>Subject</th><th>Details</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 10. SETTINGS -->
+      <section class="view" data-view="settings" hidden>
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Runtime Settings</h2>
+            <span class="muted">Database overrides take precedence over environment defaults</span>
+          </div>
+          <form id="settings-form" class="pad">
+            <label>Public Base URL <small id="src-public_base_url"></small>
+              <input name="public_base_url" placeholder="https://care-mcp.lengoc.me">
+            </label>
+            <label>Allowed Hosts (comma-separated) <small id="src-allowed_hosts"></small>
+              <input name="allowed_hosts" placeholder="localhost, 127.0.0.1, care-mcp.lengoc.me">
+            </label>
+            <label>MCP Max Scopes (comma-separated, must include care:read) <small id="src-mcp_max_scopes"></small>
+              <input name="mcp_max_scopes">
+            </label>
+            <label>Archive Retention Days <small id="src-archive_retention_days"></small>
+              <input name="archive_retention_days" type="number" min="7" max="3650">
+            </label>
+            <button type="submit" class="primary">Save Settings</button>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

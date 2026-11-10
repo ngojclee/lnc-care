@@ -1,0 +1,86 @@
+# Portainer Repository mode: git source, Compose path stack.yml (build: ., no image:).
+# Prepared for staging only. Production deployment is gated in .docs/plan.md.
+# Pre-create ${DATA_DIR}/lnc-care on the Docker host, owned by uid:gid 10001:10001.
+# Proposed port: 8482 on 10.21.4.101, domain care-mcp.lengoc.me via NPM FR.
+services:
+  lnc-care:
+    build: .
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    ports:
+      - "${BIND_IP:?set-approved-bind-ip}:${PORT:?set-approved-unused-port}:8000"
+    environment:
+      DATA_DIR: /data
+      TZ: ${TZ:-Europe/Paris}
+      MANAGEMENT_KEY: ${MANAGEMENT_KEY:?set-management-key}
+      SESSION_SECRET: ${SESSION_SECRET:?set-session-secret}
+      LNC_MASTER_KEY: ${LNC_MASTER_KEY:?set-64-hex-master-key}
+      ORGANIZATION_ID: ${ORGANIZATION_ID:?set-organization-id}
+      ORGANIZATION_NAME: ${ORGANIZATION_NAME:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
+      PROVIDER_WRITES_ENABLED: "false"
+      FORWARDED_ALLOW_IPS: "10.21.0.3"
+      CONNECTOR_BEARER: ${CONNECTOR_BEARER:-}
+      DELEGATION_SECRET: ${DELEGATION_SECRET:-}
+      CONNECTOR_AUDIENCE: ${CONNECTOR_AUDIENCE:-lnc-care}
+      CONNECTOR_MAX_SCOPES: ${CONNECTOR_MAX_SCOPES:-}
+      LNC_CONNECTOR_TOKEN: ${LNC_CONNECTOR_TOKEN:-}
+      LNC_DELEGATION_SECRET: ${LNC_DELEGATION_SECRET:-}
+      LNC_MCP_AUDIENCE: ${LNC_MCP_AUDIENCE:-lnc-care}
+      LNC_MCP_MAX_SCOPES: ${LNC_MCP_MAX_SCOPES:-}
+    volumes:
+      - type: bind
+        source: ${DATA_DIR:-/home/Docker}/lnc-care
+        target: /data
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  lnc-care-worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    environment:
+      DATA_DIR: /data
+      TZ: ${TZ:-Europe/Paris}
+      LNC_MASTER_KEY: ${LNC_MASTER_KEY:?set-64-hex-master-key}
+      ORGANIZATION_ID: ${ORGANIZATION_ID:?set-organization-id}
+      ORGANIZATION_NAME: ${ORGANIZATION_NAME:-}
+      PROVIDER_WRITES_ENABLED: "false"
+    volumes:
+      - type: bind
+        source: ${DATA_DIR:-/home/Docker}/lnc-care
+        target: /data
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,6 @@
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+cryptography>=45,<47
+httpx>=0.28,<0.29
+Authlib>=1.6.6,<2
+mcp>=1.28,<2

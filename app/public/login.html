@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — LNC Care</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="icon" type="image/png" href="/icon.png">
+  <link rel="alternate icon" href="/favicon.ico">
+  <link rel="apple-touch-icon" href="/icon.png">
+  <link rel="stylesheet" href="/style.css">
+  <script>
+    (() => {
+      const saved = localStorage.getItem("lnc-care-theme");
+      document.documentElement.dataset.theme = saved || "light";
+    })();
+  </script>
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <div class="brand">
+      <img src="/icon.svg" alt="LNC Care" class="brand-icon">
+      <div>
+        <div class="eyebrow">Business MCP Connector · care__*</div>
+        <h1>LNC Care</h1>
+      </div>
+    </div>
+    <p class="muted">Sign in with the operator management key to triage social comments, run AI consultation reasoning, capture forensic evidence, and manage the multi-account fleet.</p>
+    <form id="login-form">
+      <label for="key">Management key</label>
+      <input id="key" name="key" type="password" autocomplete="current-password" required autofocus>
+      <div id="error" class="alert error" hidden></div>
+      <button type="submit" class="primary full">Sign in</button>
+    </form>
+  </main>
+  <script>
+    fetch("/api/auth/status", { credentials: "same-origin" })
+      .then((r) => r.json())
+      .then((s) => { if (s.authenticated) location.replace("/admin/#inbox"); });
+    document.getElementById("login-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const error = document.getElementById("error");
+      error.hidden = true;
+      const key = document.getElementById("key").value;
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key })
+      });
+      if (res.ok) {
+        location.replace("/admin/#inbox");
+        return;
+      }
+      const body = await res.json().catch(() => ({}));
+      error.textContent = body.detail || "Sign-in failed";
+      error.hidden = false;
+    });
+  </script>
+</body>
+</html>

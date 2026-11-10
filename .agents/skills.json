@@ -1,0 +1,21 @@
+{
+  "entries": [
+    {
+      "path": "\\\\10.21.2.2\\data\\_agentsync\\skills",
+      "include_only": [
+        "lnc-internal-app-blueprint",
+        "business-mcp-connector",
+        "release-portainer-app",
+        "lnc-portainer",
+        "lnc-ssh",
+        "lnc-internal-domain-config",
+        "lnc-icon",
+        "lnm-ui-ux",
+        "lnm-care",
+        "lnc-cygnus-telegram-notify",
+        "w5-versioningconvention",
+        "w13-skill-safety-review"
+      ]
+    }
+  ]
+}

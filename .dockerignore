@@ -1,0 +1,8 @@
+.git
+.docs
+__pycache__
+.pytest_cache
+.ruff_cache
+data
+tests
+temp_scripts
