@@ -343,6 +343,7 @@ def build_mcp_asgi(
     *,
     mcp_gateway: gw_mod.McpGatewayClient | None = None,
     audience: str = AUDIENCE,
+    vault=None,
 ):
     mcp = FastMCP(
         audience,
@@ -1073,21 +1074,24 @@ def build_mcp_asgi(
             return
         headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
         auth = headers.get("authorization", "")
-        if not bearer_token or not auth.startswith("Bearer ") or not secrets.compare_digest(
-            auth[7:], bearer_token
+        with store.connect_readonly(path) as db:
+            cfg = settings.load(db, org, os.environ)
+            pairing_ui = (vault.get(db, org, "pairing", "connector") if vault is not None else None) or {}
+        eff_bearer = bearer_token or str(pairing_ui.get("connector_bearer") or "")
+        eff_secret = delegation_secret or str(pairing_ui.get("delegation_secret") or "")
+        if not eff_bearer or not auth.startswith("Bearer ") or not secrets.compare_digest(
+            auth[7:], eff_bearer
         ):
             await JSONResponse({"error": "Invalid MCP bearer token"}, status_code=401)(
                 scope, receive, send
             )
             return
-        with store.connect_readonly(path) as db:
-            cfg = settings.load(db, org, os.environ)
         try:
             caller = verify_delegation(
                 path,
                 org,
                 headers.get("x-lnc-delegation"),
-                delegation_secret,
+                eff_secret,
                 require_delegation,
                 cfg["mcp_max_scopes"],
                 headers=headers,

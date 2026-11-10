@@ -18,7 +18,9 @@ services:
     environment:
       DATA_DIR: /data
       TZ: ${TZ:-Europe/Paris}
-      MANAGEMENT_KEY: ${MANAGEMENT_KEY:?set-management-key}
+      MANAGEMENT_KEY: ${MANAGEMENT_KEY:-}
+      CARE_ADMIN_BOOTSTRAP_KEY: ${CARE_ADMIN_BOOTSTRAP_KEY:-}
+      LNC_API_KEYS: ${LNC_API_KEYS:-}
       SESSION_SECRET: ${SESSION_SECRET:?set-session-secret}
       LNC_MASTER_KEY: ${LNC_MASTER_KEY:?set-64-hex-master-key}
       LNC_PREVIOUS_MASTER_KEY: ${LNC_PREVIOUS_MASTER_KEY:-}

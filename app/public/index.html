@@ -1,449 +1,183 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LNC Care — Social Triage, AI Consultation & Forensic Evidence</title>
-  <link rel="icon" type="image/svg+xml" href="/icon.svg">
-  <link rel="icon" type="image/png" href="/icon.png">
-  <link rel="alternate icon" href="/favicon.ico">
-  <link rel="apple-touch-icon" href="/icon.png">
-  <link rel="stylesheet" href="/style.css">
-  <script>
-    (() => {
-      const saved = localStorage.getItem("lnc-care-theme");
-      document.documentElement.dataset.theme = saved || "light";
-    })();
-  </script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LNC Care · Admin</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="alternate icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="stylesheet" href="/admin/style.css?v=0.3.0.0">
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('lnc-care-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}catch(e){document.documentElement.dataset.theme='dark'}</script>
 </head>
 <body>
-  <div class="shell">
-    <aside class="sidebar">
-      <div class="brand">
-        <img src="/icon.svg" alt="LNC Care" class="brand-icon">
-        <div>
-          <div class="eyebrow">care__*</div>
-          <strong>LNC Care</strong>
-        </div>
+<div class="app">
+  <aside class="side">
+    <div class="side-brand">
+      <img src="/icon.svg" alt="">
+      <div><div class="t">LNC Care</div><div class="v" id="ver">-</div></div>
+    </div>
+    <div class="side-label">Operate</div>
+    <a href="#overview" data-page="overview"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>Overview</span></a>
+    <a href="#inbox" data-page="inbox"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1z"/></svg><span>Triage inbox</span><b class="count" id="count-inbox"></b></a>
+    <a href="#conversations" data-page="conversations"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>Conversations</span><b class="count" id="count-conversations"></b></a>
+    <a href="#posts" data-page="posts"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 8h10M7 12h6M7 16h8"/></svg><span>Posts &amp; archives</span><b class="count" id="count-posts"></b></a>
+    <a href="#evidence" data-page="evidence"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 15l2 2 4-4"/></svg><span>Evidence vault</span><b class="count" id="count-evidence"></b></a>
+    <a href="#fleet" data-page="fleet"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="6" rx="2"/><rect x="2" y="14" width="20" height="6" rx="2"/><path d="M6 7h.01M6 17h.01"/></svg><span>Account fleet</span><b class="count" id="count-fleet"></b></a>
+    <div class="side-label">Configure</div>
+    <a href="#channels" data-page="channels"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7H6a4 4 0 0 0 0 8h3M15 7h3a4 4 0 0 1 0 8h-3M8 11h8"/></svg><span>Channels &amp; OAuth</span><b class="count" id="count-channels"></b></a>
+    <a href="#rules" data-page="rules"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg><span>Triage rules</span></a>
+    <a href="#connector" data-page="connector"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v6M8 4v4M16 4v4"/><rect x="5" y="8" width="14" height="6" rx="2"/><path d="M12 14v4a3 3 0 0 1-3 3H7"/></svg><span>MCP connector</span></a>
+    <a href="#audit" data-page="audit"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg><span>Audit log</span></a>
+    <a href="#keys" data-page="keys"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.8 12.2 9.7-9.7M15.5 7.5l3 3M18.5 4.5l3 3"/></svg><span>API keys</span></a>
+    <a href="#settings" data-page="settings"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.9 2.9l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.9-2.9l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.9-2.9l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.9 2.9l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.5 1h.1a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg><span>Settings</span></a>
+    <div class="side-foot">
+      <div class="app-build" id="app-build">Version unavailable</div>
+      <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle light and dark theme"><svg class="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg><span id="theme-label">Light theme</span></button>
+      <a href="#" id="signout"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg><span>Sign out</span></a>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="crumb" id="crumb"><span id="org-name">LNC Care</span> / <b>Overview</b></div>
+      <div class="topright">
+        <a href="/api/auth/sso/redirect?peer=lnc-agent-hub" id="sso-hub-link" class="btn btn-sm btn-ghost" hidden title="Open LNC Agent Hub with single sign-on">Open Agent Hub &#8599;</a>
+        <a href="/api/auth/sso/redirect?peer=lnc-ads" id="sso-ads-link" class="btn btn-sm btn-ghost" hidden title="Open LNC Ads with single sign-on">Open LNC Ads &#8599;</a>
+        <label class="shop-switch"><span>Shop</span><select id="shop-select" aria-label="Shop context"></select></label>
+        <span id="health" class="pill dim"><span class="dot"></span>Checking</span>
       </div>
+    </header>
 
-      <label class="shop-picker">
-        <span>Shop scope</span>
-        <select id="shop-select"></select>
-      </label>
-
-      <nav id="nav">
-        <a href="#inbox" data-view="inbox">Triage Inbox</a>
-        <a href="#overview" data-view="overview">Overview</a>
-        <a href="#posts" data-view="posts">Posts &amp; Archives</a>
-        <a href="#evidence" data-view="evidence">Evidence Vault</a>
-        <a href="#fleet" data-view="fleet">Account Fleet</a>
-        <a href="#channels" data-view="channels">Channels &amp; OAuth</a>
-        <a href="#rules" data-view="rules">Triage Rules</a>
-        <a href="#connector" data-view="connector">MCP Connector</a>
-        <a href="#audit" data-view="audit">Audit Log</a>
-        <a href="#settings" data-view="settings">Settings</a>
-      </nav>
-
-      <div class="sidebar-footer">
-        <button id="seed-demo-btn" type="button" class="ghost full">Load Demo Workspace</button>
-        <div class="sidebar-footer-row">
-          <button id="theme-toggle" type="button" class="ghost">Theme</button>
-          <button id="logout" type="button" class="ghost">Sign out</button>
-        </div>
-      </div>
-    </aside>
-
-    <main class="main">
-      <header class="topbar">
-        <div>
-          <div class="eyebrow" id="org-label">Organization</div>
-          <h1 id="view-title">Triage &amp; Consultation Queue</h1>
-        </div>
-        <div class="topbar-right">
-          <a id="sso-hub-link" href="/api/auth/sso/redirect?peer=lnc-agent-hub" class="sso-btn" hidden>Open Agent Hub &#8599;</a>
-          <a id="sso-ads-link" href="/api/auth/sso/redirect?peer=lnc-ads" class="sso-btn" hidden>Open LNC Ads &#8599;</a>
-          <span class="badge" id="vault-badge">Vault verified</span>
-          <span class="badge" id="writes-badge">Draft-for-approval</span>
-          <span class="badge mono" id="version-badge">v0.2.0.0</span>
-        </div>
-      </header>
-
-      <div id="banner" class="alert" hidden></div>
-
-      <!-- 1. TRIAGE & CONSULTATION SPLIT-PANE INBOX -->
-      <section class="view" data-view="inbox">
-        <div class="triage-bucket-bar" id="triage-bucket-bar"></div>
-
-        <div class="triage-split">
-          <!-- Left Queue Pane -->
-          <div class="triage-queue-pane">
-            <div class="triage-queue-controls">
-              <div class="triage-subtabs" id="triage-assignment-tabs"></div>
-              <div class="triage-filters-row">
-                <select id="inbox-channel-filter">
-                  <option value="">All channels</option>
-                </select>
-                <input id="inbox-search" type="search" placeholder="Search comment or author...">
-              </div>
-              <div class="triage-sort-row">
-                <span class="muted small">Prompt-injection isolated collector</span>
-                <span class="mono small">↓ Highest score</span>
-              </div>
-            </div>
-            <div class="triage-queue-list" id="triage-queue-list"></div>
-          </div>
-
-          <!-- Right Evaluation & Consultation Detail Pane -->
-          <div class="triage-detail-pane" id="triage-detail-pane">
-            <div class="empty-state">Select a comment from the queue or click "Load Demo Workspace" in the sidebar to inspect AI rubric evaluation and consultation reasoning.</div>
+    <main class="content" id="main-content">
+      <section class="page" id="page-overview">
+        <div class="page-head">
+          <div><h1 class="page-title">Overview</h1><p class="page-sub">Owned social channels, triage metrics, shared platform vault and safety gates.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh inventory" aria-label="Refresh inventory"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
+            <button type="button" class="btn btn-sm btn-primary" data-hub-sync>Sync Vault</button>
           </div>
         </div>
+        <div id="body-overview"><div class="skel" style="width:50%"></div></div>
       </section>
 
-      <!-- 2. OVERVIEW -->
-      <section class="view" data-view="overview" hidden>
-        <div class="kpi-grid" id="overview-kpis"></div>
-        <div class="split">
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Approved Channels</h2>
-              <span class="muted">Official API &amp; Read-Only Browser Channels</span>
-            </div>
-            <table class="table" id="overview-channels">
-              <thead><tr><th>Channel</th><th>Provider</th><th>Adapter</th><th>Followers</th><th>Posts</th><th>Comments</th><th>Policy</th></tr></thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Create Shop Scope</h2>
-              <span class="muted">Isolate channels and consultation playbooks</span>
-            </div>
-            <form id="shop-form" class="pad">
-              <label>Shop name <input name="name" placeholder="LuxeClaw EU Store" required></label>
-              <button type="submit" class="primary">Create shop</button>
-            </form>
+      <section class="page" id="page-inbox">
+        <div class="page-head">
+          <div><h1 class="page-title">Triage &amp; Consultation Queue</h1><p class="page-sub">Prompt-injection isolated rubric evaluation, human calibration and consultation draft studio.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh queue" aria-label="Refresh queue"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
           </div>
         </div>
+        <div id="body-inbox"><div class="skel" style="width:60%"></div></div>
       </section>
 
-      <!-- 3. POSTS & ARCHIVES -->
-      <section class="view" data-view="posts" hidden>
-        <div class="split">
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Ingested Posts &amp; Reels</h2>
-              <span class="muted">Click a post to inspect daily metric series &amp; media archive</span>
-            </div>
-            <table class="table" id="posts-table">
-              <thead><tr><th>Channel</th><th>Kind</th><th>Caption</th><th>Reactions</th><th>Comments</th><th>Archives</th><th>Action</th></tr></thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <div class="panel" id="post-detail-panel">
-            <div class="panel-header">
-              <h2>Post Snapshot Series &amp; Archive</h2>
-              <span class="muted">Daily metrics + SHA-256 media &amp; screenshot archive</span>
-            </div>
-            <div class="pad" id="post-detail-content">
-              <p class="muted">Select a post from the table to view its 5-day metric trend and archived files.</p>
-            </div>
+      <section class="page" id="page-conversations">
+        <div class="page-head">
+          <div><h1 class="page-title">Conversations &amp; Leads</h1><p class="page-sub">Omnichannel direct messages, qualified customer leads and operator handoff tickets.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh conversations" aria-label="Refresh conversations"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
           </div>
         </div>
+        <div id="body-conversations"><div class="skel" style="width:55%"></div></div>
       </section>
 
-      <!-- 4. EVIDENCE VAULT (LẬP VI BẰNG SỐ) -->
-      <section class="view" data-view="evidence" hidden>
-        <div class="split">
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Capture Forensic Evidence ("Lập vi bằng số")</h2>
-              <span class="muted">5-Layer Preservation + SHA-256 Manifest + 6h/24h/72h Watchdog</span>
-            </div>
-            <form id="evidence-form" class="pad">
-              <label>Case title <input name="title" placeholder="Defamation / Brand Impersonation Report"></label>
-              <label>Target Post or Comment Permalink URL <input name="target_url" placeholder="https://www.facebook.com/.../posts/..." required></label>
-              <label>Linked Comment ID (optional) <input name="comment_id" type="number" placeholder="e.g. 6"></label>
-              <button type="submit" class="primary">Seal 5-Layer Forensic Snapshot</button>
-            </form>
-          </div>
-          <div class="panel">
-            <div class="panel-header">
-              <h2>5-Layer Forensic Standard</h2>
-              <span class="muted">Admissible digital preservation checklist</span>
-            </div>
-            <div class="pad stack-sm">
-              <div><strong>Layer 1 — Immutable Graph IDs:</strong> Numerical <code>actor_uid</code>, <code>post_id</code>, and <code>comment_id</code> survive handle renames.</div>
-              <div><strong>Layer 2 — Full Thread Expansion:</strong> <code>ALL_COMMENTS</code> mode + expanded nested replies &amp; <code>See more</code>.</div>
-              <div><strong>Layer 3 — Visual &amp; Network Replay:</strong> Full-page PNG + single-file <code>.mhtml</code> DOM + Playwright <code>.har</code> network trace with UTC headers.</div>
-              <div><strong>Layer 4 — Original Media:</strong> Highest-bitrate video and full-resolution image downloads.</div>
-              <div><strong>Layer 5 — Cryptographic Seal &amp; Watchdog:</strong> Canonical <code>manifest.json</code> SHA-256 digest + <code>+6h / +24h / +72h</code> deletion detection.</div>
-            </div>
+      <section class="page" id="page-posts">
+        <div class="page-head">
+          <div><h1 class="page-title">Posts &amp; Archives</h1><p class="page-sub">Ingested posts and reels, daily metric snapshot series and SHA-256 media archives.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh posts" aria-label="Refresh posts"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
           </div>
         </div>
-
-        <div class="panel">
-          <div class="panel-header">
-            <h2>Sealed Evidence Cases</h2>
-            <span class="muted">Cryptographically hashed forensic bundles</span>
-          </div>
-          <table class="table" id="evidence-table">
-            <thead><tr><th>Case ID</th><th>Title</th><th>Subject &amp; Immutable UID</th><th>Target URL</th><th>SHA-256 Seal</th><th>Watchdog</th><th>Bundle</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
+        <div id="body-posts"><div class="skel" style="width:55%"></div></div>
       </section>
 
-      <!-- 5. MULTI-ACCOUNT FLEET -->
-      <section class="view" data-view="fleet" hidden>
-        <div class="split">
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Register Account Runtime</h2>
-              <span class="muted">Tier 1 Meta API · Tier 2 VeilBrowser (Camoufox 152) · Tier 3 Orbine ARM64</span>
-            </div>
-            <form id="fleet-form" class="pad">
-              <div class="form-row-2">
-                <label>Runtime label <input name="label" placeholder="Care Consultant #03" required></label>
-                <label>Platform
-                  <select name="platform">
-                    <option value="facebook">Facebook</option>
-                    <option value="instagram">Instagram</option>
-                    <option value="tiktok">TikTok</option>
-                    <option value="youtube">YouTube</option>
-                  </select>
-                </label>
-              </div>
-              <div class="form-row-2">
-                <label>Account Role
-                  <select name="account_role">
-                    <option value="care_consultant">care_consultant (Consultation / Seeding)</option>
-                    <option value="personal_main">personal_main (Strict Read-Only)</option>
-                    <option value="evidence_scout">evidence_scout (Forensic Capture)</option>
-                    <option value="friend_hygiene">friend_hygiene (Friend Audit)</option>
-                    <option value="owned_page">owned_page (Official Graph API)</option>
-                  </select>
-                </label>
-                <label>Runtime Adapter
-                  <select name="adapter">
-                    <option value="veilbrowser">veilbrowser (Camoufox 152 + Xray TUN)</option>
-                    <option value="orbine_mobile">orbine_mobile (Physical ARM64 + TPROXY)</option>
-                    <option value="meta_api">meta_api (Official Graph API)</option>
-                    <option value="scrapling_public">scrapling_public (Public URL Capture)</option>
-                  </select>
-                </label>
-              </div>
-              <div class="form-row-2">
-                <label>Profile / Device ID <input name="runtime_profile_id" placeholder="vb_prof_consult_03" required></label>
-                <label>Expected Sticky Exit IP <input name="expected_exit_ip" placeholder="91.168.42.90"></label>
-              </div>
-              <button type="submit" class="primary">Save Account Runtime</button>
-            </form>
-          </div>
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Fleet Isolation Guardrails</h2>
-              <span class="muted">Reusable Antidetect + VeilBrowser + Orbine architecture</span>
-            </div>
-            <div class="pad stack-sm">
-              <div><strong>1 Account = 1 Sticky Residential Proxy = 1 Fingerprint Seed:</strong> Pre-flight check verifies exit IP &amp; ASN before navigating.</div>
-              <div><strong>Personal Main Protection:</strong> Any runtime with <code>account_role=personal_main</code> or browser adapter structurally forces <code>daily_write_budget=0</code> and blocks MCP provider writes (<code>channel_adapter_unsupported</code>).</div>
-              <div><strong>Circuit Breaker:</strong> Checkpoint/CAPTCHA detection immediately transitions runtime to <code>checkpointed</code> and pauses automated jobs.</div>
-            </div>
+      <section class="page" id="page-evidence">
+        <div class="page-head">
+          <div><h1 class="page-title">Evidence Vault</h1><p class="page-sub">Five-layer forensic evidence preservation, SHA-256 chain of custody and deletion watchdog.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh evidence cases" aria-label="Refresh evidence cases"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
           </div>
         </div>
-
-        <div class="panel">
-          <div class="panel-header">
-            <h2>Active Account Runtime Pool</h2>
-            <span class="muted">1:1 isolated profiles across VeilBrowser, Orbine ARM64, and Official Graph APIs</span>
-          </div>
-          <table class="table" id="fleet-table">
-            <thead><tr><th>ID</th><th>Label</th><th>Platform</th><th>Role</th><th>Adapter</th><th>Profile ID</th><th>Exit IP</th><th>Health</th><th>Read / Write Budget</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
+        <div id="body-evidence"><div class="skel" style="width:50%"></div></div>
       </section>
 
-      <!-- 6. CHANNELS & OAUTH -->
-      <section class="view" data-view="channels" hidden>
-        <div class="panel">
-          <div class="panel-header">
-            <h2>Shared Ecosystem Vault &amp; Channel Broker</h2>
-            <div style="display:flex; gap:8px; align-items:center;">
-              <button type="button" id="hub-sync-btn" class="primary">Sync Shared Vault &amp; Channels</button>
-            </div>
-          </div>
-          <div class="pad stack-sm">
-            <div id="hub-sync-summary" class="muted">Checking LNC Agent Hub &amp; LNC Ads LAN Bridge status...</div>
-            <form id="shared-oauth-form" class="inline-form">
-              <select name="provider">
-                <option value="meta">Meta (Facebook &amp; Instagram + Care Scopes)</option>
-                <option value="tiktok">TikTok Business (+ Comment Scopes)</option>
-              </select>
-              <input name="shop" id="shared-oauth-shop" placeholder="Shop name (e.g. LuxeClaw)" required>
-              <input name="label" placeholder="Connection label (optional)">
-              <button type="submit" class="ghost">Connect Shared Account &#8599;</button>
-            </form>
+      <section class="page" id="page-fleet">
+        <div class="page-head">
+          <div><h1 class="page-title">Account Fleet</h1><p class="page-sub">Isolated runtime profiles across Official Graph API, VeilBrowser and Orbine ARM64.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh fleet" aria-label="Refresh fleet"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
           </div>
         </div>
-
-        <div class="split">
-          <div class="panel">
-            <div class="panel-header">
-              <h2>OAuth App Credentials</h2>
-              <span class="muted">Encrypted in SQLite Vault with LNC_MASTER_KEY</span>
-            </div>
-            <form id="app-form" class="pad">
-              <label>Provider
-                <select name="provider" id="app-provider">
-                  <option value="meta">Meta (Facebook Pages + Instagram)</option>
-                  <option value="tiktok">TikTok Business</option>
-                  <option value="youtube">YouTube Data API</option>
-                </select>
-              </label>
-              <label>App / Client ID <input name="client_id" required></label>
-              <label>Client Secret <input name="client_secret" type="password" placeholder="********"></label>
-              <label>Webhook Verify Token <input name="webhook_verify_token" placeholder="meta_verify_token"></label>
-              <label class="check"><input name="confirm_replace" type="checkbox"> Replace existing credentials &amp; require channel re-approval</label>
-              <button type="submit" class="primary">Save Encrypted Credentials</button>
-            </form>
-          </div>
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Provider Connections</h2>
-              <span class="muted">Authorize OAuth and discover owned channels</span>
-            </div>
-            <form id="connection-form" class="pad inline-form">
-              <select name="provider">
-                <option value="meta">Meta</option>
-                <option value="tiktok">TikTok</option>
-                <option value="youtube">YouTube</option>
-              </select>
-              <input name="label" placeholder="LuxeClaw Meta Business" required>
-              <button type="submit" class="primary">Add Connection</button>
-            </form>
-            <table class="table" id="connections-table">
-              <thead><tr><th>ID</th><th>Provider</th><th>Label</th><th>State</th><th>Actions</th></tr></thead>
-              <tbody></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-header">
-            <h2>Discovered &amp; Approved Channels</h2>
-            <span class="muted">Bind channels to a shop and configure reply policy</span>
-          </div>
-          <table class="table" id="channels-table">
-            <thead><tr><th>Channel</th><th>Provider</th><th>Kind</th><th>Adapter</th><th>Reply Policy</th><th>Threshold</th><th>Approved</th><th>Actions</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
+        <div id="body-fleet"><div class="skel" style="width:50%"></div></div>
       </section>
 
-      <!-- 7. TRIAGE RULES -->
-      <section class="view" data-view="rules" hidden>
-        <div class="split">
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Create Triage Rule</h2>
-              <span class="muted">Deterministic keyword/regex/author pre-routing</span>
-            </div>
-            <form id="rule-form" class="pad">
-              <label>Rule name <input name="name" placeholder="VIP Repeat Buyer Escalation" required></label>
-              <label>Pattern <input name="pattern" placeholder="đơn #|mã vận đơn|đổi size" required></label>
-              <div class="form-row-2">
-                <label>Match kind
-                  <select name="match_kind">
-                    <option value="keyword">keyword</option>
-                    <option value="regex">regex</option>
-                    <option value="author">author</option>
-                  </select>
-                </label>
-                <label>Auto Bucket
-                  <select name="auto_bucket">
-                    <option value="should_consult">should_consult</option>
-                    <option value="complaint">complaint</option>
-                    <option value="praise">praise</option>
-                    <option value="spam_clone">spam_clone</option>
-                    <option value="evidence">evidence</option>
-                    <option value="needs_review">needs_review</option>
-                  </select>
-                </label>
-              </div>
-              <button type="submit" class="primary">Save Triage Rule</button>
-            </form>
-          </div>
-          <div class="panel">
-            <div class="panel-header">
-              <h2>Configured Rules</h2>
-              <span class="muted">Evaluated alongside the 12-label AI rubric</span>
-            </div>
-            <table class="table" id="rules-table">
-              <thead><tr><th>Name</th><th>Kind</th><th>Pattern</th><th>Bucket</th><th>Status</th></tr></thead>
-              <tbody></tbody>
-            </table>
+      <section class="page" id="page-channels">
+        <div class="page-head">
+          <div><h1 class="page-title">Channels &amp; OAuth</h1><p class="page-sub">Shared platform vault broker, provider OAuth credentials and channel approval.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh channels" aria-label="Refresh channels"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
+            <button type="button" class="btn btn-sm btn-primary" data-hub-sync>Sync Shared Vault</button>
           </div>
         </div>
+        <div id="body-channels"><div class="skel" style="width:50%"></div></div>
       </section>
 
-      <!-- 8. MCP CONNECTOR -->
-      <section class="view" data-view="connector" hidden>
-        <div class="panel">
-          <div class="panel-header">
-            <h2>Business MCP Hub Connector</h2>
-            <span class="muted">Audience: lnc-care · Namespace: care__* · HMAC-SHA256 v3/v4</span>
+      <section class="page" id="page-rules">
+        <div class="page-head">
+          <div><h1 class="page-title">Triage Rules</h1><p class="page-sub">Deterministic keyword, regular expression and author pre-routing rules.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh rules" aria-label="Refresh rules"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
           </div>
-          <div id="connector-details" class="pad"></div>
-          <table class="table" id="tools-table">
-            <thead><tr><th>MCP Tool</th><th>Required Scopes</th></tr></thead>
-            <tbody></tbody>
-          </table>
         </div>
+        <div id="body-rules"><div class="skel" style="width:45%"></div></div>
       </section>
 
-      <!-- 9. AUDIT LOG -->
-      <section class="view" data-view="audit" hidden>
-        <div class="panel">
-          <div class="panel-header">
-            <h2>SHA-256 Hash-Chained Audit Log</h2>
-            <span id="audit-verify" class="badge"></span>
+      <section class="page" id="page-connector">
+        <div class="page-head">
+          <div><h1 class="page-title">MCP Connector</h1><p class="page-sub">Business MCP Hub boundary, unified Agent Hub MCP gateway and delegated scopes.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh connector" aria-label="Refresh connector"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
           </div>
-          <table class="table" id="audit-table">
-            <thead><tr><th>#</th><th>Time (UTC)</th><th>Actor</th><th>Action</th><th>Subject</th><th>Details</th></tr></thead>
-            <tbody></tbody>
-          </table>
         </div>
+        <div id="body-connector"><div class="skel" style="width:45%"></div></div>
       </section>
 
-      <!-- 10. SETTINGS -->
-      <section class="view" data-view="settings" hidden>
-        <div class="panel">
-          <div class="panel-header">
-            <h2>Runtime Settings</h2>
-            <span class="muted">Database overrides take precedence over environment defaults</span>
+      <section class="page" id="page-audit">
+        <div class="page-head">
+          <div><h1 class="page-title">Audit Log</h1><p class="page-sub">Append-only SHA-256 hash-chained record of every operator and agent action.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh audit log" aria-label="Refresh audit log"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
+            <button type="button" class="btn btn-sm" id="audit-verify-btn">Verify Chain</button>
           </div>
-          <form id="settings-form" class="pad">
-            <label>Public Base URL <small id="src-public_base_url"></small>
-              <input name="public_base_url" placeholder="https://care-mcp.lengoc.me">
-            </label>
-            <label>Allowed Hosts (comma-separated) <small id="src-allowed_hosts"></small>
-              <input name="allowed_hosts" placeholder="localhost, 127.0.0.1, care-mcp.lengoc.me">
-            </label>
-            <label>MCP Max Scopes (comma-separated, must include care:read) <small id="src-mcp_max_scopes"></small>
-              <input name="mcp_max_scopes">
-            </label>
-            <label>Archive Retention Days <small id="src-archive_retention_days"></small>
-              <input name="archive_retention_days" type="number" min="7" max="3650">
-            </label>
-            <button type="submit" class="primary">Save Settings</button>
-          </form>
         </div>
+        <div id="body-audit"><div class="skel" style="width:55%"></div></div>
+      </section>
+
+      <section class="page" id="page-keys">
+        <div class="page-head">
+          <div><h1 class="page-title">API Keys</h1><p class="page-sub">Service API keys, management session ownership and outbound ecosystem integrations.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh credentials" aria-label="Refresh credentials"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
+          </div>
+        </div>
+        <div id="body-keys"><div class="skel" style="width:50%"></div></div>
+      </section>
+
+      <section class="page" id="page-settings">
+        <div class="page-head">
+          <div><h1 class="page-title">Settings</h1><p class="page-sub">Runtime configuration and write-only Hub pairing secrets. Environment values win when set.</p></div>
+          <div class="toolbar">
+            <button type="button" class="btn btn-icon btn-ghost" data-refresh title="Refresh settings" aria-label="Refresh settings"><svg viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg></button>
+          </div>
+        </div>
+        <div id="body-settings"><div class="skel" style="width:45%"></div></div>
       </section>
     </main>
   </div>
-  <script src="/app.js"></script>
+</div>
+<div class="toasts" id="toasts"></div>
+<div id="modal-root"></div>
+<script src="/admin/app.js?v=0.3.0.0" defer></script>
 </body>
 </html>

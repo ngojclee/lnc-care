@@ -31,6 +31,7 @@ class Vault:
     def __init__(self, key: str | None = None, previous_key: str | None = None):
         self._key = master(key or ("00" * 32))
         self._previous_key = master(previous_key) if previous_key else None
+        self.ready = True
 
     @staticmethod
     def aad(org: str, kind: str, subject: str) -> bytes:
@@ -80,6 +81,12 @@ class Vault:
             (org, kind, subject),
         ).fetchone()
         return self.open(org, kind, subject, row["envelope"]) if row else None
+
+    def delete(self, db: sqlite3.Connection, org: str, kind: str, subject: str) -> None:
+        db.execute(
+            "DELETE FROM secret_envelopes WHERE organization_id=? AND kind=? AND subject=?",
+            (org, kind, subject),
+        )
 
     def verify_master(self, db: sqlite3.Connection, org: str) -> None:
         self.initialize(db, org)

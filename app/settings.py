@@ -119,7 +119,7 @@ def load_with_sources(db, org: str, env=None) -> dict:
         "archive_retention_days": int(inv["archive_retention_days"]["value"] or 180),
     }
     sources = {k: v["source"] for k, v in inv.items()}
-    return {"values": values, "sources": sources}
+    return {"values": values, "sources": sources, "settings": inv}
 
 
 def load(db, org: str, env=None) -> dict:

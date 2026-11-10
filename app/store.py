@@ -593,6 +593,18 @@ CREATE TABLE IF NOT EXISTS write_operations (
     PRIMARY KEY (organization_id, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    organization_id TEXT NOT NULL REFERENCES organizations(id),
+    label TEXT NOT NULL,
+    prefix TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'enabled' CHECK (status IN ('enabled', 'disabled', 'revoked')),
+    created_at INTEGER NOT NULL,
+    UNIQUE (organization_id, id),
+    UNIQUE (organization_id, key_hash)
+);
+
 CREATE INDEX IF NOT EXISTS idx_channels_org ON channels(organization_id, provider);
 CREATE INDEX IF NOT EXISTS idx_posts_channel ON posts(organization_id, channel_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(organization_id, post_id, created_at DESC);

@@ -1,7 +1,18 @@
-# Handoff — LNC Care (`v0.2.0.0`)
+# Handoff — LNC Care (`v0.3.0.0`)
 
 Updated: 2026-11-10.
-Status: **LIVE** on `http://10.21.4.101:8482` and `https://care-mcp.lengoc.me` (Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, FR Caddy Fleet + FR/VN Unbound DNS live, `15/15` `pytest` passing).
+Status: **LIVE** on `http://10.21.4.101:8482` and `https://care-mcp.lengoc.me` (Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, FR Caddy Fleet + FR/VN Unbound DNS live, full `lnc-internal-app-blueprint` UI + `#keys` API/Management key contract, `19/19` `pytest` passing).
+
+## UI & Blueprint Architecture (`lnc-internal-app-blueprint` Full Standard)
+
+1. **LN UI Engine lite Shell (`app/public/{index.html, login.html, style.css, app.js}`)**:
+   - Dual light/dark token contract (`:root, [data-theme="light"]` and `[data-theme="dark"]`) derived from `lnc-care`'s paper-sketch rose-terracotta icon (`#F2CEC2` / `#5E2419`), guarded `<head>` theme script, and autohide 4px scrollbars.
+   - Pixel-aligned `56px` `.side-brand` + `.topbar` divider, 12 hash-slug pages (`overview`, `inbox`, `conversations`, `posts`, `evidence`, `fleet`, `channels`, `rules`, `connector`, `audit`, `keys`, `settings`), exact 3-row `.side-foot` (`#app-build` -> `#theme-toggle` -> `#signout`), `lite-select` rounded popups on every `<select>`, toasts, confirmation modals, copy chips, and 100% English operator UI copy.
+   - High-DPI `lnc-icon` assets served at `/icon.svg`, `/icon.png` (`1024x1024`), `/favicon.ico` (`16..256`), and mirrored in `docs/icon.{svg,png,ico}`.
+2. **The API Page (`#keys`) & `env_or_cfg` Pairing (`app/main.py`, `app/store.py`, `app/mcp_server.py`)**:
+   - Service API keys (`GET|POST /api/keys`, `POST /api/keys/{id}/copy`, `PATCH /api/keys/{id}`, `POST /api/keys/{id}/toggle`, `POST /api/keys/{id}/revoke`, `DELETE /api/keys/{id}`) stored as SHA-256 hashes in `api_keys` with Vault-encrypted copy envelopes and cookie-free `Bearer` authentication on `GET /api/status`.
+   - Bootstrap-to-runtime management key ownership (`CARE_ADMIN_BOOTSTRAP_KEY` + PBKDF2 `__mgmt_state` + `POST /api/mgmt/rotate` with fail-closed corruption protection and `Env managed` lock when `MANAGEMENT_KEY` is set).
+   - Write-only Hub pairing secrets (`connector_bearer`, `delegation_secret`) persisted in Vault via `POST /api/settings` when not locked by environment.
 
 ## Ecosystem Architecture (`LNC-Agent-Hub + Business MCP Hub + LNC Ads v1.2.0`)
 

@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import secrets
+import socket
 import time
 from pathlib import Path
 from urllib.parse import urlencode
@@ -79,11 +80,33 @@ def create_app(
     path = Path(db_path or env.get("DATABASE_PATH", str(default_db)))
     org = env.get("ORGANIZATION_ID") or env.get("DEFAULT_ORG_SLUG") or "lnc-default"
     org_name = env.get("ORGANIZATION_NAME") or env.get("DEFAULT_ORG_NAME") or "Le Ngoc Care"
-    mgmt_key = (
+    env_mgmt_key = (
         management_key
         if management_key is not None
-        else (env.get("MANAGEMENT_KEY") or env.get("LNC_MANAGEMENT_KEY") or "")
+        else (
+            env.get("MANAGEMENT_KEY")
+            or env.get("MANAGEMENT_TOKEN")
+            or env.get("LNC_MANAGEMENT_KEY")
+            or env.get("LNC_ADMIN_TOKEN")
+            or env.get("EDGE_KEY")
+            or ""
+        )
+    ).strip()
+    bootstrap_mgmt_key = (
+        ""
+        if management_key is not None
+        else (
+            env.get("CARE_ADMIN_BOOTSTRAP_KEY")
+            or env.get("LNC_ADMIN_BOOTSTRAP_KEY")
+            or ""
+        ).strip()
     )
+    env_api_keys = [
+        k.strip()
+        for k in (env.get("LNC_API_KEYS") or "").split(",")
+        if k.strip()
+    ]
+    boot_ts = int(time.time())
     bearer = (
         mcp_bearer_token
         if mcp_bearer_token is not None
@@ -121,6 +144,27 @@ def create_app(
     )
     with store.connect(path) as db:
         vault.verify_master(db, org)
+        if not env_mgmt_key and bootstrap_mgmt_key:
+            existing_mgmt = db.execute(
+                "SELECT value FROM runtime_settings WHERE organization_id=? AND key='__mgmt_state'",
+                (org,),
+            ).fetchone()
+            if existing_mgmt is None:
+                salt = secrets.token_hex(16)
+                digest = hashlib.pbkdf2_hmac(
+                    "sha256", bootstrap_mgmt_key.encode(), salt.encode(), 200_000
+                ).hex()
+                state_obj = {
+                    "salt": salt,
+                    "hash": digest,
+                    "prefix": bootstrap_mgmt_key[:12],
+                    "session_secret": secrets.token_urlsafe(32),
+                    "created_at": int(time.time()),
+                }
+                db.execute(
+                    "INSERT INTO runtime_settings(organization_id, key, value) VALUES (?, '__mgmt_state', ?)",
+                    (org, json.dumps(state_obj)),
+                )
 
     bridge = bridge_config if bridge_config is not None else internal_bridge.bridge_config(env)
     ads_bridge = (
@@ -164,14 +208,87 @@ def create_app(
         writes_enabled=writes_enabled,
         mcp_gateway=gw_client,
         audience=audience,
+        vault=vault,
     )
 
     app = FastAPI(title="LNC Care", version=VERSION, lifespan=mcp_lifespan)
     attempts: dict[str, list[float]] = defaultdict(list)
 
+    def _load_runtime_mgmt() -> dict | None:
+        with store.connect_readonly(path) as db:
+            row = db.execute(
+                "SELECT value FROM runtime_settings WHERE organization_id=? AND key='__mgmt_state'",
+                (org,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            parsed = json.loads(row["value"])
+            if not all(k in parsed for k in ("salt", "hash", "session_secret")):
+                raise ValueError("incomplete")
+            return parsed
+        except Exception as exc:
+            raise HTTPException(500, "management_state_corrupt") from exc
+
+    def _session_signing_key() -> str:
+        if env_mgmt_key:
+            return env_mgmt_key
+        rt = _load_runtime_mgmt()
+        return str(rt["session_secret"]) if rt else ""
+
+    def _verify_mgmt_secret(candidate: str) -> bool:
+        if not candidate:
+            return False
+        if env_mgmt_key:
+            return secrets.compare_digest(candidate, env_mgmt_key)
+        rt = _load_runtime_mgmt()
+        if not rt:
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", candidate.encode(), str(rt["salt"]).encode(), 200_000
+        ).hex()
+        return secrets.compare_digest(digest, str(rt["hash"]))
+
+    def _mgmt_inventory() -> dict:
+        if env_mgmt_key:
+            return {
+                "configured": True,
+                "prefix": (env_mgmt_key[:8] + "…") if len(env_mgmt_key) > 8 else "env_****",
+                "source": "environment",
+                "rotatable": False,
+                "bootstrap_ignored": False,
+            }
+        rt = _load_runtime_mgmt()
+        if rt:
+            return {
+                "configured": True,
+                "prefix": (str(rt.get("prefix") or "")[:10] + "…") if rt.get("prefix") else "care_mgmt…",
+                "created_at": rt.get("created_at"),
+                "source": "runtime",
+                "rotatable": True,
+                "bootstrap_ignored": bool(bootstrap_mgmt_key),
+            }
+        return {
+            "configured": False,
+            "prefix": "",
+            "source": "none",
+            "rotatable": True,
+            "bootstrap_ignored": False,
+        }
+
     def current_settings() -> dict:
         with store.connect_readonly(path) as db:
             return settings.load(db, org, env)
+
+    def public_base(request: Request | None = None) -> str:
+        cfg = current_settings()
+        if cfg.get("public_base_url"):
+            return str(cfg["public_base_url"]).rstrip("/")
+        if request is not None:
+            proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "http"
+            host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc or "localhost"
+            return f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}".rstrip("/")
+        return ""
 
     def check_rate(bucket: str, limit: int, window: int = 60) -> None:
         now = time.time()
@@ -181,8 +298,28 @@ def create_app(
         items.append(now)
         attempts[bucket] = items
 
+    def _verify_api_key(token: str) -> str | None:
+        tok = token.strip()
+        if not tok:
+            return None
+        if _verify_mgmt_secret(tok):
+            return "mgmt"
+        for idx, ek in enumerate(env_api_keys):
+            if secrets.compare_digest(tok, ek):
+                return f"env:{idx}"
+        key_hash = hashlib.sha256(tok.encode()).hexdigest()
+        with store.connect_readonly(path) as db:
+            row = db.execute(
+                "SELECT id, status FROM api_keys WHERE organization_id=? AND key_hash=?",
+                (org, key_hash),
+            ).fetchone()
+        if row and row["status"] == "enabled":
+            return f"key:{row['id']}"
+        return None
+
     def require_admin(request: Request) -> str:
-        session_hash = _verify_session_cookie(mgmt_key, request.cookies.get("lnc_care_session"))
+        sig_key = _session_signing_key()
+        session_hash = _verify_session_cookie(sig_key, request.cookies.get("lnc_care_session"))
         if not session_hash:
             raise HTTPException(401, "Authentication required")
         if request.method in ("POST", "PUT", "PATCH", "DELETE"):
@@ -192,7 +329,30 @@ def create_app(
                 raise HTTPException(403, "CSRF token required")
         return session_hash
 
+    def require_api_or_admin(request: Request) -> str:
+        auth = request.headers.get("authorization", "")
+        raw_tok = ""
+        if auth.lower().startswith("bearer "):
+            raw_tok = auth[7:].strip()
+        elif request.headers.get("x-api-key"):
+            raw_tok = request.headers.get("x-api-key", "").strip()
+        elif request.headers.get("x-token"):
+            raw_tok = request.headers.get("x-token", "").strip()
+        elif request.query_params.get("token"):
+            raw_tok = request.query_params.get("token", "").strip()
+        if raw_tok:
+            principal = _verify_api_key(raw_tok)
+            if principal:
+                return principal
+            raise HTTPException(401, "Invalid or revoked API key")
+        sig_key = _session_signing_key()
+        session_hash = _verify_session_cookie(sig_key, request.cookies.get("lnc_care_session"))
+        if session_hash:
+            return session_hash
+        raise HTTPException(401, "Authentication required")
+
     def _issue_admin_cookies(request: Request, response: Response) -> str:
+        sig_key = _session_signing_key()
         sid, csrf = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
         secure = (
             request.url.scheme == "https"
@@ -200,7 +360,7 @@ def create_app(
         )
         response.set_cookie(
             "lnc_care_session",
-            _session_cookie_value(mgmt_key, sid, int(time.time()) + 43200),
+            _session_cookie_value(sig_key, sid, int(time.time()) + 43200),
             httponly=True,
             samesite="lax",
             secure=secure,
@@ -255,13 +415,21 @@ def create_app(
             }
         return gw_client.status_summary()
 
+    local_hosts = {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "testserver",
+        socket.gethostname().lower(),
+    }
+
     @app.middleware("http")
     async def host_gate(request: Request, call_next):
         req_path = request.url.path
         if req_path not in ("/health", "/webhooks/meta"):
             cfg = current_settings()
-            host = (request.headers.get("host") or "").split(":")[0].lower()
-            allowed = {h.lower() for h in cfg["allowed_hosts"]} | {"testserver"}
+            host = (request.headers.get("host") or "").split(":")[0].strip("[]").lower()
+            allowed = {h.lower() for h in cfg["allowed_hosts"]} | local_hosts
             if req_path.startswith("/api/internal/bridge/"):
                 allowed = allowed | (
                     bridge.internal_hosts if bridge else internal_bridge.DEFAULT_INTERNAL_HOSTS
@@ -409,32 +577,47 @@ def create_app(
                         enqueued += 1
         return {"ok": True, "deduplicated": False, "enqueued": enqueued}
 
+    @app.get("/api/app-info")
+    def app_info():
+        return {"service": audience, "name": "LNC Care", "version": VERSION}
+
     @app.get("/api/auth/status")
     def auth_status(request: Request):
+        sig_key = _session_signing_key()
         authenticated = bool(
-            _verify_session_cookie(mgmt_key, request.cookies.get("lnc_care_session"))
+            _verify_session_cookie(sig_key, request.cookies.get("lnc_care_session"))
         )
+        csrf_val = request.cookies.get("lnc_care_csrf", "") if authenticated else ""
         return {
+            "ok": authenticated,
             "authenticated": authenticated,
-            "csrf": request.cookies.get("lnc_care_csrf", "") if authenticated else "",
+            "service": audience,
+            "version": VERSION,
+            "csrf": csrf_val,
+            "csrf_token": csrf_val,
         }
 
     @app.post("/api/auth/login")
     async def login(request: Request, response: Response):
-        check_rate(f"login:{request.client.host if request.client else 'local'}", 8)
+        check_rate(f"login:{request.client.host if request.client else 'local'}", 8, window=300)
         body = await request.json()
-        key = str(body.get("key") or body.get("password") or "")
-        if not mgmt_key or not secrets.compare_digest(key, mgmt_key):
+        key = str(body.get("key") or body.get("token") or body.get("password") or "")
+        if not _verify_mgmt_secret(key):
             raise HTTPException(401, "Invalid management key")
         csrf = _issue_admin_cookies(request, response)
         with store.connect(path) as db:
             audit.append(db, org, "owner", "auth.login", "admin_session", {})
-        return {"authenticated": True, "csrf": csrf}
+        return {"ok": True, "authenticated": True, "csrf": csrf, "csrf_token": csrf}
 
+    @app.get("/api/auth/logout")
     @app.post("/api/auth/logout")
-    def logout(response: Response, _: str = Depends(require_admin)):
+    def logout(request: Request, response: Response):
+        if request.method == "POST":
+            _ = require_admin(request)
         response.delete_cookie("lnc_care_session", path="/")
         response.delete_cookie("lnc_care_csrf", path="/")
+        if request.method == "GET":
+            return RedirectResponse("/login.html", status_code=303)
         return {"ok": True}
 
     # --- 3-Way Universal Operator SSO (`LNC Agent Hub` <-> `LNC Care` <-> `LNC Ads`) ---
@@ -510,7 +693,7 @@ def create_app(
         next: str = "/admin/#inbox",
     ):
         check_rate(f"sso_consume:{request.client.host if request.client else 'local'}", 20)
-        if not mgmt_key:
+        if not _session_signing_key():
             raise HTTPException(503, "management_key_not_configured")
 
         clean_ticket = ticket.strip()
@@ -764,7 +947,9 @@ def create_app(
 
     @app.get("/api/auth/providers/{provider}/callback")
     def oauth_callback(provider: str, state: str, code: str, request: Request):
-        session_hash = _verify_session_cookie(mgmt_key, request.cookies.get("lnc_care_session"))
+        session_hash = _verify_session_cookie(
+            _session_signing_key(), request.cookies.get("lnc_care_session")
+        )
         if not session_hash:
             raise HTTPException(401, "Authentication required")
         conns.callback(provider, state, code, session_hash)
@@ -860,6 +1045,55 @@ def create_app(
                 "messages": store.messages_list(db, org, conversation_id, limit=limit),
             }
 
+    @app.post("/api/admin/conversations/{conversation_id}/messages")
+    async def send_conversation_message(
+        conversation_id: int, request: Request, _: str = Depends(require_admin)
+    ):
+        body = await request.json()
+        text = str(body.get("text") or "").strip()
+        if not text:
+            raise HTTPException(422, "Message text is required")
+        now = int(time.time())
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            conv = db.execute(
+                """SELECT cv.*, c.reply_policy FROM conversations cv
+                   JOIN channels c ON c.id=cv.channel_id AND c.organization_id=cv.organization_id
+                   WHERE cv.organization_id=? AND cv.id=?""",
+                (org, conversation_id),
+            ).fetchone()
+            if not conv:
+                raise HTTPException(404, "Conversation not found")
+            msg_status = "sent" if (writes_enabled and conv["reply_policy"] != "draft_only") else "draft"
+            ext_id = f"out_{conversation_id}_{secrets.token_hex(6)}"
+            cur = db.execute(
+                """INSERT INTO messages
+                   (organization_id, conversation_id, channel_id, external_id, direction, sender_id, sender_name, text, status, created_at)
+                   VALUES (?, ?, ?, ?, 'outbound', 'owner', 'Care Operator', ?, ?, ?)""",
+                (org, conversation_id, conv["channel_id"], ext_id, text, msg_status, now),
+            )
+            db.execute(
+                """UPDATE conversations
+                   SET last_message_preview=?, status=?, unread_count=0, updated_at=?
+                   WHERE organization_id=? AND id=?""",
+                (
+                    text[:160],
+                    "replied" if msg_status == "sent" else "pending_reply",
+                    now,
+                    org,
+                    conversation_id,
+                ),
+            )
+            audit.append(
+                db,
+                org,
+                "owner",
+                f"conversation.message_{msg_status}",
+                str(conversation_id),
+                {"message_id": cur.lastrowid},
+            )
+        return {"ok": True, "status": msg_status, "message_id": cur.lastrowid}
+
     @app.get("/api/admin/leads")
     def list_leads_endpoint(
         shop_id: int | None = None,
@@ -869,6 +1103,32 @@ def create_app(
     ):
         with store.connect_readonly(path) as db:
             return {"leads": store.leads_list(db, org, shop_id=shop_id, status=status, limit=limit)}
+
+    @app.post("/api/admin/leads")
+    async def create_lead_endpoint(request: Request, _: str = Depends(require_admin)):
+        body = await request.json()
+        customer_name = str(body.get("customer_name") or "").strip()[:120]
+        if not customer_name:
+            raise HTTPException(422, "Customer name is required")
+        contact_handle = str(body.get("contact_handle") or "").strip()[:120]
+        phone = str(body.get("phone") or "").strip()[:40]
+        email = str(body.get("email") or "").strip()[:120]
+        notes = str(body.get("notes") or "").strip()[:500]
+        source = str(body.get("source") or "manual").strip()
+        if source not in ("comment", "dm", "meta_lead_ad", "manual"):
+            source = "manual"
+        shop_id = int(body["shop_id"]) if body.get("shop_id") else None
+        now = int(time.time())
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute(
+                """INSERT INTO leads
+                   (organization_id, shop_id, source, customer_name, contact_handle, phone, email, intent_score, status, notes, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 85.0, 'new', ?, ?, ?)""",
+                (org, shop_id, source, customer_name, contact_handle, phone, email, notes, now, now),
+            )
+            audit.append(db, org, "owner", "lead.created", str(cur.lastrowid), {"customer_name": customer_name})
+        return {"ok": True, "id": cur.lastrowid}
 
     @app.get("/api/admin/handoffs")
     def list_handoffs_endpoint(
@@ -881,6 +1141,29 @@ def create_app(
             return {
                 "handoffs": store.handoffs_list(db, org, shop_id=shop_id, status=status, limit=limit)
             }
+
+    @app.post("/api/admin/handoffs")
+    async def create_handoff_endpoint(request: Request, _: str = Depends(require_admin)):
+        body = await request.json()
+        summary = str(body.get("summary") or "").strip()[:300]
+        if not summary:
+            raise HTTPException(422, "Summary is required")
+        priority = str(body.get("priority") or "normal").strip()
+        if priority not in ("low", "normal", "high", "urgent"):
+            priority = "normal"
+        assignee = str(body.get("assignee") or "care-team").strip()[:80]
+        shop_id = int(body["shop_id"]) if body.get("shop_id") else None
+        now = int(time.time())
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute(
+                """INSERT INTO ticket_handoffs
+                   (organization_id, shop_id, priority, assignee, summary, status, created_by, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'open', 'owner', ?, ?)""",
+                (org, shop_id, priority, assignee, summary, now, now),
+            )
+            audit.append(db, org, "owner", "handoff.created", str(cur.lastrowid), {"priority": priority, "assignee": assignee})
+        return {"ok": True, "id": cur.lastrowid}
 
     @app.get("/api/admin/posts")
     def list_posts(
@@ -1265,16 +1548,309 @@ def create_app(
     def trigger_worker_jobs(_: str = Depends(require_admin)):
         return worker.run_pending_jobs(path, org, limit=15)
 
+    def _pairing_secrets_summary(db) -> dict:
+        ui_pair = (vault.get(db, org, "pairing", "connector") if vault.ready else None) or {}
+        has_ui_bearer = bool(ui_pair.get("connector_bearer"))
+        has_ui_secret = bool(ui_pair.get("delegation_secret"))
+        return {
+            "connector_bearer": {
+                "configured": bool(bearer or has_ui_bearer),
+                "source": "environment" if bearer else ("database" if has_ui_bearer else "unset"),
+            },
+            "delegation_secret": {
+                "configured": bool(del_secret or has_ui_secret),
+                "source": "environment" if del_secret else ("database" if has_ui_secret else "unset"),
+            },
+        }
+
+    @app.get("/api/status")
+    def api_status(request: Request, _: str = Depends(require_api_or_admin)):
+        base = public_base(request)
+        with store.connect_readonly(path) as db:
+            shops_cnt = db.execute(
+                "SELECT COUNT(*) FROM shops WHERE organization_id=?", (org,)
+            ).fetchone()[0]
+            channels_cnt = db.execute(
+                "SELECT COUNT(*) FROM channels WHERE organization_id=? AND approved=1", (org,)
+            ).fetchone()[0]
+            comments_cnt = db.execute(
+                "SELECT COUNT(*) FROM comments WHERE organization_id=?", (org,)
+            ).fetchone()[0]
+        return {
+            "ok": True,
+            "service": audience,
+            "version": VERSION,
+            "uptime_seconds": max(0, int(time.time()) - boot_ts),
+            "base_url": base,
+            "mcp_endpoint": f"{base}/mcp" if base else "/mcp",
+            "writes_enabled": writes_enabled,
+            "inventory": {
+                "shops": shops_cnt,
+                "approved_channels": channels_cnt,
+                "comments": comments_cnt,
+            },
+        }
+
+    # --- The API Page (`/api/keys*` + `/api/mgmt/rotate` + `/api/admin/credentials/*`) ---
+
+    def _keys_inventory_payload(db) -> dict:
+        rows = db.execute(
+            """SELECT id, label, prefix, status, created_at
+               FROM api_keys WHERE organization_id=? ORDER BY id DESC""",
+            (org,),
+        ).fetchall()
+        items: list[dict] = []
+        for idx, ek in enumerate(env_api_keys):
+            items.append(
+                {
+                    "id": f"env-{idx + 1}",
+                    "label": f"LNC_API_KEYS #{idx + 1}",
+                    "prefix": ek[:12],
+                    "status": "enabled",
+                    "enabled": True,
+                    "created_at": boot_ts,
+                    "copy_available": False,
+                    "source": "environment",
+                }
+            )
+        for r in rows:
+            has_copy = False
+            if r["status"] != "revoked" and vault.ready:
+                stored_sec = vault.get(db, org, "api_key", str(r["id"]))
+                has_copy = bool(stored_sec and stored_sec.get("secret"))
+            items.append(
+                {
+                    "id": r["id"],
+                    "label": r["label"],
+                    "prefix": r["prefix"],
+                    "status": r["status"],
+                    "enabled": r["status"] == "enabled",
+                    "created_at": r["created_at"],
+                    "copy_available": has_copy,
+                    "source": "runtime",
+                }
+            )
+        mgmt = _mgmt_inventory()
+        return {
+            "keys": items,
+            "mgmt": mgmt,
+            "inference": {
+                "configured": any(k["enabled"] for k in items),
+                "keys": items,
+            },
+            "management": mgmt,
+        }
+
+    @app.get("/api/keys")
+    @app.get("/api/admin/credentials/inventory")
+    def list_api_keys(_: str = Depends(require_admin)):
+        with store.connect_readonly(path) as db:
+            return _keys_inventory_payload(db)
+
+    @app.post("/api/keys")
+    @app.post("/api/admin/credentials/inference")
+    async def create_api_key(request: Request, _: str = Depends(require_admin)):
+        body = await request.json()
+        label = str(body.get("label") or "").strip()[:80]
+        if not label:
+            raise HTTPException(422, "Key label is required")
+        custom = str(body.get("secret") or body.get("custom") or "").strip()
+        if custom:
+            if len(custom) < 24:
+                raise HTTPException(422, "Custom secret must be at least 24 characters")
+            raw_key = custom
+        else:
+            raw_key = f"care_{secrets.token_urlsafe(24)}"
+        prefix = raw_key[:12]
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        now = int(time.time())
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            dup = db.execute(
+                "SELECT id FROM api_keys WHERE organization_id=? AND key_hash=?",
+                (org, key_hash),
+            ).fetchone()
+            if dup:
+                raise HTTPException(409, "Key secret already exists")
+            cur = db.execute(
+                """INSERT INTO api_keys (organization_id, label, prefix, key_hash, status, created_at)
+                   VALUES (?, ?, ?, ?, 'enabled', ?)""",
+                (org, label, prefix, key_hash, now),
+            )
+            key_id = int(cur.lastrowid)
+            if vault.ready:
+                vault.put(db, org, "api_key", str(key_id), {"secret": raw_key})
+            audit.append(db, org, "owner", "api_key.created", str(key_id), {"label": label, "prefix": prefix})
+        return {
+            "key": raw_key,
+            "secret": raw_key,
+            "item": {
+                "id": key_id,
+                "label": label,
+                "prefix": prefix,
+                "status": "enabled",
+                "enabled": True,
+                "created_at": now,
+                "copy_available": vault.ready,
+                "source": "runtime",
+            },
+        }
+
+    @app.post("/api/keys/{key_id}/copy")
+    @app.post("/api/admin/credentials/inference/{key_id}/copy")
+    def copy_api_key(key_id: int, _: str = Depends(require_admin)):
+        with store.connect(path) as db:
+            row = db.execute(
+                "SELECT id, label, status FROM api_keys WHERE organization_id=? AND id=?",
+                (org, key_id),
+            ).fetchone()
+            if not row or row["status"] == "revoked":
+                raise HTTPException(404, "Copyable API key not found")
+            env_sec = vault.get(db, org, "api_key", str(key_id)) if vault.ready else None
+            if not env_sec or not env_sec.get("secret"):
+                raise HTTPException(409, "Secret is not stored for copy")
+            audit.append(db, org, "owner", "api_key.copied", str(key_id), {"label": row["label"]})
+            return {"key": env_sec["secret"], "secret": env_sec["secret"]}
+
+    @app.patch("/api/keys/{key_id}")
+    @app.patch("/api/admin/credentials/inference/{key_id}")
+    async def rename_api_key(key_id: int, request: Request, _: str = Depends(require_admin)):
+        body = await request.json()
+        label = str(body.get("label") or "").strip()[:80]
+        if not label:
+            raise HTTPException(422, "Key label is required")
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT id FROM api_keys WHERE organization_id=? AND id=?",
+                (org, key_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "API key not found")
+            db.execute(
+                "UPDATE api_keys SET label=? WHERE organization_id=? AND id=?",
+                (label, org, key_id),
+            )
+            audit.append(db, org, "owner", "api_key.renamed", str(key_id), {"label": label})
+        return {"ok": True, "id": key_id, "label": label}
+
+    @app.post("/api/keys/{key_id}/toggle")
+    @app.post("/api/admin/credentials/inference/{key_id}/enable")
+    @app.post("/api/admin/credentials/inference/{key_id}/disable")
+    def toggle_api_key(key_id: int, request: Request, _: str = Depends(require_admin)):
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT id, status FROM api_keys WHERE organization_id=? AND id=?",
+                (org, key_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "API key not found")
+            if row["status"] == "revoked":
+                raise HTTPException(409, "Revoked API key cannot be re-enabled")
+            if request.url.path.endswith("/enable"):
+                next_status = "enabled"
+            elif request.url.path.endswith("/disable"):
+                next_status = "disabled"
+            else:
+                next_status = "disabled" if row["status"] == "enabled" else "enabled"
+            db.execute(
+                "UPDATE api_keys SET status=? WHERE organization_id=? AND id=?",
+                (next_status, org, key_id),
+            )
+            audit.append(db, org, "owner", f"api_key.{next_status}", str(key_id), {})
+        return {"ok": True, "id": key_id, "status": next_status, "enabled": next_status == "enabled"}
+
+    @app.post("/api/keys/{key_id}/revoke")
+    @app.post("/api/admin/credentials/inference/{key_id}/revoke")
+    def revoke_api_key(key_id: int, _: str = Depends(require_admin)):
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT id, status FROM api_keys WHERE organization_id=? AND id=?",
+                (org, key_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "API key not found")
+            db.execute(
+                "UPDATE api_keys SET status='revoked' WHERE organization_id=? AND id=?",
+                (org, key_id),
+            )
+            vault.delete(db, org, "api_key", str(key_id))
+            audit.append(db, org, "owner", "api_key.revoked", str(key_id), {})
+        return {"ok": True, "id": key_id, "status": "revoked", "enabled": False}
+
+    @app.delete("/api/keys/{key_id}")
+    @app.delete("/api/admin/credentials/inference/{key_id}")
+    def delete_api_key(key_id: int, _: str = Depends(require_admin)):
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT id, status FROM api_keys WHERE organization_id=? AND id=?",
+                (org, key_id),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "API key not found")
+            if row["status"] != "revoked":
+                raise HTTPException(409, "Revoke the API key before deleting its record")
+            vault.delete(db, org, "api_key", str(key_id))
+            db.execute("DELETE FROM api_keys WHERE organization_id=? AND id=?", (org, key_id))
+            audit.append(db, org, "owner", "api_key.deleted", str(key_id), {})
+        return {"ok": True, "id": key_id}
+
+    @app.post("/api/mgmt/rotate")
+    @app.post("/api/admin/credentials/management/rotate")
+    async def rotate_management_key(
+        request: Request, response: Response, _: str = Depends(require_admin)
+    ):
+        if env_mgmt_key:
+            raise HTTPException(409, "management_key_env_managed")
+        body = await request.json()
+        current_key = str(body.get("current_key") or "").strip()
+        rt_existing = _load_runtime_mgmt()
+        if rt_existing is not None and (not current_key or not _verify_mgmt_secret(current_key)):
+            raise HTTPException(401, "Current management key is required to confirm rotation")
+        custom = str(body.get("secret") or "").strip()
+        if custom and len(custom) < 16:
+            raise HTTPException(422, "Replacement management key must be at least 16 characters")
+        new_secret = custom or f"care_mgmt_{secrets.token_urlsafe(24)}"
+        salt = secrets.token_hex(16)
+        digest = hashlib.pbkdf2_hmac("sha256", new_secret.encode(), salt.encode(), 200_000).hex()
+        state_obj = {
+            "salt": salt,
+            "hash": digest,
+            "prefix": new_secret[:12],
+            "session_secret": secrets.token_urlsafe(32),
+            "created_at": int(time.time()),
+        }
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """INSERT INTO runtime_settings(organization_id, key, value) VALUES (?, '__mgmt_state', ?)
+                   ON CONFLICT(organization_id, key) DO UPDATE SET value=excluded.value""",
+                (org, json.dumps(state_obj)),
+            )
+            audit.append(db, org, "owner", "mgmt_key.rotated", "runtime", {"prefix": new_secret[:8]})
+        response.delete_cookie("lnc_care_session", path="/")
+        response.delete_cookie("lnc_care_csrf", path="/")
+        return {"ok": True, "key": new_secret, "prefix": new_secret[:12], "source": "runtime"}
+
     @app.get("/api/admin/connector")
-    def connector_info(_: str = Depends(require_admin)):
+    def connector_info(request: Request, _: str = Depends(require_admin)):
         cfg = current_settings()
+        base = public_base(request)
+        with store.connect_readonly(path) as db:
+            p_sec = _pairing_secrets_summary(db)
         return {
             "audience": audience,
             "namespace": "care__*",
-            "endpoint": (cfg["public_base_url"] or "") + "/mcp",
+            "endpoint": f"{base}/mcp" if base else "/mcp",
             "transport": "streamable-http",
-            "bearer_configured": bool(bearer),
-            "delegation_secret_configured": bool(del_secret),
+            "ready": p_sec["connector_bearer"]["configured"] and p_sec["delegation_secret"]["configured"],
+            "bearer_configured": p_sec["connector_bearer"]["configured"],
+            "bearer_source": p_sec["connector_bearer"]["source"],
+            "delegation_secret_configured": p_sec["delegation_secret"]["configured"],
+            "delegation_secret_source": p_sec["delegation_secret"]["source"],
             "require_delegation": require_delegation,
             "writes_enabled": writes_enabled,
             "max_scopes": cfg["mcp_max_scopes"],
@@ -1296,17 +1872,43 @@ def create_app(
     @app.get("/api/settings")
     def get_settings(_: str = Depends(require_admin)):
         with store.connect_readonly(path) as db:
-            return settings.load_with_sources(db, org, env)
+            res = settings.load_with_sources(db, org, env)
+            res["secrets"] = _pairing_secrets_summary(db)
+            return res
 
     @app.post("/api/settings")
     async def post_settings(request: Request, _: str = Depends(require_admin)):
-        body = await request.json()
+        body = dict(await request.json())
+        raw_bearer = body.pop("connector_bearer", None)
+        raw_secret = body.pop("delegation_secret", None)
         try:
             with store.connect(path) as db:
                 db.execute("BEGIN IMMEDIATE")
-                saved = settings.save(db, org, body, env)
+                if body:
+                    settings.save(db, org, body, env)
+                if raw_bearer is not None or raw_secret is not None:
+                    if (raw_bearer and bearer) or (raw_secret and del_secret):
+                        raise ValueError("Environment-managed pairing secret cannot be overridden in UI")
+                    existing_pair = (vault.get(db, org, "pairing", "connector") if vault.ready else None) or {}
+                    updated_pair = dict(existing_pair)
+                    if raw_bearer and raw_bearer != "********":
+                        updated_pair["connector_bearer"] = str(raw_bearer).strip()
+                    if raw_secret and raw_secret != "********":
+                        updated_pair["delegation_secret"] = str(raw_secret).strip()
+                    if updated_pair != existing_pair:
+                        vault.put(db, org, "pairing", "connector", updated_pair)
+                saved = settings.load_with_sources(db, org, env)
+                saved["secrets"] = _pairing_secrets_summary(db)
                 audit.append(
-                    db, org, "owner", "settings.updated", "runtime", {"keys": sorted(body.keys())}
+                    db,
+                    org,
+                    "owner",
+                    "settings.updated",
+                    "runtime",
+                    {
+                        "keys": sorted(body.keys()),
+                        "pairing_updated": bool(raw_bearer or raw_secret),
+                    },
                 )
                 return saved
         except ValueError as exc:
@@ -1314,7 +1916,7 @@ def create_app(
 
     @app.get("/")
     def root(request: Request):
-        if _verify_session_cookie(mgmt_key, request.cookies.get("lnc_care_session")):
+        if _verify_session_cookie(_session_signing_key(), request.cookies.get("lnc_care_session")):
             return RedirectResponse("/admin/", status_code=303)
         return RedirectResponse("/login.html", status_code=303)
 
@@ -1325,15 +1927,19 @@ def create_app(
     @app.get("/admin")
     @app.get("/admin/")
     def admin_page(request: Request):
-        if not _verify_session_cookie(mgmt_key, request.cookies.get("lnc_care_session")):
+        if not _verify_session_cookie(
+            _session_signing_key(), request.cookies.get("lnc_care_session")
+        ):
             return RedirectResponse("/login.html", status_code=303)
         return FileResponse(PUBLIC / "index.html")
 
     @app.get("/icon.svg")
+    @app.get("/favicon.svg")
     def icon_svg():
         return FileResponse(PUBLIC / "icon.svg", media_type="image/svg+xml")
 
     @app.get("/icon.png")
+    @app.get("/favicon.png")
     def icon_png():
         return FileResponse(PUBLIC / "icon.png", media_type="image/png")
 
