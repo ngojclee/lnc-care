@@ -145,11 +145,11 @@ Status: Phase 1 COMPLETED & VERIFIED locally (2026-11-10, `VERSION 0.1.0.0`, `py
 
 ## Phase 4: release
 
-- [ ] gitea `apps/lnc-care` + github mirror; row in
-  `lnc-internal-apps/README.md`.
-- [ ] Host prep `/home/Docker/lnc-care` (uid 10001, `archive/` subdir),
-  Portainer repo-stack (two services), env block, health checks.
-- [ ] NPM FR host + LE cert; access list on `/admin`, `/api`, `/mcp` only;
+- [x] gitea `apps/lnc-care` + github mirror `ngojclee/lnc-care` (push-mirror active); row marked `active` in
+  `lnc-internal-apps/README.md`, `PORTS.md`, and `registry.json` (`8482` on `10.21.4.101`).
+- [x] Host prep `/home/Docker/lnc-care` (uid `10001:10001`, `archive/` and `evidence/` subdirs),
+  Portainer repo-stack `#59` (`lnc-care` on `portainer-fr4` endpoint `4` `paris3`, two services `lnc-care` + `lnc-care-worker`), env block, `/health` (`200 OK`) and `/mcp/` (`200 OK`, 17 tools) verified.
+- [ ] NPM/Caddy FR host + LE cert (`care-mcp.lengoc.me`); access list on `/admin`, `/api`, `/mcp` only;
   `/webhooks/*` open; internal DNS.
 - [ ] Hub managed connector `lnc-care`, pairing, scopes, grants; live
   discovery shows `care__*`.
