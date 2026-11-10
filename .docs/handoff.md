@@ -1,4 +1,4 @@
-# Handoff — LNC Care (`v0.3.0.0`)
+# Handoff — LNC Care (`v0.3.0.1`)
 
 Updated: 2026-11-10.
 Status: **LIVE** on `http://10.21.4.101:8482` and `https://care-mcp.lengoc.me` (Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, FR Caddy Fleet + FR/VN Unbound DNS live, full `lnc-internal-app-blueprint` UI + `#keys` API/Management key contract, `19/19` `pytest` passing).

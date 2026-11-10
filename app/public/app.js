@@ -22,8 +22,8 @@ const TITLES = {
 };
 
 const PROVIDERS = {
-  meta: 'Meta (Facebook & Instagram)',
-  tiktok: 'TikTok Business',
+  meta: 'Meta',
+  tiktok: 'TikTok',
   youtube: 'YouTube'
 };
 const PROV_SHORT = { meta: 'M', tiktok: 'T', youtube: 'Y' };
@@ -130,7 +130,13 @@ function card(title, body, { sub = '', tools = '', flush = false, foot = '' } = 
 
 function table(heads, rows, emptyText) {
   if (!rows.length) return `<div class="empty">${esc(emptyText)}</div>`;
-  const ths = heads.map(h => `<th${h.startsWith('#') ? ' class="num"' : ''}>${esc(h.replace(/^#/, ''))}</th>`).join('');
+  const ths = heads.map(h => {
+    const isNum = h.startsWith('#');
+    const clean = h.replace(/^#/, '');
+    const isAct = clean === 'Actions' || clean === 'Action';
+    const cls = isNum ? ' class="num"' : (isAct ? ' class="act"' : '');
+    return `<th${cls}>${esc(clean)}</th>`;
+  }).join('');
   return `<div class="table-wrap"><table class="data-table"><thead><tr>${ths}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
 }
 
@@ -2064,6 +2070,10 @@ $('#audit-verify-btn')?.addEventListener('click', ev => busy(ev.currentTarget, a
 
 window.addEventListener('hashchange', () => {
   $('#modal-root').innerHTML = '';
+  $$('.select.open').forEach(wrap => {
+    wrap.classList.remove('open');
+    wrap.querySelector('.select-btn')?.setAttribute('aria-expanded', 'false');
+  });
   route().catch(fail);
   window.scrollTo(0, 0);
 });

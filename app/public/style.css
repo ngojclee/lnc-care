@@ -251,7 +251,7 @@ input[type=file]::file-selector-button{background:var(--surface-2);border:1px so
 .data-table tbody tr:last-child td{border-bottom:0}
 .data-table tbody tr:hover td{background:var(--surface-hover)}
 .data-table .num{font-variant-numeric:tabular-nums;text-align:right}
-.data-table th.num{text-align:right}
+.data-table th.num,.data-table th.act{text-align:right}
 .data-table .mono{color:var(--muted)}
 .data-table select,.data-table .select{height:30px;font-size:12.5px;width:auto;min-width:140px}
 .data-table .select-btn{min-height:30px;height:30px;padding:0 10px;font-size:12.5px}
