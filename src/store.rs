@@ -1168,7 +1168,7 @@ pub fn enrich_comment(db: &Connection, organization_id: &str, mut item: Map<Stri
 
     let drafts: Vec<Value> = query_maps(
         db,
-        "SELECT id, kind, strategy_summary, text, created_by, status, approved_by, created_at, updated_at
+        "SELECT id, kind, strategy_summary, text, created_by, status, approved_by, sent_action_id, created_at, updated_at
          FROM reply_drafts WHERE organization_id=? AND comment_id=? ORDER BY id DESC",
         &[organization_id.to_string().into(), cid.into()],
     )
@@ -1176,6 +1176,25 @@ pub fn enrich_comment(db: &Connection, organization_id: &str, mut item: Map<Stri
     .map(Value::Object)
     .collect();
     item.insert("drafts".to_string(), Value::Array(drafts));
+
+    let actions: Vec<Value> = query_maps(
+        db,
+        "SELECT id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at
+         FROM comment_actions WHERE organization_id=? AND comment_id=? ORDER BY id DESC LIMIT 20",
+        &[organization_id.to_string().into(), cid.into()],
+    )
+    .into_iter()
+    .map(|mut act| {
+        let payload = act
+            .get("payload_json")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or_else(|| json!({}));
+        act.insert("payload".to_string(), payload);
+        Value::Object(act)
+    })
+    .collect();
+    item.insert("actions".to_string(), Value::Array(actions));
 
     Value::Object(item)
 }

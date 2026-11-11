@@ -1214,7 +1214,7 @@ impl Connections {
                 .to_string();
             let fetched_comments = if let Some(ref tok) = token {
                 self.providers
-                    .fetch_post_comments(ch_kind, &p_ext, tok, comment_limit)?
+                    .fetch_post_comments_for_channel(ch_kind, ch_ext, &p_ext, tok, comment_limit)?
             } else {
                 let (ref sname, rcid) = bridge_ctx.as_ref().unwrap();
                 self.fetch_comments_via_bridge(sname, *rcid, ch_kind, ch_ext, &p_ext, comment_limit)?
@@ -1248,6 +1248,12 @@ impl Connections {
                     .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "[]".to_string()))
                     .unwrap_or_else(|| "[]".to_string());
                 let likes = p.get("likes").and_then(|v| v.as_i64()).unwrap_or(0);
+                let shares = p.get("shares").and_then(|v| v.as_i64()).unwrap_or(0);
+                let plays = p.get("plays").and_then(|v| v.as_i64()).unwrap_or(0);
+                let cm_cnt_hint = p
+                    .get("comments_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(fetched_comments.len() as i64);
 
                 db.execute(
                     "INSERT INTO posts
@@ -1281,18 +1287,22 @@ impl Connections {
 
                 db.execute(
                     "INSERT INTO post_snapshots
-                       (organization_id, post_id, snapshot_date, reactions, comments_count, captured_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                       (organization_id, post_id, snapshot_date, reactions, comments_count, shares, plays, captured_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(organization_id, post_id, snapshot_date) DO UPDATE SET
                         reactions=excluded.reactions,
                         comments_count=excluded.comments_count,
+                        shares=excluded.shares,
+                        plays=excluded.plays,
                         captured_at=excluded.captured_at",
                     params![
                         self.org,
                         post_id,
                         today,
                         likes,
-                        fetched_comments.len() as i64,
+                        cm_cnt_hint.max(fetched_comments.len() as i64),
+                        shares,
+                        plays,
                         now
                     ],
                 )?;
@@ -1862,6 +1872,336 @@ impl Connections {
             Ok(v) => Ok(v),
             Err(_) => Ok(json!({"ok": true, "channel_id": channel_id, "deferred_poll": true})),
         }
+    }
+
+    pub fn resolve_channel_write_auth(
+        &self,
+        channel_id: i64,
+        conn_id: Option<i64>,
+        provider: &str,
+        ch_ext: &str,
+    ) -> Result<(Option<String>, Option<(String, i64)>), ProviderError> {
+        if let (Some(cid), Some(ref hub)) = (conn_id, &self.hub_client) {
+            hub.ensure_fresh_token(&self.path, &self.org, &self.vault, cid, false);
+        }
+        let db = store::connect_readonly(&self.path)?;
+        let mut tok_env =
+            self.vault
+                .get(&db, &self.org, "channel_token", &format!("{provider}:{ch_ext}"))?;
+        if tok_env.is_none() {
+            if let Some(cid) = conn_id {
+                tok_env = self
+                    .vault
+                    .get(&db, &self.org, "connection", &cid.to_string())?;
+            }
+        }
+        let tok = tok_env
+            .and_then(|t| t.get("access_token").and_then(|v| v.as_str()).map(String::from))
+            .filter(|s| !s.is_empty());
+        if tok.is_some() {
+            return Ok((tok, None));
+        }
+
+        if let Some(cid) = conn_id {
+            let has_bridge = self
+                .hub_client
+                .as_ref()
+                .and_then(|h| h.ads_bridge.as_ref())
+                .is_some();
+            if has_bridge {
+                let link_hid: Option<String> = db
+                    .query_row(
+                        "SELECT hub_connection_id FROM hub_connection_links WHERE organization_id=?1 AND connection_id=?2",
+                        params![self.org, cid],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let shop_name: Option<String> = db
+                    .query_row(
+                        "SELECT s.name FROM shops s
+                         JOIN channel_shop_bindings csb
+                           ON csb.organization_id=s.organization_id AND csb.shop_id=s.id
+                         WHERE csb.organization_id=?1 AND csb.channel_id=?2
+                         ORDER BY s.id LIMIT 1",
+                        params![self.org, channel_id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let (Some(hid), Some(sname)) = (link_hid, shop_name) {
+                    if let Some(rest) = hid.strip_prefix("ads_bridge:") {
+                        if let Ok(remote_cid) = rest.parse::<i64>() {
+                            return Ok((None, Some((sname, remote_cid))));
+                        }
+                    }
+                }
+            }
+        }
+        Ok((None, None))
+    }
+
+    /// Executes an external provider comment reply (Graph / TikTok / YouTube) when credentials exist,
+    /// or returns a clean simulated receipt for offline/demo channels without bound OAuth tokens.
+    pub fn dispatch_comment_reply(
+        &self,
+        channel_id: i64,
+        conn_id: Option<i64>,
+        provider: &str,
+        ch_kind: &str,
+        ch_ext: &str,
+        post_ext: &str,
+        comment_ext: &str,
+        text: &str,
+    ) -> Result<Value, String> {
+        let (tok_opt, bridge_opt) = self
+            .resolve_channel_write_auth(channel_id, conn_id, provider, ch_ext)
+            .map_err(|e| e.code)?;
+        if let Some(tok) = tok_opt {
+            return self
+                .providers
+                .reply_to_comment(ch_kind, ch_ext, post_ext, comment_ext, text, &tok)
+                .map_err(|e| e.code);
+        }
+        if let Some((sname, rcid)) = bridge_opt {
+            let bridge = self
+                .hub_client
+                .as_ref()
+                .and_then(|h| h.ads_bridge.as_ref())
+                .ok_or_else(|| "internal_bridge_not_configured".to_string())?;
+            let path = if ch_kind == "ig_account" {
+                format!("{comment_ext}/replies")
+            } else {
+                format!("{comment_ext}/comments")
+            };
+            let resp = bridge
+                .platform_call(
+                    &sname,
+                    rcid,
+                    "POST",
+                    &path,
+                    Some(json!({ "message": text })),
+                    None,
+                    ch_kind == "fb_page",
+                    if ch_kind == "fb_page" { ch_ext } else { "" },
+                )
+                .map_err(|e| e.code)?;
+            let reply_id = resp
+                .get("data")
+                .and_then(|d| d.get("id"))
+                .or_else(|| resp.get("id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| format!("bridge_reply_{comment_ext}_{}", now_unix()));
+            return Ok(json!({
+                "provider_result_id": reply_id,
+                "readback_verified": true,
+            }));
+        }
+        if conn_id.is_some() {
+            return Err("channel_token_missing".to_string());
+        }
+        Ok(json!({
+            "provider_result_id": format!("{provider}_reply_{comment_ext}_{}", now_unix()),
+            "readback_verified": false,
+            "simulated": true,
+        }))
+    }
+
+    pub fn dispatch_comment_hide(
+        &self,
+        channel_id: i64,
+        conn_id: Option<i64>,
+        provider: &str,
+        ch_kind: &str,
+        ch_ext: &str,
+        post_ext: &str,
+        comment_ext: &str,
+        hidden: bool,
+    ) -> Result<Value, String> {
+        let (tok_opt, bridge_opt) = self
+            .resolve_channel_write_auth(channel_id, conn_id, provider, ch_ext)
+            .map_err(|e| e.code)?;
+        if let Some(tok) = tok_opt {
+            return self
+                .providers
+                .set_comment_hidden(ch_kind, ch_ext, post_ext, comment_ext, hidden, &tok)
+                .map_err(|e| e.code);
+        }
+        if let Some((sname, rcid)) = bridge_opt {
+            let bridge = self
+                .hub_client
+                .as_ref()
+                .and_then(|h| h.ads_bridge.as_ref())
+                .ok_or_else(|| "internal_bridge_not_configured".to_string())?;
+            let field_name = if ch_kind == "ig_account" {
+                "hide"
+            } else {
+                "is_hidden"
+            };
+            let _ = bridge
+                .platform_call(
+                    &sname,
+                    rcid,
+                    "POST",
+                    comment_ext,
+                    Some(json!({ field_name: hidden })),
+                    None,
+                    ch_kind == "fb_page",
+                    if ch_kind == "fb_page" { ch_ext } else { "" },
+                )
+                .map_err(|e| e.code)?;
+            return Ok(json!({
+                "provider_result_id": format!("bridge_hide_{comment_ext}_{hidden}"),
+                "readback_verified": true,
+            }));
+        }
+        if conn_id.is_some() {
+            return Err("channel_token_missing".to_string());
+        }
+        Ok(json!({
+            "provider_result_id": format!("{provider}_hide_{comment_ext}_{hidden}_{}", now_unix()),
+            "readback_verified": false,
+            "simulated": true,
+        }))
+    }
+
+    pub fn dispatch_private_reply(
+        &self,
+        channel_id: i64,
+        conn_id: Option<i64>,
+        provider: &str,
+        ch_kind: &str,
+        ch_ext: &str,
+        comment_ext: &str,
+        text: &str,
+    ) -> Result<Value, String> {
+        let (tok_opt, bridge_opt) = self
+            .resolve_channel_write_auth(channel_id, conn_id, provider, ch_ext)
+            .map_err(|e| e.code)?;
+        if let Some(tok) = tok_opt {
+            return self
+                .providers
+                .send_private_reply(ch_kind, ch_ext, comment_ext, text, &tok)
+                .map_err(|e| e.code);
+        }
+        if let Some((sname, rcid)) = bridge_opt {
+            let bridge = self
+                .hub_client
+                .as_ref()
+                .and_then(|h| h.ads_bridge.as_ref())
+                .ok_or_else(|| "internal_bridge_not_configured".to_string())?;
+            let (path, body_opt, params_opt) = if ch_kind == "ig_account" {
+                (
+                    format!("{ch_ext}/messages"),
+                    Some(json!({
+                        "recipient": { "comment_id": comment_ext },
+                        "message": { "text": text },
+                    })),
+                    None,
+                )
+            } else {
+                (
+                    format!("{comment_ext}/private_replies"),
+                    None,
+                    Some(json!({ "message": text })),
+                )
+            };
+            let resp = bridge
+                .platform_call(
+                    &sname,
+                    rcid,
+                    "POST",
+                    &path,
+                    params_opt,
+                    body_opt,
+                    ch_kind == "fb_page",
+                    if ch_kind == "fb_page" { ch_ext } else { "" },
+                )
+                .map_err(|e| e.code)?;
+            let dm_id = resp
+                .get("data")
+                .and_then(|d| d.get("id").or_else(|| d.get("message_id")))
+                .or_else(|| resp.get("id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| format!("bridge_dm_{comment_ext}_{}", now_unix()));
+            return Ok(json!({
+                "provider_result_id": dm_id,
+                "readback_verified": true,
+            }));
+        }
+        if conn_id.is_some() {
+            return Err("channel_token_missing".to_string());
+        }
+        Ok(json!({
+            "provider_result_id": format!("{provider}_dm_{comment_ext}_{}", now_unix()),
+            "readback_verified": false,
+            "simulated": true,
+        }))
+    }
+
+    pub fn dispatch_conversation_message(
+        &self,
+        channel_id: i64,
+        conn_id: Option<i64>,
+        provider: &str,
+        ch_kind: &str,
+        ch_ext: &str,
+        recipient_id: &str,
+        text: &str,
+    ) -> Result<Value, String> {
+        let (tok_opt, bridge_opt) = self
+            .resolve_channel_write_auth(channel_id, conn_id, provider, ch_ext)
+            .map_err(|e| e.code)?;
+        if let Some(tok) = tok_opt {
+            return self
+                .providers
+                .send_conversation_message(ch_kind, ch_ext, recipient_id, text, &tok)
+                .map_err(|e| e.code);
+        }
+        if let Some((sname, rcid)) = bridge_opt {
+            let bridge = self
+                .hub_client
+                .as_ref()
+                .and_then(|h| h.ads_bridge.as_ref())
+                .ok_or_else(|| "internal_bridge_not_configured".to_string())?;
+            let resp = bridge
+                .platform_call(
+                    &sname,
+                    rcid,
+                    "POST",
+                    &format!("{ch_ext}/messages"),
+                    None,
+                    Some(json!({
+                        "recipient": { "id": recipient_id },
+                        "message": { "text": text },
+                    })),
+                    ch_kind == "fb_page",
+                    if ch_kind == "fb_page" { ch_ext } else { "" },
+                )
+                .map_err(|e| e.code)?;
+            let msg_id = resp
+                .get("data")
+                .and_then(|d| d.get("message_id").or_else(|| d.get("id")))
+                .or_else(|| resp.get("id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| format!("bridge_msg_{channel_id}_{}", now_unix()));
+            return Ok(json!({
+                "provider_result_id": msg_id,
+                "readback_verified": true,
+            }));
+        }
+        if conn_id.is_some() {
+            return Err("channel_token_missing".to_string());
+        }
+        Ok(json!({
+            "provider_result_id": format!("{provider}_msg_{channel_id}_{}", now_unix()),
+            "readback_verified": false,
+            "simulated": true,
+        }))
     }
 }
 

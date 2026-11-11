@@ -2265,18 +2265,47 @@ async fn test_mcp_tools_execution_and_browser_write_guard() {
     let cmt_arr = cms["result"]["structuredContent"]["comments"]
         .as_array()
         .unwrap();
-    let api_cmt_id = cmt_arr
+    let api_cmt = cmt_arr
         .iter()
         .find(|x| x["adapter"] == "meta_api")
-        .unwrap()["id"]
-        .as_i64()
         .unwrap();
+    let api_cmt_id = api_cmt["id"].as_i64().unwrap();
+    let api_ch_id = api_cmt["channel_id"].as_i64().unwrap();
     let vb_cmt_id = cmt_arr
         .iter()
         .find(|x| x["adapter"] == "veilbrowser")
         .unwrap()["id"]
         .as_i64()
         .unwrap();
+
+    // 0. Default `draft_only` channel policy blocks unapproved direct agent reply!
+    let blocked_rep = call_tool(
+        &mut c,
+        &auth_hdr,
+        &mut seq,
+        "comment_reply",
+        json!({
+            "comment_id": api_cmt_id,
+            "text": "Unapproved direct reply on draft_only channel",
+            "idempotency_key": "idem-blocked-draft-only",
+        }),
+    )
+    .await;
+    assert_eq!(blocked_rep["result"]["isError"], true);
+    assert!(blocked_rep["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("reply_policy_requires_approval"));
+
+    // Operator promotes channel policy to `agent_direct`
+    let pol_res = c
+        .post_json(
+            &format!("/api/admin/channels/{api_ch_id}/policy"),
+            &json!({ "reply_policy": "agent_direct", "auto_suggest_threshold": 80 }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await;
+    assert_eq!(pol_res.status, 200);
 
     // 1. Guarded write on official `meta_api` channel succeeds & is idempotent
     let rep1 = call_tool(
@@ -3223,6 +3252,694 @@ async fn test_phase2b_fleet_leases_preflight_circuit_breaker_telegram_budgets_an
     assert_eq!(resume_ok["health_status"], "healthy");
 
     // Audit hash chain remains 100% intact across all Phase 2b operations
+    let aud = c.get("/api/admin/audit/verify").await.json();
+    assert_eq!(aud["valid"], true);
+}
+
+// ============================================================================
+// 22. Phase 3: Guarded Provider Writes + Readback Verification, Draft Approval,
+//     IG 7-Day Window, Per-Provider Write Gate, and TikTok + YouTube Official Ingest
+// ============================================================================
+#[tokio::test]
+async fn test_phase3_guarded_writes_readback_policy_and_tiktok_youtube_ingest() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase3.db");
+
+    let provider_calls: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let pc_ref = provider_calls.clone();
+
+    let p3_transport = mock_transport(move |req: TransportRequest| {
+        pc_ref
+            .lock()
+            .unwrap()
+            .push((req.method.clone(), req.url.clone()));
+
+        // --- Meta OAuth & Graph API ---
+        if req.url.contains("/oauth/access_token") {
+            return Ok(json_transport_resp(
+                200,
+                json!({ "access_token": "meta_user_tok_p3", "expires_in": 5184000 }),
+            ));
+        }
+        if req.url.contains("/me/accounts") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "data": [{
+                        "id": "55001122",
+                        "name": "LuxeClaw Paris Official",
+                        "username": "luxeclaw.paris",
+                        "fan_count": 31200,
+                        "access_token": "fb_page_tok_p3",
+                        "instagram_business_account": {
+                            "id": "1789001122",
+                            "name": "LuxeClaw IG Paris",
+                            "username": "luxeclaw.ig.paris",
+                            "followers_count": 21500
+                        }
+                    }]
+                }),
+            ));
+        }
+        if req.url.contains("/55001122/published_posts") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "data": [{
+                        "id": "55001122_801",
+                        "message": "Handcrafted Press-On Nails — EU Express 48h",
+                        "permalink_url": "https://www.facebook.com/luxeclaw/posts/801"
+                    }]
+                }),
+            ));
+        }
+        if req.url.contains("/55001122_801/comments") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "data": [{
+                        "id": "fb_cm_801",
+                        "from": { "id": "u_801", "name": "Camille Laurent" },
+                        "message": "Bonjour, quel est le prix du coffret Almond S avec livraison Paris ?",
+                        "is_hidden": false,
+                        "like_count": 3,
+                        "comment_count": 0
+                    }]
+                }),
+            ));
+        }
+        if req.url.contains("/1789001122/media") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "data": [{
+                        "id": "ig_med_802",
+                        "caption": "Velvet Cat-Eye IG Reel",
+                        "media_type": "VIDEO",
+                        "permalink": "https://www.instagram.com/p/IG802/",
+                        "like_count": 95,
+                        "comments_count": 1
+                    }]
+                }),
+            ));
+        }
+        if req.url.contains("/ig_med_802/comments") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "data": [{
+                        "id": "ig_cm_old_802",
+                        "username": "sophie.old",
+                        "text": "Superbe pose !",
+                        "hidden": false,
+                        "like_count": 1
+                    }]
+                }),
+            ));
+        }
+        // Meta write: POST comment reply + GET readback
+        if req.method == "POST" && req.url.contains("/fb_cm_801/comments") {
+            return Ok(json_transport_resp(200, json!({ "id": "fb_reply_9901" })));
+        }
+        if req.method == "GET" && req.url.contains("/fb_reply_9901") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "id": "fb_reply_9901",
+                    "message": "Bonjour Camille ! Le coffret Almond S est disponible avec livraison 48h Paris."
+                }),
+            ));
+        }
+        // Meta write: POST private reply
+        if req.method == "POST" && req.url.contains("/fb_cm_801/private_replies") {
+            return Ok(json_transport_resp(200, json!({ "id": "fb_dm_9902" })));
+        }
+        // Meta write: POST hide + GET readback
+        if req.method == "POST" && req.url.contains("/fb_cm_801") {
+            return Ok(json_transport_resp(200, json!({ "success": true })));
+        }
+        if req.method == "GET" && req.url.contains("/fb_cm_801") {
+            return Ok(json_transport_resp(
+                200,
+                json!({ "id": "fb_cm_801", "is_hidden": true }),
+            ));
+        }
+
+        // --- TikTok Business API v1.3 ---
+        if req.url.contains("business-api.tiktok.com/open_api/v1.3/oauth2/access_token/") {
+            return Ok(json_transport_resp(
+                200,
+                json!({ "data": { "access_token": "tt_tok_p3", "open_id": "tt_biz_001", "expires_in": 86400 } }),
+            ));
+        }
+        if req.url.contains("/open_api/v1.3/business/get/") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "code": 0,
+                    "data": {
+                        "open_id": "tt_biz_001",
+                        "display_name": "LuxeClaw TikTok Official",
+                        "username": "luxeclaw.tiktok",
+                        "followers_count": 44800
+                    }
+                }),
+            ));
+        }
+        if req.url.contains("/open_api/v1.3/business/video/list/") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "code": 0,
+                    "data": {
+                        "videos": [{
+                            "item_id": "tt_vid_701",
+                            "caption": "10-Minute Salon Press-On Tutorial #nailart",
+                            "share_url": "https://www.tiktok.com/@luxeclaw.tiktok/video/701",
+                            "cover_image_url": "https://cdn.example.com/tt701.jpg",
+                            "likes": 620,
+                            "comments": 14,
+                            "shares": 38,
+                            "video_views": 19400
+                        }]
+                    }
+                }),
+            ));
+        }
+        if req.url.contains("/open_api/v1.3/business/comment/list/") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "code": 0,
+                    "data": {
+                        "comments": [{
+                            "comment_id": "tt_cm_701",
+                            "user_id": "tt_u_99",
+                            "username": "chloe.nails",
+                            "text": "Can I order Almond size S to Lyon? How much is the set?",
+                            "likes": 4,
+                            "replies": 0,
+                            "status": "PUBLIC"
+                        }]
+                    }
+                }),
+            ));
+        }
+
+        // --- YouTube Data API v3 ---
+        if req.url.contains("oauth2.googleapis.com/token") {
+            return Ok(json_transport_resp(
+                200,
+                json!({ "access_token": "yt_tok_p3", "expires_in": 3600 }),
+            ));
+        }
+        if req.url.contains("googleapis.com/youtube/v3/channels") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "items": [{
+                        "id": "UC_LUXECLAW_01",
+                        "snippet": {
+                            "title": "LuxeClaw Studio TV",
+                            "customUrl": "@luxeclawtv"
+                        },
+                        "statistics": {
+                            "subscriberCount": "15900"
+                        }
+                    }]
+                }),
+            ));
+        }
+        if req.url.contains("googleapis.com/youtube/v3/search") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "items": [{
+                        "id": { "videoId": "yt_vid_601" },
+                        "snippet": {
+                            "title": "How To Prep & Reuse Press-On Nails Without Damage",
+                            "thumbnails": { "high": { "url": "https://img.youtube.com/vi/yt_vid_601/hqdefault.jpg" } }
+                        }
+                    }]
+                }),
+            ));
+        }
+        if req.url.contains("googleapis.com/youtube/v3/videos") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "items": [{
+                        "id": "yt_vid_601",
+                        "statistics": {
+                            "viewCount": "8400",
+                            "likeCount": "310",
+                            "commentCount": "9"
+                        }
+                    }]
+                }),
+            ));
+        }
+        if req.url.contains("googleapis.com/youtube/v3/commentThreads") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "items": [{
+                        "snippet": {
+                            "topLevelComment": {
+                                "id": "yt_cm_601",
+                                "snippet": {
+                                    "authorDisplayName": "Manon Girard",
+                                    "authorChannelId": { "value": "UC_MANON_88" },
+                                    "textOriginal": "Where can I buy the Velvet Chrome press-on kit in France?",
+                                    "likeCount": 5
+                                }
+                            },
+                            "totalReplyCount": 1
+                        },
+                        "replies": {
+                            "comments": [{
+                                "id": "yt_cm_601_r1",
+                                "snippet": {
+                                    "authorDisplayName": "LuxeClaw Studio TV",
+                                    "authorChannelId": { "value": "UC_LUXECLAW_01" },
+                                    "textOriginal": "Thank you Manon!",
+                                    "likeCount": 1
+                                }
+                            }]
+                        }
+                    }]
+                }),
+            ));
+        }
+        if req.method == "POST" && req.url.contains("googleapis.com/youtube/v3/comments") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "id": "yt_reply_6601",
+                    "snippet": {
+                        "textOriginal": "Hi Manon! Order directly at luxeclaw.com with 48h tracked France delivery."
+                    }
+                }),
+            ));
+        }
+
+        Ok(json_transport_resp(404, json!({ "error": "unmocked_url", "url": req.url })))
+    });
+
+    // Configure per-provider write gates:
+    // global `PROVIDER_WRITES_ENABLED=true`, `PROVIDER_WRITES_TIKTOK_ENABLED=false` (blocks TikTok writes while allowing Meta & YouTube!)
+    let mut cfg = base_app_config(db_path.clone());
+    cfg.transport = Some(p3_transport);
+    let mut env_ov = HashMap::new();
+    env_ov.insert("PROVIDER_WRITES_ENABLED".to_string(), "true".to_string());
+    env_ov.insert("PROVIDER_WRITES_META_ENABLED".to_string(), "true".to_string());
+    env_ov.insert("PROVIDER_WRITES_TIKTOK_ENABLED".to_string(), "false".to_string());
+    env_ov.insert("PROVIDER_WRITES_YOUTUBE_ENABLED".to_string(), "true".to_string());
+    cfg.env_overrides = Some(env_ov);
+
+    let mut c = TestClient::new(build_router(cfg).unwrap());
+    let csrf = c.login(MGMT_KEY).await;
+
+    // Health exposes `writes_by_provider`
+    let h = c.get("/health").await.json();
+    assert_eq!(h["version"], VERSION);
+    assert_eq!(h["writes_by_provider"]["meta"], true);
+    assert_eq!(h["writes_by_provider"]["tiktok"], false);
+    assert_eq!(h["writes_by_provider"]["youtube"], true);
+
+    c.post_json(
+        "/api/settings",
+        &json!({
+            "mcp_max_scopes": [
+                "care:read", "care:read:meta", "care:read:tiktok", "care:read:youtube",
+                "care:write", "care:write:meta", "care:write:tiktok", "care:write:youtube"
+            ]
+        }),
+        &[("x-csrf-token", &csrf)],
+    )
+    .await;
+
+    let shop = c
+        .post_json(
+            "/api/admin/shops",
+            &json!({ "name": "LuxeClaw Omnichannel" }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await
+        .json();
+    let shop_id = shop["id"].as_i64().unwrap();
+
+    // Helper to OAuth-connect a provider (`meta`, `tiktok`, `youtube`)
+    async fn setup_provider_conn(
+        c: &mut TestClient,
+        csrf: &str,
+        provider: &str,
+        label: &str,
+    ) -> i64 {
+        c.post_json(
+            &format!("/api/admin/integrations/{provider}"),
+            &json!({ "client_id": format!("{provider}_cid"), "client_secret": format!("{provider}_sec") }),
+            &[("x-csrf-token", csrf)],
+        )
+        .await;
+        let conn = c
+            .post_json(
+                "/api/admin/connections",
+                &json!({ "provider": provider, "label": label }),
+                &[("x-csrf-token", csrf)],
+            )
+            .await
+            .json();
+        let cid = conn["id"].as_i64().unwrap();
+        let start = c
+            .post_json(
+                &format!("/api/admin/connections/{cid}/authorize"),
+                &json!({}),
+                &[("x-csrf-token", csrf)],
+            )
+            .await
+            .json();
+        let auth_url = start["authorization_url"].as_str().unwrap();
+        let state_val = auth_url
+            .split("state=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
+        let cb = c
+            .get(&format!(
+                "/api/auth/providers/{provider}/callback?state={state_val}&code=code_{provider}"
+            ))
+            .await;
+        assert_eq!(cb.status, 303);
+        let disc = c
+            .post_json(
+                &format!("/api/admin/connections/{cid}/discover"),
+                &json!({}),
+                &[("x-csrf-token", csrf)],
+            )
+            .await;
+        assert_eq!(disc.status, 200, "discover {provider} failed: {}", disc.text());
+        cid
+    }
+
+    let meta_cid = setup_provider_conn(&mut c, &csrf, "meta", "Meta Omnichannel").await;
+    let tt_cid = setup_provider_conn(&mut c, &csrf, "tiktok", "TikTok Business").await;
+    let yt_cid = setup_provider_conn(&mut c, &csrf, "youtube", "YouTube Official").await;
+
+    // Approve & sync FB (`draft_only`), IG (`agent_direct`), TikTok (`agent_direct`), YouTube (`agent_direct`)
+    let fb_ch = c
+        .post_json(
+            &format!("/api/admin/connections/{meta_cid}/channels/approve"),
+            &json!({ "external_id": "55001122", "shop_id": shop_id, "reply_policy": "draft_only" }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await
+        .json()["channel_id"]
+        .as_i64()
+        .unwrap();
+    let ig_ch = c
+        .post_json(
+            &format!("/api/admin/connections/{meta_cid}/channels/approve"),
+            &json!({ "external_id": "1789001122", "shop_id": shop_id, "reply_policy": "agent_direct" }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await
+        .json()["channel_id"]
+        .as_i64()
+        .unwrap();
+    let tt_ch = c
+        .post_json(
+            &format!("/api/admin/connections/{tt_cid}/channels/approve"),
+            &json!({ "external_id": "tt_biz_001", "shop_id": shop_id, "reply_policy": "agent_direct" }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await
+        .json()["channel_id"]
+        .as_i64()
+        .unwrap();
+    let yt_ch = c
+        .post_json(
+            &format!("/api/admin/connections/{yt_cid}/channels/approve"),
+            &json!({ "external_id": "UC_LUXECLAW_01", "shop_id": shop_id, "reply_policy": "agent_direct" }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await
+        .json()["channel_id"]
+        .as_i64()
+        .unwrap();
+
+    for ch_id in [fb_ch, ig_ch, tt_ch, yt_ch] {
+        let s = c
+            .post_json(
+                &format!("/api/admin/channels/{ch_id}/sync"),
+                &json!({}),
+                &[("x-csrf-token", &csrf)],
+            )
+            .await;
+        assert_eq!(s.status, 200, "sync channel {ch_id} failed: {}", s.text());
+    }
+
+    // Verify TikTok + YouTube comments & metrics ingested
+    let all_cms = c.get("/api/admin/comments").await.json()["comments"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let fb_cm_id = all_cms
+        .iter()
+        .find(|x| x["external_id"] == "fb_cm_801")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let ig_cm_id = all_cms
+        .iter()
+        .find(|x| x["external_id"] == "ig_cm_old_802")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let tt_cm_id = all_cms
+        .iter()
+        .find(|x| x["external_id"] == "tt_cm_701")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let yt_cm_id = all_cms
+        .iter()
+        .find(|x| x["external_id"] == "yt_cm_601")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // Age the IG comment past 7 days to test IG 7-day private reply window enforcement
+    {
+        let db = store::connect(&db_path).unwrap();
+        db.execute(
+            "UPDATE comments SET created_at = created_at - (9 * 86400) WHERE id=?1",
+            rusqlite::params![ig_cm_id],
+        )
+        .unwrap();
+    }
+
+    let auth_hdr = format!("Bearer {BEARER}");
+    let mut seq = 0u64;
+    async fn mcp_call(
+        client: &mut TestClient,
+        auth_hdr: &str,
+        seq: &mut u64,
+        name: &str,
+        args: Value,
+    ) -> Value {
+        *seq += 1;
+        let nonce = format!("nonce_p3_tool_{:016}", *seq);
+        let tok = sign_delegation_token(
+            DEL_SECRET,
+            "lnc-care",
+            "agent:lnm-care",
+            &[
+                "care:read",
+                "care:read:meta",
+                "care:read:tiktok",
+                "care:read:youtube",
+                "care:write",
+                "care:write:meta",
+                "care:write:tiktok",
+                "care:write:youtube",
+            ],
+            &nonce,
+        );
+        client
+            .post_json(
+                "/mcp",
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": *seq,
+                    "method": "tools/call",
+                    "params": { "name": name, "arguments": args }
+                }),
+                &[("authorization", auth_hdr), ("x-lnc-delegation", &tok)],
+            )
+            .await
+            .json()
+    }
+
+    // 1. Draft-for-approval flow on FB (`draft_only`):
+    //    a) Unapproved direct MCP reply -> rejected (`reply_policy_requires_approval`)
+    let unapp = mcp_call(
+        &mut c,
+        &auth_hdr,
+        &mut seq,
+        "comment_reply",
+        json!({
+            "comment_id": fb_cm_id,
+            "text": "Unapproved direct reply",
+            "idempotency_key": "idem-p3-unapproved",
+        }),
+    )
+    .await;
+    assert_eq!(unapp["result"]["isError"], true);
+    assert!(unapp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("reply_policy_requires_approval"));
+
+    //    b) Operator approves public draft in UI (`/api/admin/comments/:id/drafts`)
+    let approved_text =
+        "Bonjour Camille ! Le coffret Almond S est disponible avec livraison 48h Paris.";
+    let dr_save = c
+        .post_json(
+            &format!("/api/admin/comments/{fb_cm_id}/drafts"),
+            &json!({
+                "text": approved_text,
+                "kind": "public",
+                "status": "approved",
+                "strategy_summary": "Confirm Almond S availability + 48h Paris shipping"
+            }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await
+        .json();
+    let draft_id = dr_save["draft_id"].as_i64().unwrap();
+
+    //    c) Agent executes approved `draft_id` via `care__comment_reply` -> hits Meta Graph POST + GET readback!
+    let rep_ok = mcp_call(
+        &mut c,
+        &auth_hdr,
+        &mut seq,
+        "comment_reply",
+        json!({
+            "comment_id": fb_cm_id,
+            "draft_id": draft_id,
+            "idempotency_key": "idem-p3-approved-001",
+        }),
+    )
+    .await;
+    assert_eq!(rep_ok["result"]["isError"], false, "rep_ok: {rep_ok}");
+    assert_eq!(
+        rep_ok["result"]["structuredContent"]["provider_result_id"],
+        "fb_reply_9901"
+    );
+    assert_eq!(
+        rep_ok["result"]["structuredContent"]["readback_verified"],
+        true
+    );
+
+    //    d) Verify draft transitioned to `status='sent'` and `actions` recorded in thread
+    let fb_thread = c
+        .get(&format!("/api/admin/comments/{fb_cm_id}"))
+        .await
+        .json();
+    let sent_draft = fb_thread["thread"]["drafts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == draft_id)
+        .unwrap();
+    assert_eq!(sent_draft["status"], "sent");
+    assert!(sent_draft["sent_action_id"].as_i64().is_some());
+
+    // 2. Operator direct hide & private reply via `/api/admin/comments/:id/hide` & `/private-reply`
+    let hide_adm = c
+        .post_json(
+            &format!("/api/admin/comments/{fb_cm_id}/hide"),
+            &json!({ "hidden": true }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await;
+    assert_eq!(hide_adm.status, 200);
+    assert_eq!(hide_adm.json()["readback_verified"], true);
+
+    let dm_adm = c
+        .post_json(
+            &format!("/api/admin/comments/{fb_cm_id}/private-reply"),
+            &json!({ "text": "Bonjour Camille, voici le guide des tailles en message privé !" }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await;
+    assert_eq!(dm_adm.status, 200);
+    assert_eq!(dm_adm.json()["provider_result_id"], "fb_dm_9902");
+
+    // 3. IG 7-day private reply window guard (`ig_private_reply_window_expired`)
+    let ig_exp = mcp_call(
+        &mut c,
+        &auth_hdr,
+        &mut seq,
+        "comment_private_reply",
+        json!({
+            "comment_id": ig_cm_id,
+            "text": "Late DM after 9 days",
+            "idempotency_key": "idem-p3-ig-expired",
+        }),
+    )
+    .await;
+    assert_eq!(ig_exp["result"]["isError"], true);
+    assert!(ig_exp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("ig_private_reply_window_expired"));
+
+    // 4. Per-provider write gate: TikTok write blocked (`PROVIDER_WRITES_TIKTOK_ENABLED=false`) while YouTube write succeeds!
+    let tt_blocked = mcp_call(
+        &mut c,
+        &auth_hdr,
+        &mut seq,
+        "comment_reply",
+        json!({
+            "comment_id": tt_cm_id,
+            "text": "Yes Chloe! Almond size S ships in 48h.",
+            "idempotency_key": "idem-p3-tt-blocked",
+        }),
+    )
+    .await;
+    assert_eq!(tt_blocked["result"]["isError"], true);
+    assert!(tt_blocked["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("provider_writes_disabled"));
+
+    let yt_ok = mcp_call(
+        &mut c,
+        &auth_hdr,
+        &mut seq,
+        "comment_reply",
+        json!({
+            "comment_id": yt_cm_id,
+            "text": "Hi Manon! Order directly at luxeclaw.com with 48h tracked France delivery.",
+            "idempotency_key": "idem-p3-yt-reply-01",
+        }),
+    )
+    .await;
+    assert_eq!(yt_ok["result"]["isError"], false, "yt_ok: {yt_ok}");
+    assert_eq!(
+        yt_ok["result"]["structuredContent"]["provider_result_id"],
+        "yt_reply_6601"
+    );
+    assert_eq!(
+        yt_ok["result"]["structuredContent"]["readback_verified"],
+        true
+    );
+
+    // 5. Audit hash chain remains 100% valid
     let aud = c.get("/api/admin/audit/verify").await.json();
     assert_eq!(aud["valid"], true);
 }

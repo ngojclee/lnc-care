@@ -22,6 +22,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::connections::Connections;
 use crate::mcp_gateway::McpGatewayClient;
 use crate::store::{self, query_maps, query_one_map};
 use crate::transport::SharedTransport;
@@ -84,6 +85,35 @@ pub struct McpServerConfig {
     pub vault: Vault,
     pub env_map: HashMap<String, String>,
     pub transport: Option<SharedTransport>,
+    pub conns: Connections,
+}
+
+/// Checks whether external provider writes are enabled for a given provider (`meta`, `tiktok`, `youtube`),
+/// honoring per-provider overrides (`PROVIDER_WRITES_META_ENABLED`, etc.) with fallback to `writes_enabled`.
+pub fn provider_writes_allowed(
+    writes_enabled: bool,
+    env_map: &HashMap<String, String>,
+    provider: &str,
+) -> bool {
+    let key = format!("PROVIDER_WRITES_{}_ENABLED", provider.trim().to_ascii_uppercase());
+    if let Some(raw) = env_map.get(&key) {
+        let clean = raw.trim();
+        if clean.eq_ignore_ascii_case("true") || clean == "1" {
+            return true;
+        }
+        if clean.eq_ignore_ascii_case("false") || clean == "0" {
+            return false;
+        }
+    }
+    writes_enabled
+}
+
+pub fn writes_by_provider_summary(writes_enabled: bool, env_map: &HashMap<String, String>) -> Value {
+    json!({
+        "meta": provider_writes_allowed(writes_enabled, env_map, "meta"),
+        "tiktok": provider_writes_allowed(writes_enabled, env_map, "tiktok"),
+        "youtube": provider_writes_allowed(writes_enabled, env_map, "youtube"),
+    })
 }
 
 fn now_unix() -> i64 {
@@ -479,19 +509,19 @@ fn require_tool_scopes<'a>(
 }
 
 fn guarded_comment_write<F>(
-    path: &Path,
-    org: &str,
+    cfg: &McpServerConfig,
     caller: &McpCaller,
     tool: &str,
     comment_id: i64,
     idempotency_key: &str,
     request_payload: &Value,
-    writes_enabled: bool,
     f: F,
 ) -> Result<Value, String>
 where
-    F: FnOnce(&rusqlite::Connection, &McpCaller, &Map<String, Value>) -> Result<Value, String>,
+    F: FnOnce(&McpCaller, &Map<String, Value>) -> Result<Value, String>,
 {
+    let path = &cfg.path;
+    let org = cfg.org.as_str();
     if idempotency_key.trim().len() < 6 {
         return Err("idempotency_key_required".to_string());
     }
@@ -501,8 +531,11 @@ where
         let db = store::connect_readonly(path).map_err(|e| e.to_string())?;
         let row = query_one_map(
             &db,
-            "SELECT cm.*, c.provider, c.adapter, c.approved, c.reply_policy
+            "SELECT cm.*, p.external_id AS post_external_id,
+                    c.provider, c.kind AS channel_kind, c.external_id AS channel_external_id,
+                    c.connection_id, c.adapter, c.approved, c.reply_policy
              FROM comments cm
+             JOIN posts p ON p.id=cm.post_id AND p.organization_id=cm.organization_id
              JOIN channels c ON c.id=cm.channel_id AND c.organization_id=cm.organization_id
              WHERE cm.organization_id=? AND cm.id=?",
             &[org.to_string().into(), comment_id.into()],
@@ -520,13 +553,12 @@ where
     let provider = cm
         .get("provider")
         .and_then(|v| v.as_str())
-        .unwrap_or("meta");
+        .unwrap_or("meta")
+        .to_string();
     require_tool_scopes(caller, tool, &[format!("care:write:{provider}")])?;
 
-    let db = store::connect(path).map_err(|e| e.to_string())?;
-    db.execute_batch("BEGIN IMMEDIATE;")
-        .map_err(|e| e.to_string())?;
-    let outcome: Result<Value, String> = (|| {
+    {
+        let db = store::connect_readonly(path).map_err(|e| e.to_string())?;
         if let Some(existing) = query_one_map(
             &db,
             "SELECT * FROM write_operations WHERE organization_id=? AND idempotency_key=?",
@@ -550,10 +582,14 @@ where
                 }
             }
         }
-        if !writes_enabled {
-            return Err("provider_writes_disabled".to_string());
-        }
-        let res = f(&db, caller, &cm)?;
+    }
+
+    if !provider_writes_allowed(cfg.writes_enabled, &cfg.env_map, &provider) {
+        return Err("provider_writes_disabled".to_string());
+    }
+
+    let res = f(caller, &cm)?;
+    store::with_write_tx_str(path, |db| {
         db.execute(
             "INSERT OR REPLACE INTO write_operations
              (organization_id, idempotency_key, tool, request_hash, result_json, created_at)
@@ -568,35 +604,25 @@ where
             ],
         )
         .map_err(|e| e.to_string())?;
-        Ok(res)
-    })();
-
-    match outcome {
-        Ok(v) => {
-            db.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
-            Ok(v)
-        }
-        Err(e) => {
-            let _ = db.execute_batch("ROLLBACK;");
-            Err(e)
-        }
-    }
+        Ok(())
+    })?;
+    Ok(res)
 }
 
 fn guarded_conversation_write<F>(
-    path: &Path,
-    org: &str,
+    cfg: &McpServerConfig,
     caller: &McpCaller,
     tool: &str,
     conversation_id: i64,
     idempotency_key: &str,
     request_payload: &Value,
-    writes_enabled: bool,
     f: F,
 ) -> Result<Value, String>
 where
-    F: FnOnce(&rusqlite::Connection, &McpCaller, &Map<String, Value>) -> Result<Value, String>,
+    F: FnOnce(&McpCaller, &Map<String, Value>) -> Result<Value, String>,
 {
+    let path = &cfg.path;
+    let org = cfg.org.as_str();
     if idempotency_key.trim().len() < 6 {
         return Err("idempotency_key_required".to_string());
     }
@@ -606,7 +632,8 @@ where
         let db = store::connect_readonly(path).map_err(|e| e.to_string())?;
         let row = query_one_map(
             &db,
-            "SELECT cv.*, c.provider, c.adapter, c.approved, c.reply_policy
+            "SELECT cv.*, c.provider, c.kind AS channel_kind, c.external_id AS channel_external_id,
+                    c.connection_id, c.adapter, c.approved, c.reply_policy
              FROM conversations cv
              JOIN channels c ON c.id=cv.channel_id AND c.organization_id=cv.organization_id
              WHERE cv.organization_id=? AND cv.id=?",
@@ -625,13 +652,12 @@ where
     let provider = conv
         .get("provider")
         .and_then(|v| v.as_str())
-        .unwrap_or("meta");
+        .unwrap_or("meta")
+        .to_string();
     require_tool_scopes(caller, tool, &[format!("care:write:{provider}")])?;
 
-    let db = store::connect(path).map_err(|e| e.to_string())?;
-    db.execute_batch("BEGIN IMMEDIATE;")
-        .map_err(|e| e.to_string())?;
-    let outcome: Result<Value, String> = (|| {
+    {
+        let db = store::connect_readonly(path).map_err(|e| e.to_string())?;
         if let Some(existing) = query_one_map(
             &db,
             "SELECT * FROM write_operations WHERE organization_id=? AND idempotency_key=?",
@@ -655,10 +681,14 @@ where
                 }
             }
         }
-        if !writes_enabled {
-            return Err("provider_writes_disabled".to_string());
-        }
-        let res = f(&db, caller, &conv)?;
+    }
+
+    if !provider_writes_allowed(cfg.writes_enabled, &cfg.env_map, &provider) {
+        return Err("provider_writes_disabled".to_string());
+    }
+
+    let res = f(caller, &conv)?;
+    store::with_write_tx_str(path, |db| {
         db.execute(
             "INSERT OR REPLACE INTO write_operations
              (organization_id, idempotency_key, tool, request_hash, result_json, created_at)
@@ -673,19 +703,75 @@ where
             ],
         )
         .map_err(|e| e.to_string())?;
-        Ok(res)
-    })();
+        Ok(())
+    })?;
+    Ok(res)
+}
 
-    match outcome {
-        Ok(v) => {
-            db.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
-            Ok(v)
+fn resolve_agent_reply_text_and_policy(
+    path: &Path,
+    org: &str,
+    comment_id: i64,
+    draft_kind: &str,
+    reply_policy: &str,
+    draft_id_opt: Option<i64>,
+    raw_text_opt: Option<&str>,
+    missing_err: &str,
+) -> Result<(String, Option<i64>), String> {
+    let db = store::connect_readonly(path).map_err(|e| e.to_string())?;
+    let provided_text = raw_text_opt
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    if let Some(did) = draft_id_opt {
+        let draft = query_one_map(
+            &db,
+            "SELECT * FROM reply_drafts WHERE organization_id=? AND id=? AND comment_id=?",
+            &[org.to_string().into(), did.into(), comment_id.into()],
+        )
+        .ok_or_else(|| "draft_not_found".to_string())?;
+        let d_status = draft
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("draft");
+        if d_status != "approved" {
+            return Err("draft_not_approved".to_string());
         }
-        Err(e) => {
-            let _ = db.execute_batch("ROLLBACK;");
-            Err(e)
-        }
+        let d_text = draft
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .ok_or_else(|| missing_err.to_string())?;
+        let final_text = provided_text.unwrap_or(d_text);
+        return Ok((final_text, Some(did)));
     }
+
+    let text = provided_text.ok_or_else(|| missing_err.to_string())?;
+    if reply_policy == "agent_direct" {
+        return Ok((text, None));
+    }
+
+    // For `draft_only` or `operator_direct`, allow if an operator-approved draft with matching text exists
+    if let Some(approved) = query_one_map(
+        &db,
+        "SELECT id FROM reply_drafts
+         WHERE organization_id=? AND comment_id=? AND kind=? AND status='approved' AND TRIM(text)=?
+         ORDER BY id DESC LIMIT 1",
+        &[
+            org.to_string().into(),
+            comment_id.into(),
+            draft_kind.to_string().into(),
+            text.clone().into(),
+        ],
+    ) {
+        let did = approved.get("id").and_then(|v| v.as_i64());
+        return Ok((text, did));
+    }
+
+    Err("reply_policy_requires_approval".to_string())
 }
 
 fn opt_i64(args: &Map<String, Value>, key: &str) -> Option<i64> {
@@ -1517,63 +1603,161 @@ fn execute_tool(
         }
         "comment_reply" => {
             let comment_id = req_i64(args, "comment_id")?;
-            let clean_text = opt_str(args, "text")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| "reply_text_required".to_string())?;
+            let draft_id_opt = opt_i64(args, "draft_id");
+            let raw_text_opt = opt_str(args, "text");
+            if draft_id_opt.is_none()
+                && raw_text_opt.map(|s| s.trim().is_empty()).unwrap_or(true)
+            {
+                return Err("reply_text_required".to_string());
+            }
             let idem_key = opt_str(args, "idempotency_key").unwrap_or("");
             guarded_comment_write(
-                path,
-                org,
+                cfg,
                 caller,
                 "comment_reply",
                 comment_id,
                 idem_key,
-                &json!({ "comment_id": comment_id, "text": clean_text }),
-                cfg.writes_enabled,
-                |db, c, _cm| {
-                    let now = now_unix();
-                    let sub_actor = format!("mcp:{}", c.sub);
-                    let res_id = format!("meta_reply_{comment_id}_{now}");
-                    db.execute(
-                        "INSERT INTO comment_actions
-                         (organization_id, comment_id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at)
-                         VALUES (?1, ?2, 'reply', ?3, ?4, ?5, 'completed', ?6, ?7)",
-                        params![
-                            org,
-                            comment_id,
-                            sub_actor,
-                            idem_key,
-                            res_id,
-                            json!({ "text": clean_text }).to_string(),
-                            now
-                        ],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let action_id = db.last_insert_rowid();
-                    db.execute(
-                        "INSERT INTO comment_states (organization_id, comment_id, status, updated_by, updated_at)
-                         VALUES (?1, ?2, 'replied', ?3, ?4)
-                         ON CONFLICT(organization_id, comment_id) DO UPDATE SET
-                          status='replied', updated_by=excluded.updated_by, updated_at=excluded.updated_at",
-                        params![org, comment_id, sub_actor, now],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    audit::append(
-                        db,
+                &json!({
+                    "comment_id": comment_id,
+                    "text": raw_text_opt.map(str::trim),
+                    "draft_id": draft_id_opt,
+                }),
+                |c, cm| {
+                    let reply_policy = cm
+                        .get("reply_policy")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("draft_only");
+                    let (clean_text, matched_draft_id) = resolve_agent_reply_text_and_policy(
+                        path,
                         org,
-                        &sub_actor,
-                        "comment.replied",
-                        &comment_id.to_string(),
-                        &json!({ "action_id": action_id, "idempotency_key": idem_key }),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    Ok(json!({
-                        "ok": true,
-                        "action_id": action_id,
-                        "comment_id": comment_id,
-                        "status": "replied",
-                    }))
+                        comment_id,
+                        "public",
+                        reply_policy,
+                        draft_id_opt,
+                        raw_text_opt,
+                        "reply_text_required",
+                    )?;
+
+                    let ch_kind = cm
+                        .get("channel_kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("fb_page");
+                    let is_hidden = cm.get("is_hidden").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let parent_ext = cm
+                        .get("parent_external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if ch_kind == "ig_account" && is_hidden != 0 {
+                        return Err("ig_cannot_reply_hidden_comment".to_string());
+                    }
+                    if ch_kind == "ig_account" && !parent_ext.is_empty() {
+                        return Err("ig_nested_reply_unsupported".to_string());
+                    }
+
+                    let channel_id = cm.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let conn_id = cm.get("connection_id").and_then(|v| v.as_i64());
+                    let provider = cm
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("meta");
+                    let ch_ext = cm
+                        .get("channel_external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let post_ext = cm
+                        .get("post_external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let comment_ext = cm
+                        .get("external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let dispatch = cfg.conns.dispatch_comment_reply(
+                        channel_id,
+                        conn_id,
+                        provider,
+                        ch_kind,
+                        ch_ext,
+                        post_ext,
+                        comment_ext,
+                        &clean_text,
+                    )?;
+                    let res_id = dispatch
+                        .get("provider_result_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let readback = dispatch
+                        .get("readback_verified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    store::with_write_tx_str(path, |db| {
+                        let now = now_unix();
+                        let sub_actor = format!("mcp:{}", c.sub);
+                        db.execute(
+                            "INSERT INTO comment_actions
+                             (organization_id, comment_id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at)
+                             VALUES (?1, ?2, 'reply', ?3, ?4, ?5, 'completed', ?6, ?7)",
+                            params![
+                                org,
+                                comment_id,
+                                sub_actor,
+                                idem_key,
+                                res_id,
+                                json!({
+                                    "text": clean_text,
+                                    "draft_id": matched_draft_id,
+                                    "readback_verified": readback,
+                                })
+                                .to_string(),
+                                now
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        let action_id = db.last_insert_rowid();
+                        if let Some(did) = matched_draft_id {
+                            db.execute(
+                                "UPDATE reply_drafts SET status='sent', sent_action_id=?1, updated_at=?2
+                                 WHERE organization_id=?3 AND id=?4",
+                                params![action_id, now, org, did],
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        db.execute(
+                            "INSERT INTO comment_states (organization_id, comment_id, status, updated_by, updated_at)
+                             VALUES (?1, ?2, 'replied', ?3, ?4)
+                             ON CONFLICT(organization_id, comment_id) DO UPDATE SET
+                              status='replied', updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+                            params![org, comment_id, sub_actor, now],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        audit::append(
+                            db,
+                            org,
+                            &sub_actor,
+                            "comment.replied",
+                            &comment_id.to_string(),
+                            &json!({
+                                "action_id": action_id,
+                                "idempotency_key": idem_key,
+                                "provider_result_id": res_id,
+                                "readback_verified": readback,
+                                "draft_id": matched_draft_id,
+                            }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Ok(json!({
+                            "ok": true,
+                            "action_id": action_id,
+                            "comment_id": comment_id,
+                            "provider_result_id": res_id,
+                            "readback_verified": readback,
+                            "draft_id": matched_draft_id,
+                            "status": "replied",
+                        }))
+                    })
                 },
             )
         }
@@ -1582,120 +1766,256 @@ fn execute_tool(
             let hidden = req_bool(args, "hidden")?;
             let idem_key = opt_str(args, "idempotency_key").unwrap_or("");
             guarded_comment_write(
-                path,
-                org,
+                cfg,
                 caller,
                 "comment_hide_set",
                 comment_id,
                 idem_key,
                 &json!({ "comment_id": comment_id, "hidden": hidden }),
-                cfg.writes_enabled,
-                |db, c, _cm| {
-                    let now = now_unix();
-                    let kind = if hidden { "hide" } else { "unhide" };
-                    let sub_actor = format!("mcp:{}", c.sub);
-                    let res_id = format!("meta_{kind}_{comment_id}_{now}");
-                    db.execute(
-                        "INSERT INTO comment_actions
-                         (organization_id, comment_id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed', ?7, ?8)",
-                        params![
-                            org,
-                            comment_id,
-                            kind,
-                            sub_actor,
-                            idem_key,
-                            res_id,
-                            json!({ "hidden": hidden }).to_string(),
-                            now
-                        ],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let action_id = db.last_insert_rowid();
-                    db.execute(
-                        "UPDATE comments SET is_hidden=?1 WHERE organization_id=?2 AND id=?3",
-                        params![if hidden { 1 } else { 0 }, org, comment_id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    if hidden {
+                |c, cm| {
+                    let channel_id = cm.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let conn_id = cm.get("connection_id").and_then(|v| v.as_i64());
+                    let provider = cm
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("meta");
+                    let ch_kind = cm
+                        .get("channel_kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("fb_page");
+                    let ch_ext = cm
+                        .get("channel_external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let post_ext = cm
+                        .get("post_external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let comment_ext = cm
+                        .get("external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let dispatch = cfg.conns.dispatch_comment_hide(
+                        channel_id,
+                        conn_id,
+                        provider,
+                        ch_kind,
+                        ch_ext,
+                        post_ext,
+                        comment_ext,
+                        hidden,
+                    )?;
+                    let res_id = dispatch
+                        .get("provider_result_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let readback = dispatch
+                        .get("readback_verified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    store::with_write_tx_str(path, |db| {
+                        let now = now_unix();
+                        let kind = if hidden { "hide" } else { "unhide" };
+                        let sub_actor = format!("mcp:{}", c.sub);
                         db.execute(
-                            "INSERT INTO comment_states (organization_id, comment_id, status, updated_by, updated_at)
-                             VALUES (?1, ?2, 'hidden', ?3, ?4)
-                             ON CONFLICT(organization_id, comment_id) DO UPDATE SET
-                              status='hidden', updated_by=excluded.updated_by, updated_at=excluded.updated_at",
-                            params![org, comment_id, sub_actor, now],
+                            "INSERT INTO comment_actions
+                             (organization_id, comment_id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed', ?7, ?8)",
+                            params![
+                                org,
+                                comment_id,
+                                kind,
+                                sub_actor,
+                                idem_key,
+                                res_id,
+                                json!({ "hidden": hidden, "readback_verified": readback }).to_string(),
+                                now
+                            ],
                         )
                         .map_err(|e| e.to_string())?;
-                    }
-                    audit::append(
-                        db,
-                        org,
-                        &sub_actor,
-                        &format!("comment.{kind}"),
-                        &comment_id.to_string(),
-                        &json!({ "action_id": action_id, "hidden": hidden, "idempotency_key": idem_key }),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    Ok(json!({
-                        "ok": true,
-                        "action_id": action_id,
-                        "comment_id": comment_id,
-                        "hidden": hidden,
-                    }))
+                        let action_id = db.last_insert_rowid();
+                        db.execute(
+                            "UPDATE comments SET is_hidden=?1 WHERE organization_id=?2 AND id=?3",
+                            params![if hidden { 1 } else { 0 }, org, comment_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        if hidden {
+                            db.execute(
+                                "INSERT INTO comment_states (organization_id, comment_id, status, updated_by, updated_at)
+                                 VALUES (?1, ?2, 'hidden', ?3, ?4)
+                                 ON CONFLICT(organization_id, comment_id) DO UPDATE SET
+                                  status='hidden', updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+                                params![org, comment_id, sub_actor, now],
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        audit::append(
+                            db,
+                            org,
+                            &sub_actor,
+                            &format!("comment.{kind}"),
+                            &comment_id.to_string(),
+                            &json!({
+                                "action_id": action_id,
+                                "hidden": hidden,
+                                "idempotency_key": idem_key,
+                                "provider_result_id": res_id,
+                                "readback_verified": readback,
+                            }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Ok(json!({
+                            "ok": true,
+                            "action_id": action_id,
+                            "comment_id": comment_id,
+                            "hidden": hidden,
+                            "provider_result_id": res_id,
+                            "readback_verified": readback,
+                        }))
+                    })
                 },
             )
         }
         "comment_private_reply" => {
             let comment_id = req_i64(args, "comment_id")?;
-            let clean_text = opt_str(args, "text")
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| "private_reply_text_required".to_string())?;
+            let draft_id_opt = opt_i64(args, "draft_id");
+            let raw_text_opt = opt_str(args, "text");
+            if draft_id_opt.is_none()
+                && raw_text_opt.map(|s| s.trim().is_empty()).unwrap_or(true)
+            {
+                return Err("private_reply_text_required".to_string());
+            }
             let idem_key = opt_str(args, "idempotency_key").unwrap_or("");
             guarded_comment_write(
-                path,
-                org,
+                cfg,
                 caller,
                 "comment_private_reply",
                 comment_id,
                 idem_key,
-                &json!({ "comment_id": comment_id, "text": clean_text }),
-                cfg.writes_enabled,
-                |db, c, _cm| {
-                    let now = now_unix();
-                    let sub_actor = format!("mcp:{}", c.sub);
-                    let res_id = format!("meta_dm_{comment_id}_{now}");
-                    db.execute(
-                        "INSERT INTO comment_actions
-                         (organization_id, comment_id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at)
-                         VALUES (?1, ?2, 'private_reply', ?3, ?4, ?5, 'completed', ?6, ?7)",
-                        params![
-                            org,
-                            comment_id,
-                            sub_actor,
-                            idem_key,
-                            res_id,
-                            json!({ "text": clean_text }).to_string(),
-                            now
-                        ],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let action_id = db.last_insert_rowid();
-                    audit::append(
-                        db,
+                &json!({
+                    "comment_id": comment_id,
+                    "text": raw_text_opt.map(str::trim),
+                    "draft_id": draft_id_opt,
+                }),
+                |c, cm| {
+                    let reply_policy = cm
+                        .get("reply_policy")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("draft_only");
+                    let (clean_text, matched_draft_id) = resolve_agent_reply_text_and_policy(
+                        path,
                         org,
-                        &sub_actor,
-                        "comment.private_replied",
-                        &comment_id.to_string(),
-                        &json!({ "action_id": action_id, "idempotency_key": idem_key }),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    Ok(json!({
-                        "ok": true,
-                        "action_id": action_id,
-                        "comment_id": comment_id,
-                        "kind": "private_reply",
-                    }))
+                        comment_id,
+                        "private_dm",
+                        reply_policy,
+                        draft_id_opt,
+                        raw_text_opt,
+                        "private_reply_text_required",
+                    )?;
+
+                    let ch_kind = cm
+                        .get("channel_kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("fb_page");
+                    let created_at = cm.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                    if ch_kind == "ig_account" && created_at > 0 && now_unix() - created_at > 7 * 86_400 {
+                        return Err("ig_private_reply_window_expired".to_string());
+                    }
+
+                    let channel_id = cm.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let conn_id = cm.get("connection_id").and_then(|v| v.as_i64());
+                    let provider = cm
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("meta");
+                    let ch_ext = cm
+                        .get("channel_external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let comment_ext = cm
+                        .get("external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let dispatch = cfg.conns.dispatch_private_reply(
+                        channel_id,
+                        conn_id,
+                        provider,
+                        ch_kind,
+                        ch_ext,
+                        comment_ext,
+                        &clean_text,
+                    )?;
+                    let res_id = dispatch
+                        .get("provider_result_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let readback = dispatch
+                        .get("readback_verified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    store::with_write_tx_str(path, |db| {
+                        let now = now_unix();
+                        let sub_actor = format!("mcp:{}", c.sub);
+                        db.execute(
+                            "INSERT INTO comment_actions
+                             (organization_id, comment_id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at)
+                             VALUES (?1, ?2, 'private_reply', ?3, ?4, ?5, 'completed', ?6, ?7)",
+                            params![
+                                org,
+                                comment_id,
+                                sub_actor,
+                                idem_key,
+                                res_id,
+                                json!({
+                                    "text": clean_text,
+                                    "draft_id": matched_draft_id,
+                                    "readback_verified": readback,
+                                })
+                                .to_string(),
+                                now
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        let action_id = db.last_insert_rowid();
+                        if let Some(did) = matched_draft_id {
+                            db.execute(
+                                "UPDATE reply_drafts SET status='sent', sent_action_id=?1, updated_at=?2
+                                 WHERE organization_id=?3 AND id=?4",
+                                params![action_id, now, org, did],
+                            )
+                            .map_err(|e| e.to_string())?;
+                        }
+                        audit::append(
+                            db,
+                            org,
+                            &sub_actor,
+                            "comment.private_replied",
+                            &comment_id.to_string(),
+                            &json!({
+                                "action_id": action_id,
+                                "idempotency_key": idem_key,
+                                "provider_result_id": res_id,
+                                "readback_verified": readback,
+                                "draft_id": matched_draft_id,
+                            }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Ok(json!({
+                            "ok": true,
+                            "action_id": action_id,
+                            "comment_id": comment_id,
+                            "kind": "private_reply",
+                            "provider_result_id": res_id,
+                            "readback_verified": readback,
+                            "draft_id": matched_draft_id,
+                        }))
+                    })
                 },
             )
         }
@@ -1707,59 +2027,107 @@ fn execute_tool(
                 .ok_or_else(|| "message_text_required".to_string())?;
             let idem_key = opt_str(args, "idempotency_key").unwrap_or("");
             guarded_conversation_write(
-                path,
-                org,
+                cfg,
                 caller,
                 "message_reply",
                 conversation_id,
                 idem_key,
                 &json!({ "conversation_id": conversation_id, "text": clean_text }),
-                cfg.writes_enabled,
-                |db, c, conv| {
-                    let now = now_unix();
-                    let sub_actor = format!("mcp:{}", c.sub);
-                    let ext_id = format!("out_msg_{conversation_id}_{now}_{}", random_hex(3));
+                |c, conv| {
+                    let reply_policy = conv
+                        .get("reply_policy")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("draft_only");
+                    if reply_policy != "agent_direct" {
+                        return Err("reply_policy_requires_approval".to_string());
+                    }
+
                     let channel_id = conv.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    db.execute(
-                        "INSERT INTO messages
-                         (organization_id, conversation_id, channel_id, external_id, direction,
-                          sender_id, sender_name, text, status, created_at)
-                         VALUES (?1, ?2, ?3, ?4, 'outbound', ?5, 'LNC Care', ?6, 'sent', ?7)",
-                        params![
+                    let conn_id = conv.get("connection_id").and_then(|v| v.as_i64());
+                    let provider = conv
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("meta");
+                    let ch_kind = conv
+                        .get("channel_kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("fb_page");
+                    let ch_ext = conv
+                        .get("channel_external_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let recipient_id = conv
+                        .get("participant_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let dispatch = cfg.conns.dispatch_conversation_message(
+                        channel_id,
+                        conn_id,
+                        provider,
+                        ch_kind,
+                        ch_ext,
+                        recipient_id,
+                        clean_text,
+                    )?;
+                    let ext_id = dispatch
+                        .get("provider_result_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            format!("out_msg_{conversation_id}_{}_{}", now_unix(), random_hex(3))
+                        });
+
+                    store::with_write_tx_str(path, |db| {
+                        let now = now_unix();
+                        let sub_actor = format!("mcp:{}", c.sub);
+                        db.execute(
+                            "INSERT INTO messages
+                             (organization_id, conversation_id, channel_id, external_id, direction,
+                              sender_id, sender_name, text, status, created_at)
+                             VALUES (?1, ?2, ?3, ?4, 'outbound', ?5, 'LNC Care', ?6, 'sent', ?7)",
+                            params![
+                                org,
+                                conversation_id,
+                                channel_id,
+                                ext_id,
+                                sub_actor,
+                                clean_text,
+                                now
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        let message_id = db.last_insert_rowid();
+                        let preview: String = clean_text.chars().take(200).collect();
+                        db.execute(
+                            "UPDATE conversations
+                             SET status='replied', last_message_preview=?1, unread_count=0, updated_at=?2
+                             WHERE organization_id=?3 AND id=?4",
+                            params![preview, now, org, conversation_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        audit::append(
+                            db,
                             org,
-                            conversation_id,
-                            channel_id,
-                            ext_id,
-                            sub_actor,
-                            clean_text,
-                            now
-                        ],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let message_id = db.last_insert_rowid();
-                    let preview: String = clean_text.chars().take(200).collect();
-                    db.execute(
-                        "UPDATE conversations
-                         SET status='replied', last_message_preview=?1, unread_count=0, updated_at=?2
-                         WHERE organization_id=?3 AND id=?4",
-                        params![preview, now, org, conversation_id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    audit::append(
-                        db,
-                        org,
-                        &sub_actor,
-                        "conversation.message_replied",
-                        &conversation_id.to_string(),
-                        &json!({ "message_id": message_id, "idempotency_key": idem_key }),
-                    )
-                    .map_err(|e| e.to_string())?;
-                    Ok(json!({
-                        "ok": true,
-                        "message_id": message_id,
-                        "conversation_id": conversation_id,
-                        "status": "replied",
-                    }))
+                            &sub_actor,
+                            "conversation.message_replied",
+                            &conversation_id.to_string(),
+                            &json!({
+                                "message_id": message_id,
+                                "idempotency_key": idem_key,
+                                "provider_result_id": ext_id,
+                            }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Ok(json!({
+                            "ok": true,
+                            "message_id": message_id,
+                            "conversation_id": conversation_id,
+                            "provider_result_id": ext_id,
+                            "status": "replied",
+                        }))
+                    })
                 },
             )
         }
@@ -2121,15 +2489,16 @@ fn all_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "comment_reply",
-            "description": "Publish an audited public reply to a comment on an official API channel.",
+            "description": "Publish an audited public reply to a comment on an official API channel (supports draft_id for operator-approved drafts).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "comment_id": { "type": "integer" },
-                    "text": { "type": "string" },
+                    "text": { "type": ["string", "null"] },
+                    "draft_id": { "type": ["integer", "null"] },
                     "idempotency_key": { "type": "string" }
                 },
-                "required": ["comment_id", "text", "idempotency_key"]
+                "required": ["comment_id", "idempotency_key"]
             }
         }),
         json!({
@@ -2147,15 +2516,16 @@ fn all_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "comment_private_reply",
-            "description": "Send an audited private consultation reply (DM) to a comment author on an official API channel.",
+            "description": "Send an audited private consultation reply (DM) to a comment author on an official API channel (supports draft_id for operator-approved drafts).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "comment_id": { "type": "integer" },
-                    "text": { "type": "string" },
+                    "text": { "type": ["string", "null"] },
+                    "draft_id": { "type": ["integer", "null"] },
                     "idempotency_key": { "type": "string" }
                 },
-                "required": ["comment_id", "text", "idempotency_key"]
+                "required": ["comment_id", "idempotency_key"]
             }
         }),
         json!({

@@ -18,7 +18,7 @@ use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use rusqlite::params;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -941,6 +941,7 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
         vault: vault.clone(),
         env_map: env_map.clone(),
         transport: cfg.transport.clone(),
+        conns: conns.clone(),
     };
 
     let mut local_hosts: HashSet<String> = ["localhost", "127.0.0.1", "::1", "testserver"]
@@ -1106,6 +1107,18 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
             "/api/admin/comments/:comment_id/drafts",
             post(save_comment_draft_handler),
         )
+        .route(
+            "/api/admin/comments/:comment_id/reply",
+            post(send_comment_reply_handler),
+        )
+        .route(
+            "/api/admin/comments/:comment_id/hide",
+            post(hide_comment_handler),
+        )
+        .route(
+            "/api/admin/comments/:comment_id/private-reply",
+            post(send_comment_private_reply_handler),
+        )
         .route("/api/admin/evidence", get(list_evidence_cases_handler))
         .route(
             "/api/admin/evidence/capture",
@@ -1225,6 +1238,7 @@ async fn health_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
         "service": st.audience,
         "version": crate::VERSION,
         "writes_enabled": st.writes_enabled,
+        "writes_by_provider": mcp_server::writes_by_provider_summary(st.writes_enabled, &st.env_map),
     }))
 }
 
@@ -1912,6 +1926,7 @@ async fn overview_handler(
         "organization": { "id": st.org, "name": st.org_name },
         "version": crate::VERSION,
         "writes_enabled": st.writes_enabled,
+        "writes_by_provider": mcp_server::writes_by_provider_summary(st.writes_enabled, &st.env_map),
         "shops": store::shops(&db, &st.org),
         "integrations": st.conns.inventory(&db),
         "channels": store::channels(&db, &st.org, shop_id, false),
@@ -2350,27 +2365,79 @@ async fn send_conversation_message_handler(
             "Message text is required",
         ));
     }
-    let now = now_unix();
-    let res = store::with_write_tx(&st.path, |db| -> Result<Value, AppError> {
-        let conv = query_one_map(
-            db,
-            "SELECT cv.*, c.reply_policy FROM conversations cv
+    let conv = {
+        let db = store::connect_readonly(&st.path)?;
+        query_one_map(
+            &db,
+            "SELECT cv.*, c.provider, c.kind AS channel_kind, c.external_id AS channel_external_id,
+                    c.connection_id, c.adapter, c.approved, c.reply_policy
+             FROM conversations cv
              JOIN channels c ON c.id=cv.channel_id AND c.organization_id=cv.organization_id
              WHERE cv.organization_id=? AND cv.id=?",
             &[st.org.clone().into(), conversation_id.into()],
         )
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Conversation not found"))?;
-        let policy = conv
-            .get("reply_policy")
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "Conversation not found"))?
+    };
+
+    let policy = conv
+        .get("reply_policy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("draft_only");
+    let provider = conv
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("meta");
+    let adapter = conv
+        .get("adapter")
+        .and_then(|v| v.as_str())
+        .unwrap_or("meta_api");
+    let approved = conv.get("approved").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
+    let channel_id = conv.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let conn_id = conv.get("connection_id").and_then(|v| v.as_i64());
+    let ch_kind = conv
+        .get("channel_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fb_page");
+    let ch_ext = conv
+        .get("channel_external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let recipient_id = conv
+        .get("participant_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let can_send_live = approved
+        && adapter == "meta_api"
+        && policy != "draft_only"
+        && mcp_server::provider_writes_allowed(st.writes_enabled, &st.env_map, provider);
+
+    let (msg_status, ext_id) = if can_send_live {
+        let dispatch = st
+            .conns
+            .dispatch_conversation_message(
+                channel_id,
+                conn_id,
+                provider,
+                ch_kind,
+                ch_ext,
+                recipient_id,
+                &text,
+            )
+            .map_err(|e| AppError::new(StatusCode::CONFLICT, e))?;
+        let pid = dispatch
+            .get("provider_result_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("draft_only");
-        let msg_status = if st.writes_enabled && policy != "draft_only" {
-            "sent"
-        } else {
-            "draft"
-        };
-        let ext_id = format!("out_{conversation_id}_{}", random_hex(6));
-        let channel_id = conv.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| format!("out_{conversation_id}_{}", random_hex(6)));
+        ("sent", pid)
+    } else {
+        ("draft", format!("out_{conversation_id}_{}", random_hex(6)))
+    };
+
+    let now = now_unix();
+    let res = store::with_write_tx(&st.path, |db| -> Result<Value, AppError> {
         db.execute(
             "INSERT INTO messages
              (organization_id, conversation_id, channel_id, external_id, direction, sender_id, sender_name, text, status, created_at)
@@ -2396,9 +2463,14 @@ async fn send_conversation_message_handler(
             "owner",
             &format!("conversation.message_{msg_status}"),
             &conversation_id.to_string(),
-            &json!({ "message_id": msg_id }),
+            &json!({ "message_id": msg_id, "external_id": ext_id }),
         )?;
-        Ok(json!({ "ok": true, "status": msg_status, "message_id": msg_id }))
+        Ok(json!({
+            "ok": true,
+            "status": msg_status,
+            "message_id": msg_id,
+            "provider_result_id": ext_id,
+        }))
     })?;
     Ok(Json(res))
 }
@@ -2985,6 +3057,522 @@ async fn save_comment_draft_handler(
         )?;
         let thread = store::comment_thread(db, &st.org, comment_id);
         Ok(json!({ "ok": true, "draft_id": draft_id, "thread": thread }))
+    })?;
+    Ok(Json(res))
+}
+
+fn load_authorized_official_comment(
+    st: &AppState,
+    comment_id: i64,
+) -> Result<Map<String, Value>, AppError> {
+    let db = store::connect_readonly(&st.path)?;
+    let cm = query_one_map(
+        &db,
+        "SELECT cm.*, p.external_id AS post_external_id,
+                c.provider, c.kind AS channel_kind, c.external_id AS channel_external_id,
+                c.connection_id, c.adapter, c.approved, c.reply_policy
+         FROM comments cm
+         JOIN posts p ON p.id=cm.post_id AND p.organization_id=cm.organization_id
+         JOIN channels c ON c.id=cm.channel_id AND c.organization_id=cm.organization_id
+         WHERE cm.organization_id=? AND cm.id=?",
+        &[st.org.clone().into(), comment_id.into()],
+    )
+    .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "comment_or_channel_not_authorized"))?;
+    if cm.get("approved").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "comment_or_channel_not_authorized",
+        ));
+    }
+    if cm.get("adapter").and_then(|v| v.as_str()).unwrap_or("") != "meta_api" {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "channel_adapter_unsupported",
+        ));
+    }
+    Ok(cm)
+}
+
+async fn send_comment_reply_handler(
+    State(st): State<Arc<AppState>>,
+    Path(comment_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let body = parse_json_body(&raw_body)?;
+    let draft_id_opt = body
+        .get("draft_id")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    let raw_text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let cm = load_authorized_official_comment(&st, comment_id)?;
+    let provider = cm
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("meta");
+    if !mcp_server::provider_writes_allowed(st.writes_enabled, &st.env_map, provider) {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "provider_writes_disabled",
+        ));
+    }
+
+    let (clean_text, matched_draft_id) = {
+        let db = store::connect_readonly(&st.path)?;
+        if let Some(did) = draft_id_opt {
+            let d = query_one_map(
+                &db,
+                "SELECT * FROM reply_drafts WHERE organization_id=? AND id=? AND comment_id=?",
+                &[st.org.clone().into(), did.into(), comment_id.into()],
+            )
+            .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "draft_not_found"))?;
+            let d_text = d
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .ok_or_else(|| AppError::new(StatusCode::UNPROCESSABLE_ENTITY, "reply_text_required"))?;
+            (raw_text.unwrap_or(d_text), Some(did))
+        } else {
+            let txt = raw_text.ok_or_else(|| {
+                AppError::new(StatusCode::UNPROCESSABLE_ENTITY, "reply_text_required")
+            })?;
+            (txt, None)
+        }
+    };
+
+    let ch_kind = cm
+        .get("channel_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fb_page");
+    if ch_kind == "ig_account" && cm.get("is_hidden").and_then(|v| v.as_i64()).unwrap_or(0) != 0 {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "ig_cannot_reply_hidden_comment",
+        ));
+    }
+    if ch_kind == "ig_account"
+        && cm
+            .get("parent_external_id")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "ig_nested_reply_unsupported",
+        ));
+    }
+
+    let idem_key = body
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| s.len() >= 6)
+        .map(String::from)
+        .unwrap_or_else(|| format!("admin_reply_{comment_id}_{}", random_hex(6)));
+
+    let channel_id = cm.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let conn_id = cm.get("connection_id").and_then(|v| v.as_i64());
+    let ch_ext = cm
+        .get("channel_external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let post_ext = cm
+        .get("post_external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let comment_ext = cm
+        .get("external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let dispatch = st
+        .conns
+        .dispatch_comment_reply(
+            channel_id,
+            conn_id,
+            provider,
+            ch_kind,
+            ch_ext,
+            post_ext,
+            comment_ext,
+            &clean_text,
+        )
+        .map_err(|e| AppError::new(StatusCode::CONFLICT, e))?;
+    let res_id = dispatch
+        .get("provider_result_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let readback = dispatch
+        .get("readback_verified")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let now = now_unix();
+    let res = store::with_write_tx(&st.path, |db| -> Result<Value, rusqlite::Error> {
+        db.execute(
+            "INSERT INTO comment_actions
+             (organization_id, comment_id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at)
+             VALUES (?1, ?2, 'reply', 'owner', ?3, ?4, 'completed', ?5, ?6)",
+            params![
+                st.org,
+                comment_id,
+                idem_key,
+                res_id,
+                json!({
+                    "text": clean_text,
+                    "draft_id": matched_draft_id,
+                    "readback_verified": readback,
+                })
+                .to_string(),
+                now
+            ],
+        )?;
+        let action_id = db.last_insert_rowid();
+        if let Some(did) = matched_draft_id {
+            db.execute(
+                "UPDATE reply_drafts SET status='sent', approved_by=COALESCE(approved_by, 'owner'), sent_action_id=?1, updated_at=?2
+                 WHERE organization_id=?3 AND id=?4",
+                params![action_id, now, st.org, did],
+            )?;
+        }
+        db.execute(
+            "INSERT INTO comment_states (organization_id, comment_id, status, updated_by, updated_at)
+             VALUES (?1, ?2, 'replied', 'owner', ?3)
+             ON CONFLICT(organization_id, comment_id) DO UPDATE SET
+              status='replied', updated_by='owner', updated_at=excluded.updated_at",
+            params![st.org, comment_id, now],
+        )?;
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            "comment.replied",
+            &comment_id.to_string(),
+            &json!({
+                "action_id": action_id,
+                "provider_result_id": res_id,
+                "readback_verified": readback,
+                "draft_id": matched_draft_id,
+            }),
+        )?;
+        let thread = store::comment_thread(db, &st.org, comment_id);
+        Ok(json!({
+            "ok": true,
+            "action_id": action_id,
+            "comment_id": comment_id,
+            "provider_result_id": res_id,
+            "readback_verified": readback,
+            "thread": thread,
+        }))
+    })?;
+    Ok(Json(res))
+}
+
+async fn hide_comment_handler(
+    State(st): State<Arc<AppState>>,
+    Path(comment_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let body = parse_json_body(&raw_body)?;
+    let hidden = body
+        .get("hidden")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let cm = load_authorized_official_comment(&st, comment_id)?;
+    let provider = cm
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("meta");
+    if !mcp_server::provider_writes_allowed(st.writes_enabled, &st.env_map, provider) {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "provider_writes_disabled",
+        ));
+    }
+
+    let idem_key = body
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| s.len() >= 6)
+        .map(String::from)
+        .unwrap_or_else(|| format!("admin_hide_{comment_id}_{}", random_hex(6)));
+
+    let channel_id = cm.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let conn_id = cm.get("connection_id").and_then(|v| v.as_i64());
+    let ch_kind = cm
+        .get("channel_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fb_page");
+    let ch_ext = cm
+        .get("channel_external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let post_ext = cm
+        .get("post_external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let comment_ext = cm
+        .get("external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let dispatch = st
+        .conns
+        .dispatch_comment_hide(
+            channel_id,
+            conn_id,
+            provider,
+            ch_kind,
+            ch_ext,
+            post_ext,
+            comment_ext,
+            hidden,
+        )
+        .map_err(|e| AppError::new(StatusCode::CONFLICT, e))?;
+    let res_id = dispatch
+        .get("provider_result_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let readback = dispatch
+        .get("readback_verified")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let now = now_unix();
+    let kind = if hidden { "hide" } else { "unhide" };
+    let res = store::with_write_tx(&st.path, |db| -> Result<Value, rusqlite::Error> {
+        db.execute(
+            "INSERT INTO comment_actions
+             (organization_id, comment_id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at)
+             VALUES (?1, ?2, ?3, 'owner', ?4, ?5, 'completed', ?6, ?7)",
+            params![
+                st.org,
+                comment_id,
+                kind,
+                idem_key,
+                res_id,
+                json!({ "hidden": hidden, "readback_verified": readback }).to_string(),
+                now
+            ],
+        )?;
+        let action_id = db.last_insert_rowid();
+        db.execute(
+            "UPDATE comments SET is_hidden=?1 WHERE organization_id=?2 AND id=?3",
+            params![if hidden { 1 } else { 0 }, st.org, comment_id],
+        )?;
+        if hidden {
+            db.execute(
+                "INSERT INTO comment_states (organization_id, comment_id, status, updated_by, updated_at)
+                 VALUES (?1, ?2, 'hidden', 'owner', ?3)
+                 ON CONFLICT(organization_id, comment_id) DO UPDATE SET
+                  status='hidden', updated_by='owner', updated_at=excluded.updated_at",
+                params![st.org, comment_id, now],
+            )?;
+        }
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            &format!("comment.{kind}"),
+            &comment_id.to_string(),
+            &json!({
+                "action_id": action_id,
+                "hidden": hidden,
+                "provider_result_id": res_id,
+                "readback_verified": readback,
+            }),
+        )?;
+        let thread = store::comment_thread(db, &st.org, comment_id);
+        Ok(json!({
+            "ok": true,
+            "action_id": action_id,
+            "comment_id": comment_id,
+            "hidden": hidden,
+            "provider_result_id": res_id,
+            "readback_verified": readback,
+            "thread": thread,
+        }))
+    })?;
+    Ok(Json(res))
+}
+
+async fn send_comment_private_reply_handler(
+    State(st): State<Arc<AppState>>,
+    Path(comment_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let body = parse_json_body(&raw_body)?;
+    let draft_id_opt = body
+        .get("draft_id")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    let raw_text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let cm = load_authorized_official_comment(&st, comment_id)?;
+    let provider = cm
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("meta");
+    if !mcp_server::provider_writes_allowed(st.writes_enabled, &st.env_map, provider) {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "provider_writes_disabled",
+        ));
+    }
+
+    let (clean_text, matched_draft_id) = {
+        let db = store::connect_readonly(&st.path)?;
+        if let Some(did) = draft_id_opt {
+            let d = query_one_map(
+                &db,
+                "SELECT * FROM reply_drafts WHERE organization_id=? AND id=? AND comment_id=?",
+                &[st.org.clone().into(), did.into(), comment_id.into()],
+            )
+            .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "draft_not_found"))?;
+            let d_text = d
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .ok_or_else(|| {
+                    AppError::new(StatusCode::UNPROCESSABLE_ENTITY, "private_reply_text_required")
+                })?;
+            (raw_text.unwrap_or(d_text), Some(did))
+        } else {
+            let txt = raw_text.ok_or_else(|| {
+                AppError::new(StatusCode::UNPROCESSABLE_ENTITY, "private_reply_text_required")
+            })?;
+            (txt, None)
+        }
+    };
+
+    let ch_kind = cm
+        .get("channel_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fb_page");
+    let created_at = cm.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
+    if ch_kind == "ig_account" && created_at > 0 && now_unix() - created_at > 7 * 86_400 {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "ig_private_reply_window_expired",
+        ));
+    }
+
+    let idem_key = body
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| s.len() >= 6)
+        .map(String::from)
+        .unwrap_or_else(|| format!("admin_dm_{comment_id}_{}", random_hex(6)));
+
+    let channel_id = cm.get("channel_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let conn_id = cm.get("connection_id").and_then(|v| v.as_i64());
+    let ch_ext = cm
+        .get("channel_external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let comment_ext = cm
+        .get("external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let dispatch = st
+        .conns
+        .dispatch_private_reply(
+            channel_id,
+            conn_id,
+            provider,
+            ch_kind,
+            ch_ext,
+            comment_ext,
+            &clean_text,
+        )
+        .map_err(|e| AppError::new(StatusCode::CONFLICT, e))?;
+    let res_id = dispatch
+        .get("provider_result_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let readback = dispatch
+        .get("readback_verified")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let now = now_unix();
+    let res = store::with_write_tx(&st.path, |db| -> Result<Value, rusqlite::Error> {
+        db.execute(
+            "INSERT INTO comment_actions
+             (organization_id, comment_id, kind, actor, idempotency_key, provider_result_id, status, payload_json, created_at)
+             VALUES (?1, ?2, 'private_reply', 'owner', ?3, ?4, 'completed', ?5, ?6)",
+            params![
+                st.org,
+                comment_id,
+                idem_key,
+                res_id,
+                json!({
+                    "text": clean_text,
+                    "draft_id": matched_draft_id,
+                    "readback_verified": readback,
+                })
+                .to_string(),
+                now
+            ],
+        )?;
+        let action_id = db.last_insert_rowid();
+        if let Some(did) = matched_draft_id {
+            db.execute(
+                "UPDATE reply_drafts SET status='sent', approved_by=COALESCE(approved_by, 'owner'), sent_action_id=?1, updated_at=?2
+                 WHERE organization_id=?3 AND id=?4",
+                params![action_id, now, st.org, did],
+            )?;
+        }
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            "comment.private_replied",
+            &comment_id.to_string(),
+            &json!({
+                "action_id": action_id,
+                "provider_result_id": res_id,
+                "readback_verified": readback,
+                "draft_id": matched_draft_id,
+            }),
+        )?;
+        let thread = store::comment_thread(db, &st.org, comment_id);
+        Ok(json!({
+            "ok": true,
+            "action_id": action_id,
+            "comment_id": comment_id,
+            "provider_result_id": res_id,
+            "readback_verified": readback,
+            "thread": thread,
+        }))
     })?;
     Ok(Json(res))
 }
@@ -4006,6 +4594,7 @@ async fn connector_info_handler(
         "delegation_secret_source": p_sec["delegation_secret"]["source"],
         "require_delegation": st.require_delegation,
         "writes_enabled": st.writes_enabled,
+        "writes_by_provider": mcp_server::writes_by_provider_summary(st.writes_enabled, &st.env_map),
         "max_scopes": cfg.mcp_max_scopes,
         "available_scopes": avail,
         "tools": tools_map,

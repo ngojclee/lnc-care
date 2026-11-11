@@ -1,6 +1,6 @@
 # LNC Care: task checklist
 
-Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) + Full-Width `lnc-internal-app-blueprint` UI Standard + **1:1 Native Rust Backend Rewrite (`Axum 0.7` + `Rusqlite 0.32` WAL)** + **Phase 2 (Realtime Webhooks + Archive Retention + 5-Layer Forensic Evidence Vault PKZIP + Watchdog)** + **Phase 2b (Multi-Account Fleet `VeilBrowser` / `Orbine` + Concurrency Leases + Circuit Breaker + Cygnus Alert + Playbooks)** COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.5.0.0`, `cargo test` 22/22 passed, 32 `care__*` MCP tools). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
+Status: **ALL ENGINEERING PHASES COMPLETE & LIVE (`Phase 1` + `Phase 2` + `Phase 2b` + `Phase 3` + `Phase 4`)** on `https://care-mcp.lengoc.me` & `10.21.4.101:8482` (2026-11-11, `VERSION 0.6.0.0`, **100% Native Rust Backend (`Axum 0.7` + `Rusqlite 0.32` WAL)**, `cargo test` **23/23** passed, 32 `care__*` MCP tools, `lnm-care` skill activated). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
 
 ## Phase 0: evidence and decisions
 
@@ -149,15 +149,27 @@ Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `L
   operator `Resume` (`POST /api/admin/fleet/:id/resume`), verified in
   `test_phase2b_fleet_leases_preflight_circuit_breaker_telegram_budgets_and_playbooks`.
 
-## Phase 3: guarded writes + more platforms
+## Phase 3: guarded writes + more platforms — COMPLETED 2026-11-11
 
-- [ ] Draft approval flow; `comment_reply`, `comment_hide_set`,
-  `comment_private_reply` with idempotency, readback, audit; env gate per
-  provider; channel policy enforcement by caller class (operator/agent).
-- [ ] MCP write tools behind `care:write(:p)`; prove one reply, one
-  hide/unhide, one private reply on a test post; idempotent replay.
-- [ ] TikTok business-account reads once scopes approved; YouTube reads
-  (separate consent) if owner wants.
+- [x] Draft approval flow (`reply_drafts` `draft -> approved -> sent` with `sent_action_id`);
+  `comment_reply`, `comment_hide_set`, `comment_private_reply`, and `message_reply`
+  wired to real external provider transports (`src/providers.rs`, `src/connections.rs`,
+  `src/mcp_server.rs`, `src/routes.rs`) with `write_operations` idempotency, GET readback
+  verification (`readback_verified`), SHA-256 `audit_events`, per-provider env gates
+  (`PROVIDER_WRITES_{META,TIKTOK,YOUTUBE}_ENABLED`), IG top-level/hidden/7-day private
+  reply window guards, and caller-class `reply_policy` enforcement (`draft_only`,
+  `operator_direct`, `agent_direct`).
+- [x] MCP write tools behind `care:write(:p)` + operator UI buttons (`/api/admin/comments/:id/{reply,hide,private-reply}`);
+  proven in `test_phase3_guarded_writes_readback_policy_and_tiktok_youtube_ingest`
+  (one reply with `readback_verified: true`, one hide + readback, one private reply,
+  `draft_only` unapproved block -> approved `draft_id` execution -> `status='sent'`,
+  IG 7-day window block, per-provider gate block on TikTok while YouTube succeeds,
+  and idempotent replay).
+- [x] Official TikTok Business API v1.3 (`/business/get/`, `/business/video/list/`,
+  `/business/comment/list/`, `/business/comment/reply/create/`, `/business/comment/hide/`)
+  and YouTube Data API v3 (`/youtube/v3/channels`, `/search`, `/videos`, `/commentThreads`
+  including nested replies, `/comments`, `/comments/setModerationStatus`) implemented &
+  verified in `src/providers.rs` + `tests/contract_suite.rs`.
 
 ## Phase 4: release
 
@@ -171,6 +183,6 @@ Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `L
 - [x] Hub managed connector `lnc-care`, pairing, scopes, grants; live
   discovery shows 26 `care__*` tools on Business MCP Hub (`:8790`) + LNC-Agent-Hub (`:8380/mcp`), Vault `pconn_0mwbf9p0xbbac3c585e8ab6c5` synced to local encrypted cache, and stateful `Mcp-Session-Id` handshake + 1x `400/404` auto re-init in `McpGatewayClient` (`VERSION 0.3.0.2`, `20/20 pytest`).
 - [x] **1:1 Native Rust Backend Migration (`VERSION 0.4.0.0`, `20/20 cargo test`)**: ported all 15 backend modules (`src/{lib,main,transport,audit,vault,settings,store,evaluator,providers,worker,internal_bridge,agent_hub,connections,mcp_gateway,mcp_server,routes}.rs`) to `Axum 0.7` + `Rusqlite 0.32` (WAL) with 100% SQLite/AES-256-GCM/PBKDF2/SHA-256/MCP/SSO wire compatibility, removed legacy Python `app/` + `requirements.txt` + `tests/*.py`, updated multi-stage `Dockerfile` (`rust:1-slim-bookworm` -> `debian:bookworm-slim`) & `stack.yml`, and redeployed Stack `#59` on `10.21.4.101:8482`.
-- [ ] Update skill `lnm-care` (tool surface, inbox workflow, reply policy,
-  errors) and cross-links in `lnm-ads`/`lnm-accounts`.
-- [ ] Release report in `.docs/reports/`.
+- [x] Update skill `lnm-care` (`\\10.21.2.2\data\_agentsync\skills\lnm-care\SKILL.md`:
+  32 `care__*` tools, scopes, inbox SOP, `reply_policy` rules, platform limits & error codes).
+- [x] Release report in `.docs/reports/release-v0.6.0.0.md`.

@@ -713,6 +713,20 @@ function renderInboxDetailPane() {
   const pubDraft = (cm.drafts || []).find(d => d.kind === 'public') || { text: '' };
   const privDraft = (cm.drafts || []).find(d => d.kind === 'private_dm') || { text: '' };
   const strat = ev.reply_strategy || {};
+  const provAllowed = Boolean(
+    state.overview?.writes_by_provider?.[cm.provider || 'meta'] ?? state.overview?.writes_enabled
+  );
+  const canProviderWrite = cm.adapter === 'meta_api' && provAllowed;
+  const actionsList = cm.actions || [];
+  const actionsHtml = actionsList.length
+    ? `<div style="margin-top:10px;font-size:12px">
+        <div class="cell-sub" style="margin-bottom:4px"><b>Audited provider actions</b></div>
+        ${actionsList.slice(0, 4).map(a => `<div class="cell-sub" style="padding:3px 0">
+          ${badge(a.kind, 'b-ok')} <code>${esc(a.provider_result_id || '-')}</code> · by ${esc(a.actor)} · ${when(a.created_at)}
+          ${a.payload?.readback_verified ? badge('readback verified', 'b-acc') : ''}
+        </div>`).join('')}
+      </div>`
+    : '';
 
   const rubricRows = (ev.label_scores || []).map(lbl => {
     const p = Math.max(0, Math.min(100, Number(lbl.probability || 0)));
@@ -792,13 +806,14 @@ function renderInboxDetailPane() {
           <div class="cell-sub"><b>Tone:</b> ${esc(strat.tone || 'Warm & professional')} · <b>Next step CTA:</b> ${esc(strat.next_step_cta || 'Confirm details in direct message')}</div>
         </div>
         <div class="draft-editors-grid">
-          <label class="field"><span class="field-label">Public comment reply draft</span>
+          <label class="field"><span class="field-label">Public comment reply draft ${pubDraft.status ? badge(pubDraft.status, pubDraft.status === 'sent' ? 'b-ok' : (pubDraft.status === 'approved' ? 'b-acc' : 'b-dim')) : ''}</span>
             <textarea id="draft-public-text" placeholder="Draft public comment reply...">${esc(pubDraft.text)}</textarea>
           </label>
-          <label class="field"><span class="field-label">Private DM consultation draft</span>
+          <label class="field"><span class="field-label">Private DM consultation draft ${privDraft.status ? badge(privDraft.status, privDraft.status === 'sent' ? 'b-ok' : (privDraft.status === 'approved' ? 'b-acc' : 'b-dim')) : ''}</span>
             <textarea id="draft-private-text" placeholder="Draft private message follow-up...">${esc(privDraft.text)}</textarea>
           </label>
         </div>
+        ${actionsHtml}
       </div>
     </div>
 
@@ -811,7 +826,11 @@ function renderInboxDetailPane() {
       <div class="bottom-cta-row">
         <button type="button" class="btn btn-danger" id="btn-reject-hide">Reject / hide</button>
         <button type="button" class="btn" id="btn-capture-evidence">Seal forensic evidence</button>
-        <button type="button" class="btn btn-primary" id="btn-approve-consult">Approve consultation drafts</button>
+        <button type="button" class="btn" id="btn-approve-consult">Approve drafts</button>
+        ${canProviderWrite ? `
+          <button type="button" class="btn btn-primary" id="btn-send-public-now">Send public reply</button>
+          <button type="button" class="btn" id="btn-send-private-now">Send private DM</button>
+        ` : ''}
       </div>
     </div>`;
 
@@ -853,11 +872,17 @@ function renderInboxDetailPane() {
     });
     if (!ok) return;
     await busy(evBtn.currentTarget, async () => {
+      if (canProviderWrite) {
+        await api(`/api/admin/comments/${cm.id}/hide`, {
+          method: 'POST',
+          body: { hidden: true }
+        });
+      }
       await api(`/api/admin/comments/${cm.id}/state`, {
         method: 'POST',
         body: { status: 'hidden', bucket: 'spam_clone' }
       });
-      toast('Comment marked hidden', 'ok');
+      toast(canProviderWrite ? 'Comment hidden on provider and archived' : 'Comment marked hidden locally', 'ok');
       await loadInbox();
     });
   });
@@ -895,6 +920,34 @@ function renderInboxDetailPane() {
       });
     }
     toast('Consultation drafts approved and logged', 'ok');
+    await loadInbox();
+  }));
+
+  $('#btn-send-public-now')?.addEventListener('click', evBtn => busy(evBtn.currentTarget, async () => {
+    const pubText = $('#draft-public-text').value.trim();
+    if (!pubText) {
+      toast('Enter a public reply before sending', 'err');
+      return;
+    }
+    const res = await api(`/api/admin/comments/${cm.id}/reply`, {
+      method: 'POST',
+      body: { text: pubText, draft_id: pubDraft.id || null }
+    });
+    toast(`Public reply sent (${res.provider_result_id || 'ok'})`, 'ok');
+    await loadInbox();
+  }));
+
+  $('#btn-send-private-now')?.addEventListener('click', evBtn => busy(evBtn.currentTarget, async () => {
+    const privText = $('#draft-private-text').value.trim();
+    if (!privText) {
+      toast('Enter a private DM message before sending', 'err');
+      return;
+    }
+    const res = await api(`/api/admin/comments/${cm.id}/private-reply`, {
+      method: 'POST',
+      body: { text: privText, draft_id: privDraft.id || null }
+    });
+    toast(`Private DM sent (${res.provider_result_id || 'ok'})`, 'ok');
     await loadInbox();
   }));
 }
