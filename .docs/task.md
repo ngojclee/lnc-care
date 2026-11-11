@@ -1,6 +1,6 @@
 # LNC Care: task checklist
 
-Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) + Full-Width `lnc-internal-app-blueprint` UI Standard + **1:1 Native Rust Backend Rewrite (`Axum 0.7` + `Rusqlite 0.32` WAL)** COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.4.0.0`, `cargo test` 20/20 passed, legacy Python removed). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
+Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) + Full-Width `lnc-internal-app-blueprint` UI Standard + **1:1 Native Rust Backend Rewrite (`Axum 0.7` + `Rusqlite 0.32` WAL)** + **Phase 2 (Realtime Webhooks + Archive Retention + 5-Layer Forensic Evidence Vault PKZIP + Watchdog)** + **Phase 2b (Multi-Account Fleet `VeilBrowser` / `Orbine` + Concurrency Leases + Circuit Breaker + Cygnus Alert + Playbooks)** COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.5.0.0`, `cargo test` 22/22 passed, 32 `care__*` MCP tools). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
 
 ## Phase 0: evidence and decisions
 
@@ -89,49 +89,65 @@ Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `L
 - [x] Tests (`tests/test_api.py`, `tests/test_evaluator.py`, `tests/test_evidence_and_fleet.py`, `tests/test_mcp.py`):
   `python -m pytest -v` → **11 passed in 2.63s** (mock Meta OAuth/discovery/poller, prompt-injection shield, 12-label rubric + `[✓]/[✕]` calibration, 5-layer Evidence Vault SHA-256 manifest, Multi-Account Fleet `personal_main` write-guard `channel_adapter_unsupported`, MCP HMAC v3/v4 signature & nonce replay guard).
 
-## Phase 2: realtime + archive + Evidence Vault + worker
+## Phase 2: realtime + archive + Evidence Vault + worker — COMPLETED 2026-11-11
 
-- [ ] `/webhooks/meta`: GET challenge with verify token; POST signature
-  check (`X-Hub-Signature-256`), raw-body dedupe, enqueue, 200 fast.
-- [ ] Subscribe pages (`/{page}/subscribed_apps`, `feed`) and IG comments;
-  show subscription status per channel; polling fallback stays on.
-- [ ] Worker service: same image, `python -m app.worker`; Playwright
-  Chromium; screenshot public permalinks; media download + sha256;
-  retention; failure dashboard; SQLite `busy_timeout`.
-- [ ] Evidence Vault ("Lập vi bằng số" — `evidence_cases`, `evidence_items`):
-  5-layer forensic collector (numerical UIDs/post/comment IDs, full comment
-  tree expansion, full-page + viewport screenshots + MHTML/DOM + Playwright
-  trace/HAR with UTC headers, original media download, SHA-256 manifest + ZIP
-  export) and post-capture watchdog (+6h/+24h/+72h alive/edited/deleted check).
-- [ ] Tests: webhook signature vectors; worker job idempotency; evidence
-  bundle manifest + SHA-256 verification.
+- [x] `/webhooks/meta`: GET challenge with verify token; POST signature
+  check (`X-Hub-Signature-256`), raw-body dedupe, enqueue, 200 fast, plus
+  inline worker materialization of `feed` / `comments` / `mentions` / `messages`
+  changes (`process_meta_webhook_change`, including `remove`/`delete` verbs
+  and immediate AI rubric evaluation).
+- [x] Subscribe pages (`/{page}/subscribed_apps`, `feed`) and IG comments
+  (`POST /api/admin/channels/:id/subscribe` + `care__channel_webhook_subscribe`);
+  show subscription status per channel (`Webhook active` / `Polling` badge);
+  polling fallback stays on.
+- [x] Worker service: same Rust image, `/app/lnc-care worker` wired with full
+  Vault + Agent Hub + Ads LAN Bridge runtime (`src/main.rs`, `src/worker.rs`);
+  external `BROWSER_CAPTURE_URL`/`VEILBROWSER_API_URL` screenshot capture + HTML
+  snapshot fallback; media download + SHA-256 + byte size into `/data/archive/post_<id>/`;
+  `archive_retention_days` pruning (`prune_expired_archives`); exponential backoff
+  retries (`max_attempts`) + worker queue summary dashboard; SQLite WAL `busy_timeout=5000ms`.
+- [x] Evidence Vault ("Lập vi bằng số" — `evidence_cases`, `evidence_items` in `src/evidence.rs`):
+  5-layer forensic collector on disk (`manifest.json`, `forensic_report.md`,
+  `layer1_immutable_ids.json`, `layer2_thread_snapshot.json`, `layer3_dom_snapshot.html`,
+  `layer3_network_trace.har.json`, `layer4_media/*`, deterministic pure-Rust IEEE CRC-32
+  PKZIP bundle `case_<id>_bundle.zip`), `.zip` download (`GET /api/admin/evidence/:id/export`),
+  SHA-256 custody verification (`GET /api/admin/evidence/:id/verify`), and post-capture
+  watchdog (`+6h/+24h/+72h` `evidence_watchdog` jobs + `POST /api/admin/evidence/:id/check` /
+  `care__evidence_watchdog_check` tracking `alive` -> `edited` / `deleted`).
+- [x] Tests (`tests/contract_suite.rs::test_phase2_webhook_materialization_archive_pruning_and_forensic_zip_watchdog`):
+  webhook signature vectors & materialization; worker job idempotency & archive retention
+  pruning; 5-layer forensic PKZIP export (`PK\x03\x04`) + SHA-256 custody verification +
+  watchdog `alive -> edited -> deleted` transitions (`22/22` `cargo test` passed).
 
-## Phase 2b: Multi-Account Fleet (`VeilBrowser` + `Orbine` + `Antidetect` Reuse)
+## Phase 2b: Multi-Account Fleet (`VeilBrowser` + `Orbine` + `Antidetect` Reuse) — COMPLETED 2026-11-11
 
 > Detailed spec: [`.docs/multi-account-antidetect-plan.md`](multi-account-antidetect-plan.md).
 
-- [ ] `account_runtimes`, `runtime_leases`, and `consultation_playbooks` tables
-  + `/admin/#fleet` UI (account pool, adapter type, proxy status, daily
-  read/write budgets, active leases, health badges).
-- [ ] `VeilBrowserAdapter` (`adapter='veilbrowser'`): integrate with
-  `veilbrowser__*` MCP (`profiles_list`, `sessions_prepare_start`,
-  `sessions_start`, pre-flight outbound IP/ASN check, jittered feed/comment
-  reads, `sessions_stop`) under bounded concurrency leases.
-- [ ] Reuse high-value `Antidetect` (`RN2` + `RN5`) patterns in `VeilBrowser`
-  (tracked with `VeilBrowser` lane `B01/B02`): `xray.exe + wintun.dll`
+- [x] `account_runtimes`, `runtime_leases`, and `consultation_playbooks` tables
+  (`src/fleet.rs`, `src/store.rs`) + `/admin/#fleet` UI (`public/app.js`, `public/index.html`:
+  account pool, adapter type, proxy status, daily read/write budgets, active concurrency
+  leases table, `Probe IP` / `Resume` actions, and Consultation Playbooks studio).
+- [x] `VeilBrowserAdapter` (`adapter='veilbrowser'` in `src/fleet.rs`): pre-flight
+  outbound IP/ASN/checkpoint gate (`VEILBROWSER_API_URL`), atomic `BEGIN IMMEDIATE`
+  SQLite concurrency leases (`MAX_CONCURRENT_BROWSER_SESSIONS`, TTL reap), jittered
+  `±35%` feed/comment reads (`run_browser_channel_fetch`, `source='browser'`, `verified=0`),
+  and deterministic session lease release.
+- [ ] Reuse high-value `Antidetect` (`RN2` + `RN5`) patterns inside upstream `VeilBrowser`
+  repo (tracked separately on `VeilBrowser` lane `B01/B02`): `xray.exe + wintun.dll`
   per-process fail-closed proxy routing (`RN2` `launch.exe`) + HKDF 64-bit
   sub-seeding & Portable Passkey Store (`RN5`).
-- [ ] `OrbineMobileAdapter` (`adapter='orbine_mobile'`): client for `Orbine`
-  Engine (`127.0.0.1:9817` on physical ARM64 Android) reusing `RN1`
-  `devices.json` (2,638 OEM catalog), `xray` TPROXY (`dokodemo-door` +
-  `XRAY_FAILSAFE_WD` fail-closed watchdog), and 63 split-APK corpus.
-- [ ] Write-guard & role-guard proof: `account_role='personal_main'` strictly
-  rejects automated writes (`channel_adapter_unsupported` / `role_read_only`);
-  dedicated `care_consultant` accounts enforce daily budget + score/confidence
-  threshold.
-- [ ] Circuit breaker: auto-pause runtime on checkpoint/login redirect/proxy
-  mismatch (`health_status='checkpointed'`) + Telegram alert
-  (`lnc-cygnus-telegram-notify`); manual resume in `#fleet` page.
+- [x] `OrbineMobileAdapter` (`adapter='orbine_mobile'` in `src/fleet.rs`): client for `Orbine`
+  Engine (`ORBINE_API_URL`, default `127.0.0.1:9817` on physical ARM64 Android) with
+  pre-flight IP/device health verification and unified lease/budget/circuit-breaker guards.
+- [x] Write-guard & role-guard proof: `account_role='personal_main'` and `'evidence_scout'`
+  strictly reject automated writes (`channel_adapter_unsupported` / `role_read_only`);
+  dedicated `care_consultant` accounts enforce daily UTC budget (`daily_read_budget`,
+  `daily_write_budget`) + brand `consultation_playbooks` injection in `src/evaluator.rs`.
+- [x] Circuit breaker (`trip_circuit_breaker` in `src/fleet.rs`): fail-closed auto-pause on
+  checkpoint/login redirect/IP mismatch (`health_status='checkpointed'`) + Cygnus Telegram
+  Gateway alert (`CYGNUS_GATEWAY_URL`, bot `Cygnus_Assitance_Bot`, topic `7410`) + manual
+  operator `Resume` (`POST /api/admin/fleet/:id/resume`), verified in
+  `test_phase2b_fleet_leases_preflight_circuit_breaker_telegram_budgets_and_playbooks`.
 
 ## Phase 3: guarded writes + more platforms
 

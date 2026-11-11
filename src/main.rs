@@ -157,9 +157,19 @@ async fn main() {
                 eprintln!("worker db init failed: {e}");
                 std::process::exit(1);
             }
+            let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
+            let conns = worker::build_connections_from_env(&path, &org, None, &env_map);
             eprintln!("lnc-care worker v{} started (db={})", lnc_care::VERSION, path.display());
             loop {
-                let _ = worker::run_pending_jobs(&path, &org, 10, "lnc-care-worker");
+                let _ = worker::run_pending_jobs_with_runtime(
+                    &path,
+                    &org,
+                    10,
+                    "lnc-care-worker",
+                    conns.as_ref(),
+                    None,
+                    &env_map,
+                );
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }

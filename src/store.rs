@@ -686,10 +686,52 @@ where
     }
 }
 
+fn ensure_column(
+    db: &Connection,
+    table: &str,
+    column: &str,
+    ddl_suffix: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|c| c.eq_ignore_ascii_case(column));
+    if !exists {
+        db.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl_suffix}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn initialize(path: &Path, organization_id: &str, organization_name: &str) -> Result<(), rusqlite::Error> {
     let db = connect(path)?;
     let _ = db.query_row("PRAGMA journal_mode=WAL;", [], |r| r.get::<_, String>(0));
     db.execute_batch(SCHEMA)?;
+    // Additive Phase 2 / Phase 2b migrations (safe & idempotent on live `/data/care.db`)
+    ensure_column(&db, "channels", "webhook_fields", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&db, "channels", "webhook_error", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        &db,
+        "account_runtimes",
+        "budget_date",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &db,
+        "account_runtimes",
+        "last_exit_ip",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &db,
+        "account_runtimes",
+        "proxy_mode",
+        "TEXT NOT NULL DEFAULT 'xray_tun_failclosed'",
+    )?;
+    ensure_column(&db, "jobs", "max_attempts", "INTEGER NOT NULL DEFAULT 3")?;
     db.execute(
         "INSERT OR IGNORE INTO organizations (id, name) VALUES (?1, ?2)",
         params![organization_id, organization_name],
@@ -810,6 +852,12 @@ pub fn channels(
                 .get("comments_count")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
+            let webhook_subscribed = item
+                .get("webhook_subscribed_at")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0;
+            item.insert("webhook_subscribed".to_string(), Value::Bool(webhook_subscribed));
             item.insert("followers_count".to_string(), json!(followers));
             item.insert("posts_count".to_string(), json!(posts_cnt));
             item.insert("comments_count".to_string(), json!(comments_cnt));
@@ -820,6 +868,55 @@ pub fn channels(
             Value::Object(item)
         })
         .collect()
+}
+
+pub fn jobs_summary(db: &Connection, organization_id: &str) -> Value {
+    let pending: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE organization_id=?1 AND done_at IS NULL",
+            params![organization_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let completed: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE organization_id=?1 AND done_at IS NOT NULL AND error IS NULL",
+            params![organization_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let failed: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE organization_id=?1 AND error IS NOT NULL",
+            params![organization_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let archives_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM post_archives WHERE organization_id=?1",
+            params![organization_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let recent_failures: Vec<Value> = query_maps(
+        db,
+        "SELECT id, kind, attempts, error, run_after FROM jobs
+         WHERE organization_id=? AND error IS NOT NULL
+         ORDER BY id DESC LIMIT 10",
+        &[organization_id.to_string().into()],
+    )
+    .into_iter()
+    .map(Value::Object)
+    .collect();
+
+    json!({
+        "pending": pending,
+        "completed": completed,
+        "failed": failed,
+        "archives_count": archives_count,
+        "recent_failures": recent_failures,
+    })
 }
 
 pub fn posts_list(

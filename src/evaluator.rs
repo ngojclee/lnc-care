@@ -804,12 +804,24 @@ pub fn evaluate_context(ctx: &CommentContext, threshold_override: Option<i64>) -
             } else {
                 ""
             };
+            let playbook_note = if !ctx.playbook_knowledge.trim().is_empty() {
+                format!(
+                    "\n• Brand Playbook Note: {}",
+                    truncate_chars(ctx.playbook_knowledge.trim(), 260)
+                )
+            } else {
+                String::new()
+            };
+            if !playbook_note.is_empty() {
+                points.push("Apply active consultation playbook knowledge".to_string());
+            }
             (
                 json!({
                     "objective": "Convert high-intent inquiry into an order via structured consultation",
                     "goal": "Convert high-intent inquiry into an order via structured consultation",
                     "tone": "Warm, Consultative & Luxury-Editorial",
                     "recommended_channel": "public_and_dm",
+                    "playbook_applied": !playbook_note.is_empty(),
                     "key_points": points,
                     "next_step_cta": "Check Private Message (DM) for Custom Size Chart & Direct Order Link",
                     "steps": [
@@ -822,7 +834,7 @@ pub fn evaluate_context(ctx: &CommentContext, threshold_override: Option<i64>) -
                     "Hi {author}! Thank you for your interest in this set.{spec_clause}{ship_clause} We have just sent the full price details and sizing guide to your inbox — please check your messages!"
                 ),
                 format!(
-                    "Hi {author}! Following up on your comment on \"{post_snip}\":\n• Handcrafted Press-On Set: available in standard sizes (XS/S/M/L) or custom measurements.\n• Includes: 10 handmade nails + prep kit (buffer, cuticle stick, alcohol pad, jelly tabs & nail glue).\n• Reply here with your preferred shape or nail widths and we will help you pick the exact fit!"
+                    "Hi {author}! Following up on your comment on \"{post_snip}\":\n• Handcrafted Press-On Set: available in standard sizes (XS/S/M/L) or custom measurements.\n• Includes: 10 handmade nails + prep kit (buffer, cuticle stick, alcohol pad, jelly tabs & nail glue).{playbook_note}\n• Reply here with your preferred shape or nail widths and we will help you pick the exact fit!"
                 ),
             )
         }

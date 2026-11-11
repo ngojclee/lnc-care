@@ -1,7 +1,8 @@
-//! Comprehensive Rust contract test suite for LNC Care (`v0.4.0.0`).
+//! Comprehensive Rust contract test suite for LNC Care (`v0.5.0.0`).
 //!
 //! Verifies 1:1 wire, cryptographic, SQLite WAL, UI blueprint, Agent Hub / LAN Bridge,
-//! Universal 3-way SSO, and Business MCP Hub v3/v4 + McpGatewayClient contracts.
+//! Universal 3-way SSO, Business MCP Hub v3/v4 + McpGatewayClient, Phase 2 Realtime Webhooks /
+//! Media Archives / 5-Layer Forensic PKZIP + Watchdog, and Phase 2b Multi-Account Fleet contracts.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ use lnc_care::mcp_gateway::{McpGatewayClient, McpGatewayConfig};
 use lnc_care::routes::{build_router, AppConfig};
 use lnc_care::transport::{mock_transport, TransportRequest, TransportResponse};
 use lnc_care::vault::Vault;
-use lnc_care::{audit, evaluator, internal_bridge, mcp_server, store, VERSION};
+use lnc_care::{audit, evaluator, fleet, internal_bridge, mcp_server, store, worker, VERSION};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -2124,7 +2125,7 @@ async fn test_mcp_bearer_delegation_replay_and_scope_filtering() {
         403
     );
 
-    // Read-only caller sees 14 read tools and 0 write tools; replaying same nonce -> 403
+    // Read-only caller sees 16 read tools and 0 write tools; replaying same nonce -> 403
     let ro_tok = sign_delegation_token(
         DEL_SECRET,
         "lnc-care",
@@ -2146,7 +2147,7 @@ async fn test_mcp_bearer_delegation_replay_and_scope_filtering() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(ro_tools.len(), 14);
+    assert_eq!(ro_tools.len(), 16);
     assert!(!ro_tools.contains(&"comment_reply".to_string()));
 
     // Nonce replay -> 403
@@ -2161,7 +2162,7 @@ async fn test_mcp_bearer_delegation_replay_and_scope_filtering() {
         403
     );
 
-    // Enable `care:write` in `mcp_max_scopes` -> full read+write caller sees all 26 `care__*` tools
+    // Enable `care:write` in `mcp_max_scopes` -> full read+write caller sees all 32 `care__*` tools
     let csrf = c.login(MGMT_KEY).await;
     c.post_json(
         "/api/settings",
@@ -2189,7 +2190,7 @@ async fn test_mcp_bearer_delegation_replay_and_scope_filtering() {
     assert_eq!(rw_res.status, 200);
     assert_eq!(
         rw_res.json()["result"]["tools"].as_array().unwrap().len(),
-        26
+        32
     );
 }
 
@@ -2762,4 +2763,466 @@ fn test_python_sqlite_vault_and_audit_wire_compatibility() {
 
     let ascii = audit::canonical_ascii_json(&json!({ "b": "Tiếng Việt", "a": 1 }));
     assert_eq!(ascii, "{\"a\":1,\"b\":\"Ti\\u1ebfng Vi\\u1ec7t\"}");
+}
+
+// ============================================================================
+// 20. Phase 2: Realtime Webhook Subscription & Materialization, Media/Screenshot
+//     Archive + Retention Pruning, and 5-Layer Forensic PKZIP + Watchdog
+// ============================================================================
+#[tokio::test]
+async fn test_phase2_webhook_materialization_archive_pruning_and_forensic_zip_watchdog() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase2.db");
+
+    let target_deleted = Arc::new(Mutex::new(false));
+    let target_deleted_cl = target_deleted.clone();
+    let subscribed_calls = Arc::new(Mutex::new(0usize));
+    let subscribed_calls_cl = subscribed_calls.clone();
+
+    let transport = mock_transport(move |req: TransportRequest| {
+        if req.url.contains("/subscribed_apps") && req.method == "POST" {
+            *subscribed_calls_cl.lock().unwrap() += 1;
+            return Ok(json_transport_resp(200, json!({ "success": true })));
+        }
+        if req.url.contains("cdn.example.com/photo1.jpg") {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "image/jpeg".to_string());
+            return Ok(TransportResponse {
+                status: 200,
+                headers: h,
+                body: b"\xFF\xD8\xFF\xE0JFIF_MOCK_PHOTO_BYTES_12345".to_vec(),
+            });
+        }
+        if req.url.contains("facebook.com/luxeclaw/posts/wh_999") {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "text/html".to_string());
+            return Ok(TransportResponse {
+                status: 200,
+                headers: h,
+                body: b"<html><body><h1>LuxeClaw Post Permalink Snapshot</h1></body></html>".to_vec(),
+            });
+        }
+        if req.url.contains("facebook.com/defamation/target_777") {
+            if *target_deleted_cl.lock().unwrap() {
+                return Ok(TransportResponse {
+                    status: 404,
+                    headers: HashMap::new(),
+                    body: b"This content isn't available right now".to_vec(),
+                });
+            }
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "text/html".to_string());
+            return Ok(TransportResponse {
+                status: 200,
+                headers: h,
+                body: b"<html><body data-forensic-comment-body=\"1\">Shop lua dao!</body></html>".to_vec(),
+            });
+        }
+        Ok(json_transport_resp(200, json!({ "data": [] })))
+    });
+
+    let mut cfg = base_app_config(db_path.clone());
+    cfg.transport = Some(transport);
+    cfg.env_overrides
+        .as_mut()
+        .unwrap()
+        .insert("META_APP_SECRET".to_string(), "meta_wh_secret_phase2".to_string());
+
+    let mut c = TestClient::new(build_router(cfg).unwrap());
+    let csrf = c.login(MGMT_KEY).await;
+
+    // Seed demo workspace and store a Page token in Vault so `POST /subscribe` calls Graph `subscribed_apps`
+    c.post_json("/api/admin/seed-demo", &json!({}), &[("x-csrf-token", &csrf)])
+        .await;
+    let ov = c.get("/api/admin/overview").await.json();
+    let fb_ch = ov["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ch| ch["external_id"] == "235513372986478")
+        .unwrap()
+        .clone();
+    let fb_ch_id = fb_ch["id"].as_i64().unwrap();
+
+    {
+        let db = store::connect(&db_path).unwrap();
+        let v = Vault::new(Some(KEY_1), None).unwrap();
+        v.put(
+            &db,
+            "lnc-default",
+            "channel_token",
+            "meta:235513372986478",
+            &json!({ "access_token": "EAAPageTokenPhase2" }),
+        )
+        .unwrap();
+    }
+
+    // 1. Subscribe Page webhooks
+    let sub_r = c
+        .post_json(
+            &format!("/api/admin/channels/{fb_ch_id}/subscribe"),
+            &json!({ "fields": "feed,messages,mention" }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await;
+    assert_eq!(sub_r.status, 200, "subscribe failed: {}", sub_r.text());
+    assert_eq!(sub_r.json()["webhook_subscribed"], true);
+    assert_eq!(*subscribed_calls.lock().unwrap(), 1);
+
+    // 2. Signed realtime Meta webhook with inline comment + DM message -> materialized by worker!
+    let wh_payload = json!({
+        "object": "page",
+        "entry": [{
+            "id": "235513372986478",
+            "time": now_unix(),
+            "changes": [
+                {
+                    "field": "feed",
+                    "value": {
+                        "item": "comment",
+                        "verb": "add",
+                        "post_id": "235513372986478_wh_999",
+                        "comment_id": "wh_cm_8881",
+                        "permalink_url": "https://www.facebook.com/luxeclaw/posts/wh_999",
+                        "from": { "id": "100044332211", "name": "Claire Laurent" },
+                        "message": "Shop ơi cho mình hỏi bộ Coffin size M giá bao nhiêu và ship Lyon mất mấy ngày ạ?",
+                        "created_time": now_unix()
+                    }
+                },
+                {
+                    "field": "messages",
+                    "value": {
+                        "sender": { "id": "psid_claire_01", "name": "Claire Laurent" },
+                        "mid": "mid_wh_001",
+                        "text": "Mình muốn đặt 2 bộ luôn nhé shop!"
+                    }
+                }
+            ]
+        }]
+    });
+    let raw_wh = serde_json::to_vec(&wh_payload).unwrap();
+    let wh_sig = format!("sha256={}", hmac_hex("meta_wh_secret_phase2", &raw_wh));
+    let wh_res = c
+        .request(
+            Method::POST,
+            "/webhooks/meta",
+            &[
+                ("content-type", "application/json"),
+                ("x-hub-signature-256", &wh_sig),
+            ],
+            Some(raw_wh),
+        )
+        .await;
+    assert_eq!(wh_res.status, 200);
+    assert_eq!(wh_res.json()["enqueued"], 2);
+
+    let run_res = c
+        .post_json("/api/admin/jobs/run", &json!({}), &[("x-csrf-token", &csrf)])
+        .await;
+    assert_eq!(run_res.status, 200);
+    assert!(run_res.json()["processed"].as_i64().unwrap() >= 2);
+
+    // Verify comment was materialized & scored in `should_consult`, and DM conversation was created
+    let cms = c.get("/api/admin/comments?search=Claire").await.json();
+    let claire_cm = &cms["comments"].as_array().unwrap()[0];
+    assert_eq!(claire_cm["external_id"], "wh_cm_8881");
+    assert_eq!(claire_cm["bucket"], "should_consult");
+    let wh_post_id = claire_cm["post_id"].as_i64().unwrap();
+
+    let convs = c.get("/api/admin/conversations").await.json();
+    assert!(convs["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cv| cv["participant_name"] == "Claire Laurent"));
+
+    // Attach remote photo URL to post & run real media + permalink HTML archive
+    {
+        let db = store::connect(&db_path).unwrap();
+        db.execute(
+            "UPDATE posts SET media_json=?1 WHERE id=?2",
+            params![r#"[{"type":"photo","url":"https://cdn.example.com/photo1.jpg"}]"#, wh_post_id],
+        )
+        .unwrap();
+    }
+    let arch_res = c
+        .post_json(
+            &format!("/api/admin/posts/{wh_post_id}/archive"),
+            &json!({}),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await;
+    assert_eq!(arch_res.status, 200);
+    let p_det = c.get(&format!("/api/admin/posts/{wh_post_id}")).await.json();
+    let archives = p_det["post"]["archives"].as_array().unwrap();
+    assert!(archives.len() >= 2);
+    assert!(archives.iter().all(|a| a["bytes"].as_i64().unwrap() > 15));
+
+    // Verify retention pruning deletes expired post_archives rows & files
+    {
+        let db = store::connect(&db_path).unwrap();
+        let old_ts = now_unix() - 400 * 86400;
+        db.execute(
+            "INSERT INTO post_archives (organization_id, post_id, kind, path, sha256, bytes, captured_at)
+             VALUES ('lnc-default', ?1, 'media', 'archive/expired_dummy.bin', '00', 4, ?2)",
+            params![wh_post_id, old_ts],
+        )
+        .unwrap();
+        let pruned = worker::prune_expired_archives(&db_path, "lnc-default", 365).unwrap();
+        assert_eq!(pruned, 1);
+    }
+
+    // 3. Seal 5-layer forensic bundle on disk -> export `.zip` -> verify custody -> run deletion watchdog
+    let cap = c
+        .post_json(
+            "/api/admin/evidence/capture",
+            &json!({
+                "title": "Phase 2 Forensic Defamation Bundle",
+                "target_url": "https://www.facebook.com/defamation/target_777",
+            }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await;
+    assert_eq!(cap.status, 200);
+    let cap_json = cap.json();
+    let case_id = cap_json["case_id"].as_i64().unwrap();
+    assert_eq!(
+        cap_json["watchdog_job_ids"].as_array().unwrap().len(),
+        3,
+        "must schedule +6h, +24h, and +72h watchdog jobs"
+    );
+
+    let zip_resp = c
+        .get(&format!("/api/admin/evidence/{case_id}/export"))
+        .await;
+    assert_eq!(zip_resp.status, 200);
+    assert_eq!(zip_resp.header("content-type"), Some("application/zip"));
+    assert_eq!(&zip_resp.body[..4], b"PK\x03\x04", "must be valid PKZIP archive");
+    let zip_str = String::from_utf8_lossy(&zip_resp.body);
+    assert!(zip_str.contains("manifest.json"));
+    assert!(zip_str.contains("layer1_immutable_ids.json"));
+    assert!(zip_str.contains("layer3_dom_snapshot.html"));
+
+    let ver_resp = c
+        .get(&format!("/api/admin/evidence/{case_id}/verify"))
+        .await
+        .json();
+    assert_eq!(ver_resp["valid"], true);
+    assert_eq!(ver_resp["disk_zip_valid"], true);
+
+    // Simulate author deleting the defamatory post (`404`) and run watchdog check
+    *target_deleted.lock().unwrap() = true;
+    let chk_resp = c
+        .post_json(
+            &format!("/api/admin/evidence/{case_id}/check"),
+            &json!({}),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await
+        .json();
+    assert_eq!(chk_resp["alive_status"], "deleted");
+}
+
+// ============================================================================
+// 21. Phase 2b: Multi-Account Fleet Concurrency Leases, Pre-Flight IP Gate,
+//     Circuit Breaker + Cygnus Telegram Alert, Budgets & Consultation Playbooks
+// ============================================================================
+#[tokio::test]
+async fn test_phase2b_fleet_leases_preflight_circuit_breaker_telegram_budgets_and_playbooks() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("phase2b.db");
+
+    let observed_vb_ip = Arc::new(Mutex::new("82.64.110.14".to_string()));
+    let observed_vb_ip_cl = observed_vb_ip.clone();
+    let telegram_alerts = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let telegram_alerts_cl = telegram_alerts.clone();
+
+    let transport = mock_transport(move |req: TransportRequest| {
+        if req.url == "http://10.21.1.101:8899/send" && req.method == "POST" {
+            let b: Value = serde_json::from_slice(req.body.as_deref().unwrap_or(b"{}")).unwrap();
+            telegram_alerts_cl.lock().unwrap().push(b);
+            return Ok(json_transport_resp(200, json!({ "ok": true })));
+        }
+        if req.url.contains("/v1/profiles/") && req.url.ends_with("/preflight") {
+            let ip = observed_vb_ip_cl.lock().unwrap().clone();
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "exit_ip": ip,
+                    "country": "FR",
+                    "xray_failsafe_ok": true,
+                }),
+            ));
+        }
+        if req.url.contains("/v1/profiles/") && req.url.ends_with("/fetch-feed") {
+            return Ok(json_transport_resp(
+                200,
+                json!({
+                    "posts": [{
+                        "permalink": "https://www.facebook.com/ngocle/posts/browser_101",
+                        "caption": "Handcrafted press-on nails showcase",
+                        "comments": [{
+                            "author_name": "Élodie Moreau",
+                            "author_external_id": "fb_elodie_77",
+                            "author_meta": "Paris · 12 mutuals",
+                            "text": "Shop ơi tư vấn giúp mình giá bộ Almond size S và ship Paris nhé!"
+                        }]
+                    }]
+                }),
+            ));
+        }
+        Ok(json_transport_resp(200, json!({})))
+    });
+
+    let mut cfg = base_app_config(db_path.clone());
+    cfg.transport = Some(transport);
+    {
+        let env = cfg.env_overrides.as_mut().unwrap();
+        env.insert(
+            "VEILBROWSER_API_URL".to_string(),
+            "http://127.0.0.1:19400".to_string(),
+        );
+        env.insert(
+            "ORBINE_API_URL".to_string(),
+            "http://127.0.0.1:19500".to_string(),
+        );
+        env.insert(
+            "CYGNUS_GATEWAY_URL".to_string(),
+            "http://10.21.1.101:8899/send".to_string(),
+        );
+        env.insert(
+            "CYGNUS_AUTH_KEY".to_string(),
+            "cygnus_test_bearer_key".to_string(),
+        );
+        env.insert("MAX_CONCURRENT_BROWSER_SESSIONS".to_string(), "2".to_string());
+    }
+
+    let mut c = TestClient::new(build_router(cfg).unwrap());
+    let csrf = c.login(MGMT_KEY).await;
+    c.post_json("/api/admin/seed-demo", &json!({}), &[("x-csrf-token", &csrf)])
+        .await;
+
+    // 1. Create Consultation Playbook and verify it lists cleanly
+    let pb_save = c
+        .post_json(
+            "/api/admin/playbooks",
+            &json!({
+                "name": "Paris VIP Press-On Playbook",
+                "auto_suggest_threshold": 75,
+                "auto_consult_enabled": true,
+                "consultation_knowledge_md": "Complimentary sizing kit + 48h tracked Colissimo from Paris.",
+                "forbidden_topics": ["competitor_bashing", "medical_claims"]
+            }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await;
+    assert_eq!(pb_save.status, 200);
+
+    // 2. Test `personal_main` strict `role_read_only` write-budget rejection & concurrency ceiling (`max=2`)
+    let fl = c.get("/api/admin/fleet").await.json();
+    let runtimes = fl["runtimes"].as_array().unwrap();
+    let founder_rt_id = runtimes
+        .iter()
+        .find(|r| r["account_role"] == "personal_main")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let consult1_id = runtimes
+        .iter()
+        .find(|r| r["runtime_profile_id"] == "vb_prof_consult_01")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let consult2_id = runtimes
+        .iter()
+        .find(|r| r["runtime_profile_id"] == "vb_prof_consult_02")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    {
+        let db = store::connect(&db_path).unwrap();
+        let write_attempt = fleet::consume_runtime_budget_tx(&db, "lnc-default", founder_rt_id, true);
+        assert_eq!(write_attempt.unwrap_err(), "role_read_only");
+    }
+
+    let l1 = fleet::acquire_lease(&db_path, "lnc-default", founder_rt_id, None, "w1", 120, 2).unwrap();
+    let l2 = fleet::acquire_lease(&db_path, "lnc-default", consult1_id, None, "w2", 120, 2).unwrap();
+    // Third concurrent lease exceeds `max_concurrent = 2` -> rejected!
+    let l3_err = fleet::acquire_lease(&db_path, "lnc-default", consult2_id, None, "w3", 120, 2).unwrap_err();
+    assert_eq!(l3_err, "fleet_concurrency_limit_reached");
+    fleet::release_lease(&db_path, "lnc-default", l1["lease_id"].as_i64().unwrap(), "completed", true).unwrap();
+    fleet::release_lease(&db_path, "lnc-default", l2["lease_id"].as_i64().unwrap(), "completed", true).unwrap();
+
+    // 3. Browser channel sync (`veilbrowser` channel) -> preflight IP match (`82.64.110.14`), synthetic `br_cm_*`, `source='browser'`, `verified=0`, playbook injected in draft!
+    let ov = c.get("/api/admin/overview").await.json();
+    let vb_ch_id = ov["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ch| ch["adapter"] == "veilbrowser")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let bsync = c
+        .post_json(
+            &format!("/api/admin/channels/{vb_ch_id}/browser-sync"),
+            &json!({ "runtime_id": founder_rt_id, "reschedule": true }),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await;
+    assert_eq!(bsync.status, 200, "browser-sync failed: {}", bsync.text());
+    assert_eq!(bsync.json()["comments"], 1);
+    assert!(bsync.json()["next_job_id"].as_i64().is_some());
+
+    let elodie_cms = c.get("/api/admin/comments?search=Moreau").await.json();
+    let elodie = &elodie_cms["comments"].as_array().unwrap()[0];
+    assert_eq!(elodie["source"], "browser");
+    assert_eq!(elodie["verified"], 0);
+    assert!(elodie["external_id"].as_str().unwrap().starts_with("br_cm_"));
+    let elodie_thread = c
+        .get(&format!("/api/admin/comments/{}", elodie["id"].as_i64().unwrap()))
+        .await
+        .json();
+    let drafts = elodie_thread["thread"]["drafts"].as_array().unwrap();
+    assert!(
+        drafts
+            .iter()
+            .any(|d| d["text"].as_str().unwrap_or("").contains("Complimentary sizing kit")),
+        "Consultation playbook knowledge must be injected into private draft"
+    );
+
+    // 4. Simulate proxy residential IP leak/change -> `POST /probe` trips circuit breaker (`checkpointed`) AND alerts Cygnus Telegram Gateway!
+    *observed_vb_ip.lock().unwrap() = "185.220.101.9".to_string();
+    let probe_bad = c
+        .post_json(
+            &format!("/api/admin/fleet/{founder_rt_id}/probe"),
+            &json!({}),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await
+        .json();
+    assert_eq!(probe_bad["tripped"], true);
+    assert_eq!(probe_bad["health_status"], "checkpointed");
+    assert_eq!(telegram_alerts.lock().unwrap().len(), 1);
+    assert_eq!(
+        telegram_alerts.lock().unwrap()[0]["bot"],
+        "Cygnus_Assitance_Bot"
+    );
+
+    // Operator resolves proxy & clicks Resume -> back to `healthy`
+    let resume_ok = c
+        .post_json(
+            &format!("/api/admin/fleet/{founder_rt_id}/resume"),
+            &json!({}),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await
+        .json();
+    assert_eq!(resume_ok["health_status"], "healthy");
+
+    // Audit hash chain remains 100% intact across all Phase 2b operations
+    let aud = c.get("/api/admin/audit/verify").await.json();
+    assert_eq!(aud["valid"], true);
 }

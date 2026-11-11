@@ -24,8 +24,9 @@ use subtle::ConstantTimeEq;
 
 use crate::mcp_gateway::McpGatewayClient;
 use crate::store::{self, query_maps, query_one_map};
+use crate::transport::SharedTransport;
 use crate::vault::Vault;
-use crate::{audit, connections, evaluator, settings, worker};
+use crate::{audit, connections, evaluator, evidence, fleet, settings, worker};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -82,6 +83,7 @@ pub struct McpServerConfig {
     pub audience: String,
     pub vault: Vault,
     pub env_map: HashMap<String, String>,
+    pub transport: Option<SharedTransport>,
 }
 
 fn now_unix() -> i64 {
@@ -161,6 +163,8 @@ pub fn tool_scopes_map() -> BTreeMap<&'static str, Vec<&'static str>> {
         "inbox_summary",
         "evidence_case_get",
         "ads_context_lookup",
+        "fleet_runtimes_list",
+        "playbooks_list",
     ] {
         m.insert(name, vec!["care:read"]);
     }
@@ -174,6 +178,10 @@ pub fn tool_scopes_map() -> BTreeMap<&'static str, Vec<&'static str>> {
         "ticket_handoff",
         "archive_request",
         "evidence_capture",
+        "evidence_watchdog_check",
+        "channel_webhook_subscribe",
+        "fleet_runtime_probe",
+        "playbook_upsert",
         "comment_reply",
         "comment_hide_set",
         "comment_private_reply",
@@ -889,6 +897,40 @@ fn execute_tool(
             let sub_args = args.get("arguments");
             gw.call_tool(tool_name, sub_args).map_err(|e| e.code)
         }
+        "fleet_runtimes_list" => {
+            require_tool_scopes(caller, "fleet_runtimes_list", &[])?;
+            let shop_id = opt_i64(args, "shop_id");
+            let db = store::connect_readonly(path).map_err(|e| e.to_string())?;
+            let mut sql = String::from("SELECT * FROM account_runtimes WHERE organization_id=?");
+            let mut pvec: Vec<rusqlite::types::Value> = vec![org.clone().into()];
+            if let Some(sid) = shop_id {
+                sql.push_str(" AND (shop_id=? OR shop_id IS NULL)");
+                pvec.push(sid.into());
+            }
+            sql.push_str(" ORDER BY id ASC");
+            let runtimes: Vec<Value> = query_maps(&db, &sql, &pvec)
+                .into_iter()
+                .map(Value::Object)
+                .collect();
+            let leases: Vec<Value> = query_maps(
+                &db,
+                "SELECT * FROM runtime_leases WHERE organization_id=? ORDER BY id DESC LIMIT 30",
+                &[org.clone().into()],
+            )
+            .into_iter()
+            .map(Value::Object)
+            .collect();
+            Ok(json!({ "runtimes": runtimes, "leases": leases }))
+        }
+        "playbooks_list" => {
+            require_tool_scopes(caller, "playbooks_list", &[])?;
+            let shop_id = opt_i64(args, "shop_id");
+            let channel_id = opt_i64(args, "channel_id");
+            let db = store::connect_readonly(path).map_err(|e| e.to_string())?;
+            Ok(json!({
+                "playbooks": fleet::playbooks_list(&db, org, shop_id, channel_id)
+            }))
+        }
         "comment_evaluate" => {
             require_tool_scopes(caller, "comment_evaluate", &[])?;
             let comment_id = req_i64(args, "comment_id")?;
@@ -1336,13 +1378,139 @@ fn execute_tool(
             let comment_id = opt_i64(args, "comment_id");
             let case_id = opt_i64(args, "case_id");
             store::with_write_tx_str(path, |db| {
-                connections::capture_forensic_evidence(
+                connections::capture_forensic_evidence_on_disk(
                     db,
+                    path,
                     org,
                     target_url,
                     title,
                     comment_id,
                     case_id,
+                    &actor,
+                    cfg.transport.as_ref(),
+                )
+            })
+        }
+        "evidence_watchdog_check" => {
+            require_tool_scopes(caller, "evidence_watchdog_check", &[])?;
+            let case_id = opt_i64(args, "case_id");
+            let item_id = opt_i64(args, "item_id");
+            let data_dir = evidence::resolve_data_dir(path);
+            store::with_write_tx_str(path, |db| -> Result<Value, String> {
+                let watchdog = evidence::run_watchdog_check(
+                    db,
+                    org,
+                    case_id,
+                    item_id,
+                    cfg.transport.as_ref(),
+                    &actor,
+                )?;
+                let custody = if let Some(cid) = case_id {
+                    evidence::verify_case_custody(db, &data_dir, org, cid).ok()
+                } else {
+                    None
+                };
+                Ok(json!({
+                    "ok": true,
+                    "watchdog": watchdog,
+                    "custody": custody,
+                }))
+            })
+        }
+        "channel_webhook_subscribe" => {
+            require_tool_scopes(caller, "channel_webhook_subscribe", &[])?;
+            let channel_id = req_i64(args, "channel_id")?;
+            let fields = opt_str(args, "fields").unwrap_or("feed,messages,mention");
+            let now = now_unix();
+            store::with_write_tx_str(path, |db| -> Result<Value, String> {
+                let exists = db
+                    .query_row(
+                        "SELECT 1 FROM channels WHERE organization_id=?1 AND id=?2 AND approved=1",
+                        params![org, channel_id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .is_ok();
+                if !exists {
+                    return Err("channel_not_authorized".to_string());
+                }
+                let job_id = worker::enqueue_job(
+                    db,
+                    org,
+                    "backfill",
+                    &json!({ "channel_id": channel_id, "subscribe_fields": fields }),
+                    0,
+                )
+                .map_err(|e| e.to_string())?;
+                db.execute(
+                    "UPDATE channels SET webhook_subscribed_at=?1, webhook_fields=?2, webhook_error=''
+                     WHERE organization_id=?3 AND id=?4",
+                    params![now, fields, org, channel_id],
+                )
+                .map_err(|e| e.to_string())?;
+                audit::append(
+                    db,
+                    org,
+                    &actor,
+                    "channel.webhook_subscribed",
+                    &channel_id.to_string(),
+                    &json!({ "fields": fields, "job_id": job_id }),
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "ok": true,
+                    "channel_id": channel_id,
+                    "webhook_subscribed": true,
+                    "webhook_fields": fields,
+                    "job_id": job_id,
+                }))
+            })
+        }
+        "fleet_runtime_probe" => {
+            require_tool_scopes(caller, "fleet_runtime_probe", &[])?;
+            let runtime_id = req_i64(args, "runtime_id")?;
+            fleet::probe_runtime(
+                path,
+                org,
+                runtime_id,
+                cfg.transport.as_ref(),
+                &cfg.env_map,
+                &actor,
+            )
+        }
+        "playbook_upsert" => {
+            require_tool_scopes(caller, "playbook_upsert", &[])?;
+            let name = opt_str(args, "name")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "name is required".to_string())?;
+            let playbook_id = opt_i64(args, "playbook_id");
+            let shop_id = opt_i64(args, "shop_id");
+            let channel_id = opt_i64(args, "channel_id");
+            let threshold = opt_i64(args, "auto_suggest_threshold").unwrap_or(80);
+            let auto_consult = opt_bool(args, "auto_consult_enabled", false);
+            let knowledge_md = opt_str(args, "consultation_knowledge_md").unwrap_or("");
+            let forbidden: Vec<String> = args
+                .get("forbidden_topics")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            store::with_write_tx_str(path, |db| {
+                fleet::upsert_playbook(
+                    db,
+                    org,
+                    playbook_id,
+                    shop_id,
+                    channel_id,
+                    name,
+                    threshold,
+                    auto_consult,
+                    knowledge_md,
+                    &forbidden,
                     &actor,
                 )
             })
@@ -1756,6 +1924,27 @@ fn all_tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "fleet_runtimes_list",
+            "description": "List isolated runtime profiles (`meta_api`, `veilbrowser`, `orbine_mobile`) and concurrency leases.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "shop_id": { "type": ["integer", "null"] }
+                }
+            }
+        }),
+        json!({
+            "name": "playbooks_list",
+            "description": "List consultation playbooks and brand knowledge rules by shop or channel.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "shop_id": { "type": ["integer", "null"] },
+                    "channel_id": { "type": ["integer", "null"] }
+                }
+            }
+        }),
+        json!({
             "name": "comment_evaluate",
             "description": "Run the prompt-injection-isolated AI rubric evaluator and consultation drafter on a comment.",
             "inputSchema": {
@@ -1867,7 +2056,7 @@ fn all_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "evidence_capture",
-            "description": "Capture a 5-layer forensic snapshot ('Lập vi bằng số') with SHA-256 manifest seal.",
+            "description": "Capture a 5-layer forensic snapshot ('Lập vi bằng số') with SHA-256 manifest & deterministic PKZIP bundle.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1876,6 +2065,58 @@ fn all_tool_definitions() -> Vec<Value> {
                     "comment_id": { "type": ["integer", "null"] },
                     "case_id": { "type": ["integer", "null"] }
                 }
+            }
+        }),
+        json!({
+            "name": "evidence_watchdog_check",
+            "description": "Run deletion/edit watchdog check and verify SHA-256 chain of custody on a forensic evidence case.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "case_id": { "type": ["integer", "null"] },
+                    "item_id": { "type": ["integer", "null"] }
+                }
+            }
+        }),
+        json!({
+            "name": "channel_webhook_subscribe",
+            "description": "Enable realtime Meta webhook subscription (`feed,messages,mention`) for an approved channel.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel_id": { "type": "integer" },
+                    "fields": { "type": "string", "default": "feed,messages,mention" }
+                },
+                "required": ["channel_id"]
+            }
+        }),
+        json!({
+            "name": "fleet_runtime_probe",
+            "description": "Run fail-closed pre-flight residential IP/ASN & checkpoint health probe on an account runtime.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "runtime_id": { "type": "integer" }
+                },
+                "required": ["runtime_id"]
+            }
+        }),
+        json!({
+            "name": "playbook_upsert",
+            "description": "Create or update a brand consultation playbook for AI rubric drafting.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "playbook_id": { "type": ["integer", "null"] },
+                    "shop_id": { "type": ["integer", "null"] },
+                    "channel_id": { "type": ["integer", "null"] },
+                    "name": { "type": "string" },
+                    "auto_suggest_threshold": { "type": "integer", "default": 80 },
+                    "auto_consult_enabled": { "type": "boolean", "default": false },
+                    "consultation_knowledge_md": { "type": "string", "default": "" },
+                    "forbidden_topics": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["name"]
             }
         }),
         json!({

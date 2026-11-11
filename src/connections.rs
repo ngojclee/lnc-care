@@ -16,8 +16,9 @@ use subtle::ConstantTimeEq;
 use url::Url;
 
 use crate::agent_hub::AgentHubClient;
-use crate::audit::{self, canonical_ascii_json};
+use crate::audit;
 use crate::evaluator;
+use crate::evidence;
 use crate::providers::{
     ProviderError, Providers, META_VERSION, TIKTOK_VERSION, YOUTUBE_VERSION,
 };
@@ -1388,6 +1389,480 @@ impl Connections {
             "comments": comments_saved,
         }))
     }
+
+    pub fn subscribe_channel_webhooks(
+        &self,
+        channel_id: i64,
+        fields: &str,
+    ) -> Result<Value, ProviderError> {
+        let eff_fields = if fields.trim().is_empty() {
+            "feed,messages"
+        } else {
+            fields.trim()
+        };
+
+        let ch = {
+            let db = store::connect_readonly(&self.path)?;
+            let ch = query_one_map(
+                &db,
+                "SELECT * FROM channels WHERE organization_id=? AND id=? AND approved=1",
+                &[self.org.clone().into(), channel_id.into()],
+            )
+            .ok_or_else(|| ProviderError::new("channel_not_authorized", 403))?;
+            if ch.get("adapter").and_then(|v| v.as_str()) != Some("meta_api") {
+                return Err(ProviderError::new("channel_adapter_unsupported", 409));
+            }
+            ch
+        };
+
+        let conn_id = ch.get("connection_id").and_then(|v| v.as_i64());
+        if let (Some(cid), Some(ref hub)) = (conn_id, &self.hub_client) {
+            hub.ensure_fresh_token(&self.path, &self.org, &self.vault, cid, false);
+        }
+
+        let provider = ch
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("meta");
+        let ch_kind = ch
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("fb_page");
+        let ch_ext = ch
+            .get("external_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // For IG business accounts, subscribe the linked FB page if linked_channel_id is set
+        let subscribe_target_ext = if ch_kind == "ig_account" {
+            let db = store::connect_readonly(&self.path)?;
+            if let Some(linked_cid) = ch.get("linked_channel_id").and_then(|v| v.as_i64()) {
+                db.query_row(
+                    "SELECT external_id FROM channels WHERE organization_id=?1 AND id=?2",
+                    params![self.org, linked_cid],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap_or_else(|_| ch_ext.clone())
+            } else {
+                ch_ext.clone()
+            }
+        } else {
+            ch_ext.clone()
+        };
+
+        let (token, bridge_ctx): (Option<String>, Option<(String, i64)>) = {
+            let db = store::connect_readonly(&self.path)?;
+            let mut tok_env = self.vault.get(
+                &db,
+                &self.org,
+                "channel_token",
+                &format!("{provider}:{subscribe_target_ext}"),
+            )?;
+            if tok_env.is_none() {
+                tok_env = self.vault.get(
+                    &db,
+                    &self.org,
+                    "channel_token",
+                    &format!("{provider}:{ch_ext}"),
+                )?;
+            }
+            if tok_env.is_none() {
+                if let Some(cid) = conn_id {
+                    tok_env = self
+                        .vault
+                        .get(&db, &self.org, "connection", &cid.to_string())?;
+                }
+            }
+            let tok = tok_env
+                .and_then(|t| t.get("access_token").and_then(|v| v.as_str()).map(String::from))
+                .filter(|s| !s.is_empty());
+
+            if tok.is_some() {
+                (tok, None)
+            } else if let Some(cid) = conn_id {
+                let has_bridge = self
+                    .hub_client
+                    .as_ref()
+                    .and_then(|h| h.ads_bridge.as_ref())
+                    .is_some();
+                if has_bridge {
+                    let link_hid: Option<String> = db
+                        .query_row(
+                            "SELECT hub_connection_id FROM hub_connection_links WHERE organization_id=?1 AND connection_id=?2",
+                            params![self.org, cid],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    let shop_name: Option<String> = db
+                        .query_row(
+                            "SELECT s.name FROM shops s
+                             JOIN channel_shop_bindings csb
+                               ON csb.organization_id=s.organization_id AND csb.shop_id=s.id
+                             WHERE csb.organization_id=?1 AND csb.channel_id=?2
+                             ORDER BY s.id LIMIT 1",
+                            params![self.org, channel_id],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    if let (Some(hid), Some(sname)) = (link_hid, shop_name) {
+                        if let Some(rest) = hid.strip_prefix("ads_bridge:") {
+                            if let Ok(remote_cid) = rest.parse::<i64>() {
+                                (None, Some((sname, remote_cid)))
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        };
+
+        if token.is_none() && bridge_ctx.is_none() {
+            return Err(ProviderError::new("channel_token_missing", 409));
+        }
+
+        let sub_res: Result<Value, ProviderError> = if let Some(ref tok) = token {
+            self.providers
+                .subscribe_page_webhooks(&subscribe_target_ext, tok, eff_fields)
+        } else {
+            let (ref sname, rcid) = bridge_ctx.as_ref().unwrap();
+            let bridge = self
+                .hub_client
+                .as_ref()
+                .and_then(|h| h.ads_bridge.as_ref())
+                .ok_or_else(|| ProviderError::new("internal_bridge_not_configured", 503))?;
+            bridge
+                .platform_call(
+                    sname,
+                    *rcid,
+                    "POST",
+                    &format!("{subscribe_target_ext}/subscribed_apps"),
+                    Some(json!({ "subscribed_fields": eff_fields })),
+                    None,
+                    true,
+                    &subscribe_target_ext,
+                )
+                .map_err(|e| ProviderError::new(e.code, e.status))
+        };
+
+        let now = now_unix();
+        match sub_res {
+            Ok(_) => {
+                store::with_write_tx(&self.path, |db| -> Result<(), ProviderError> {
+                    db.execute(
+                        "UPDATE channels
+                         SET webhook_subscribed_at=?1, webhook_fields=?2, webhook_error=''
+                         WHERE organization_id=?3 AND id=?4",
+                        params![now, eff_fields, self.org, channel_id],
+                    )?;
+                    audit::append(
+                        db,
+                        &self.org,
+                        "owner",
+                        "channel.webhook_subscribed",
+                        &channel_id.to_string(),
+                        &json!({
+                            "external_id": subscribe_target_ext,
+                            "fields": eff_fields,
+                        }),
+                    )?;
+                    Ok(())
+                })?;
+                Ok(json!({
+                    "ok": true,
+                    "channel_id": channel_id,
+                    "webhook_subscribed": true,
+                    "webhook_subscribed_at": now,
+                    "webhook_fields": eff_fields,
+                }))
+            }
+            Err(err) => {
+                let _ = store::with_write_tx(&self.path, |db| -> Result<(), ProviderError> {
+                    db.execute(
+                        "UPDATE channels SET webhook_error=?1 WHERE organization_id=?2 AND id=?3",
+                        params![err.code, self.org, channel_id],
+                    )?;
+                    Ok(())
+                });
+                Err(err)
+            }
+        }
+    }
+
+    /// Materializes a Meta webhook change (`feed` / `comments` / `mentions` / `messages`) into SQLite
+    /// and triggers AI rubric evaluation (`evaluator::evaluate_and_persist`).
+    pub fn process_meta_webhook_change(
+        &self,
+        entry_id: &str,
+        field: &str,
+        value: &Value,
+        actor: &str,
+    ) -> Result<Value, String> {
+        let entry_clean = entry_id.trim();
+        if entry_clean.is_empty() {
+            return Ok(json!({"ok": true, "ignored": "empty_entry_id"}));
+        }
+
+        let ch_opt = {
+            let db = store::connect_readonly(&self.path).map_err(|e| e.to_string())?;
+            query_one_map(
+                &db,
+                "SELECT * FROM channels WHERE organization_id=? AND external_id=? AND approved=1",
+                &[self.org.clone().into(), entry_clean.to_string().into()],
+            )
+        };
+        let Some(ch) = ch_opt else {
+            return Ok(json!({"ok": true, "ignored": "unapproved_or_unknown_channel"}));
+        };
+
+        let channel_id = ch.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let now = now_unix();
+
+        if field == "messages" {
+            let sender_id = value
+                .get("sender")
+                .and_then(|s| s.get("id"))
+                .and_then(|v| v.as_str())
+                .or_else(|| value.get("from").and_then(|f| f.get("id")).and_then(|v| v.as_str()))
+                .unwrap_or("customer_dm");
+            let sender_name = value
+                .get("sender")
+                .and_then(|s| s.get("name"))
+                .and_then(|v| v.as_str())
+                .or_else(|| value.get("from").and_then(|f| f.get("name")).and_then(|v| v.as_str()))
+                .unwrap_or("Messenger User");
+            let msg_text = value
+                .get("message")
+                .and_then(|m| {
+                    m.as_str()
+                        .or_else(|| m.get("text").and_then(|t| t.as_str()))
+                })
+                .or_else(|| value.get("text").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            if msg_text.trim().is_empty() {
+                return Ok(json!({"ok": true, "ignored": "empty_message"}));
+            }
+            let msg_ext = value
+                .get("mid")
+                .or_else(|| value.get("id"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| format!("wh_msg_{channel_id}_{now}"));
+            let conv_ext = format!("dm_{entry_clean}_{sender_id}");
+
+            return store::with_write_tx_str(&self.path, |db| {
+                let preview: String = msg_text.chars().take(180).collect();
+                db.execute(
+                    "INSERT INTO conversations
+                       (organization_id, channel_id, external_id, participant_id, participant_name,
+                        status, last_message_preview, unread_count, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, 1, ?7)
+                     ON CONFLICT(organization_id, channel_id, external_id) DO UPDATE SET
+                        status='open',
+                        last_message_preview=excluded.last_message_preview,
+                        unread_count=conversations.unread_count+1,
+                        updated_at=excluded.updated_at",
+                    params![
+                        self.org,
+                        channel_id,
+                        conv_ext,
+                        sender_id,
+                        sender_name,
+                        preview,
+                        now
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                let conv_id: i64 = db
+                    .query_row(
+                        "SELECT id FROM conversations WHERE organization_id=?1 AND channel_id=?2 AND external_id=?3",
+                        params![self.org, channel_id, conv_ext],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                db.execute(
+                    "INSERT INTO messages
+                       (organization_id, conversation_id, channel_id, external_id, direction,
+                        sender_id, sender_name, text, status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'inbound', ?5, ?6, ?7, 'delivered', ?8)
+                     ON CONFLICT(organization_id, channel_id, external_id) DO UPDATE SET
+                        text=excluded.text",
+                    params![
+                        self.org,
+                        conv_id,
+                        channel_id,
+                        msg_ext,
+                        sender_id,
+                        sender_name,
+                        msg_text,
+                        now
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "ok": true,
+                    "kind": "message",
+                    "conversation_id": conv_id,
+                }))
+            });
+        }
+
+        // Feed / comment / mention delta
+        let verb = value
+            .get("verb")
+            .and_then(|v| v.as_str())
+            .unwrap_or("add");
+        let item_type = value
+            .get("item")
+            .and_then(|v| v.as_str())
+            .unwrap_or("comment");
+        let post_ext = value
+            .get("post_id")
+            .or_else(|| value.get("media").and_then(|m| m.get("id")))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| format!("{entry_clean}_webhook_post"));
+        let comment_ext_opt = value
+            .get("comment_id")
+            .or_else(|| value.get("id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != post_ext)
+            .map(String::from);
+
+        if verb == "remove" || verb == "delete" {
+            if let Some(ref c_ext) = comment_ext_opt {
+                return store::with_write_tx_str(&self.path, |db| {
+                    db.execute(
+                        "UPDATE comments SET deleted_at=?1 WHERE organization_id=?2 AND channel_id=?3 AND external_id=?4",
+                        params![now, self.org, channel_id, c_ext],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(json!({"ok": true, "deleted_comment_external_id": c_ext}))
+                });
+            }
+        }
+
+        let inline_msg = value
+            .get("message")
+            .or_else(|| value.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // If webhook contains inline comment text, persist directly and evaluate immediately
+        if let Some(c_ext) = comment_ext_opt {
+            if !inline_msg.trim().is_empty() || item_type == "comment" || field == "comments" {
+                let parent_ext = value
+                    .get("parent_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|p| !p.is_empty() && *p != post_ext);
+                let from_obj = value.get("from").cloned().unwrap_or_else(|| json!({}));
+                let author_id = from_obj
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let author_name = from_obj
+                    .get("name")
+                    .or_else(|| from_obj.get("username"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Social User");
+                let permalink = value
+                    .get("permalink_url")
+                    .or_else(|| value.get("post").and_then(|p| p.get("permalink_url")))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("https://www.facebook.com/{post_ext}"));
+                let created_ts = value
+                    .get("created_time")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(now);
+                let is_by_channel = if author_id == entry_clean { 1 } else { 0 };
+
+                return store::with_write_tx_str(&self.path, |db| {
+                    db.execute(
+                        "INSERT INTO posts
+                           (organization_id, channel_id, external_id, permalink, kind, caption,
+                            published_at, author_is_channel, media_json, first_seen, last_synced)
+                         VALUES (?1, ?2, ?3, ?4, 'post', '', ?5, 1, '[]', ?6, ?6)
+                         ON CONFLICT(organization_id, channel_id, external_id) DO UPDATE SET
+                            last_synced=excluded.last_synced",
+                        params![self.org, channel_id, post_ext, permalink, created_ts, now],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let post_id: i64 = db
+                        .query_row(
+                            "SELECT id FROM posts WHERE organization_id=?1 AND channel_id=?2 AND external_id=?3",
+                            params![self.org, channel_id, post_ext],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+
+                    db.execute(
+                        "INSERT INTO comments
+                           (organization_id, post_id, channel_id, external_id, source, verified,
+                            parent_external_id, author_external_id, author_name, text,
+                            created_at, is_by_channel, raw_json)
+                         VALUES (?1, ?2, ?3, ?4, 'api', 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                         ON CONFLICT(organization_id, channel_id, external_id) DO UPDATE SET
+                            text=excluded.text,
+                            raw_json=excluded.raw_json",
+                        params![
+                            self.org,
+                            post_id,
+                            channel_id,
+                            c_ext,
+                            parent_ext,
+                            author_id,
+                            author_name,
+                            inline_msg,
+                            created_ts,
+                            is_by_channel,
+                            serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+                        ],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let cm_id: i64 = db
+                        .query_row(
+                            "SELECT id FROM comments WHERE organization_id=?1 AND channel_id=?2 AND external_id=?3",
+                            params![self.org, channel_id, c_ext],
+                            |r| r.get(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+
+                    let ev = evaluator::evaluate_and_persist(db, &self.org, cm_id, None, actor)?;
+                    db.execute(
+                        "UPDATE channels SET last_synced_at=?1 WHERE organization_id=?2 AND id=?3",
+                        params![now, self.org, channel_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+
+                    Ok(json!({
+                        "ok": true,
+                        "kind": "comment",
+                        "channel_id": channel_id,
+                        "post_id": post_id,
+                        "comment_id": cm_id,
+                        "bucket": ev.get("bucket"),
+                    }))
+                });
+            }
+        }
+
+        // Fallback: if webhook only carried post delta or lacked inline body, try Graph sync if token available
+        match self.sync_channel(channel_id, 5, 25) {
+            Ok(v) => Ok(v),
+            Err(_) => Ok(json!({"ok": true, "channel_id": channel_id, "deferred_poll": true})),
+        }
+    }
 }
 
 pub fn capture_forensic_evidence(
@@ -1399,238 +1874,42 @@ pub fn capture_forensic_evidence(
     case_id_in: Option<i64>,
     actor: &str,
 ) -> Result<Value, String> {
-    let now = now_unix();
-    let comment_row = match comment_id {
-        Some(cid) => query_one_map(
-            db,
-            "SELECT cm.*, p.permalink AS post_permalink, p.external_id AS post_external_id,
-                    c.id AS channel_id, c.name AS channel_name
-             FROM comments cm
-             JOIN posts p ON p.id=cm.post_id AND p.organization_id=cm.organization_id
-             JOIN channels c ON c.id=cm.channel_id AND c.organization_id=cm.organization_id
-             WHERE cm.organization_id=? AND cm.id=?",
-            &[organization_id.to_string().into(), cid.into()],
-        ),
-        None => None,
-    };
-
-    let fallback_url = comment_row
-        .as_ref()
-        .and_then(|r| r.get("post_permalink"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let effective_url = if !target_url.trim().is_empty() {
-        target_url.trim().to_string()
-    } else {
-        fallback_url.to_string()
-    };
-    if effective_url.is_empty() {
-        return Err("Target URL or comment with permalink is required".to_string());
-    }
-
-    let mut url_hasher = Sha256::new();
-    url_hasher.update(effective_url.as_bytes());
-    let url_hash = hex::encode(url_hasher.finalize());
-
-    let actor_uid = comment_row
-        .as_ref()
-        .and_then(|r| r.get("author_external_id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| format!("uid_{}", &url_hash[..12]));
-    let actor_name = comment_row
-        .as_ref()
-        .and_then(|r| r.get("author_name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("External Subject")
-        .to_string();
-    let captured_text = comment_row
-        .as_ref()
-        .and_then(|r| r.get("text"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| format!("Forensic URL preservation: {effective_url}"));
-    let post_ext_id = comment_row
-        .as_ref()
-        .and_then(|r| r.get("post_external_id"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| format!("ext_post_{}", &url_hash[..10]));
-    let comment_ext_id = comment_row
-        .as_ref()
-        .and_then(|r| r.get("external_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let channel_id_opt = comment_row
-        .as_ref()
-        .and_then(|r| r.get("channel_id"))
-        .and_then(|v| v.as_i64());
-    let published_at = comment_row
-        .as_ref()
-        .and_then(|r| r.get("created_at"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(now);
-
-    let case_id = match case_id_in {
-        Some(cid) => cid,
-        None => {
-            let case_title = if !title.trim().is_empty() {
-                title.trim().to_string()
-            } else {
-                format!(
-                    "Forensic Case · {actor_name} ({})",
-                    Utc::now().format("%Y-%m-%d %H:%M UTC")
-                )
-            };
-            db.execute(
-                "INSERT INTO evidence_cases
-                   (organization_id, title, subject_name, subject_uid, channel_id, status, created_by, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'sealed', ?6, ?7)",
-                params![
-                    organization_id,
-                    case_title,
-                    actor_name,
-                    actor_uid,
-                    channel_id_opt,
-                    actor,
-                    now
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-            db.last_insert_rowid()
-        }
-    };
-
-    let captured_utc = Utc
-        .timestamp_opt(now, 0)
-        .single()
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())
-        .unwrap_or_default();
-
-    let layers = json!({
-        "layer_1_immutable_ids": {
-            "actor_uid": actor_uid,
-            "post_id": post_ext_id,
-            "comment_id": comment_ext_id,
-        },
-        "layer_2_thread_expansion": {
-            "filter_mode": "ALL_COMMENTS",
-            "expanded_replies": true,
-            "expanded_see_more": true,
-        },
-        "layer_3_visual_and_network_replay": {
-            "fullpage_screenshot": format!("evidence/case_{case_id}/fullpage_{now}.png"),
-            "dom_mhtml": format!("evidence/case_{case_id}/snapshot_{now}.mhtml"),
-            "playwright_trace_har": format!("evidence/case_{case_id}/network_trace_{now}.har"),
-        },
-        "layer_4_original_media": {
-            "media_dir": format!("evidence/case_{case_id}/media/"),
-        },
-        "layer_5_watchdog": {
-            "checkpoints_hours": [6, 24, 72],
-            "alive_status": "alive",
-        },
-    });
-
-    let manifest_payload = json!({
-        "case_id": case_id,
-        "target_url": effective_url,
-        "actor_uid": actor_uid,
-        "actor_name": actor_name,
-        "post_external_id": post_ext_id,
-        "comment_external_id": comment_ext_id,
-        "captured_text": captured_text,
-        "captured_at_utc": captured_utc,
-        "layers": layers,
-    });
-    let manifest_json = canonical_ascii_json(&manifest_payload);
-    let mut m_hasher = Sha256::new();
-    m_hasher.update(manifest_json.as_bytes());
-    let manifest_sha256 = hex::encode(m_hasher.finalize());
-    let bundle_path = format!(
-        "evidence/case_{case_id}/forensic_bundle_{}.zip",
-        &manifest_sha256[..12]
-    );
-    let target_kind = if comment_id.is_some() {
-        "comment"
-    } else {
-        "post"
-    };
-
-    db.execute(
-        "INSERT INTO evidence_items
-           (organization_id, case_id, comment_id, target_url, target_kind, actor_uid, actor_name,
-            post_external_id, comment_external_id, captured_text, published_at, captured_at,
-            artifacts_json, manifest_sha256, alive_status, last_checked_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'alive', ?15)",
-        params![
-            organization_id,
-            case_id,
-            comment_id,
-            effective_url,
-            target_kind,
-            actor_uid,
-            actor_name,
-            post_ext_id,
-            comment_ext_id,
-            captured_text,
-            published_at,
-            now,
-            manifest_json,
-            manifest_sha256,
-            now
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    let item_id = db.last_insert_rowid();
-
-    let preserved_snip: String = captured_text.chars().take(300).collect();
-    let summary_md = format!(
-        "### Forensic Evidence Record (Vi bằng số #{case_id})\n- **Subject:** {actor_name} (`UID: {actor_uid}`)\n- **Target URL:** `{effective_url}`\n- **Captured UTC:** `{captured_utc}`\n- **SHA-256 Seal:** `{manifest_sha256}`\n- **Preserved Content:** {preserved_snip}"
-    );
-    db.execute(
-        "UPDATE evidence_cases
-         SET status='sealed', summary_md=?1, bundle_zip_path=?2, bundle_sha256=?3
-         WHERE organization_id=?4 AND id=?5",
-        params![summary_md, bundle_path, manifest_sha256, organization_id, case_id],
-    )
-    .map_err(|e| e.to_string())?;
-    db.execute(
-        "INSERT INTO jobs (organization_id, kind, payload_json, run_after, created_at)
-         VALUES (?1, 'evidence_watchdog', ?2, ?3, ?4)",
-        params![
-            organization_id,
-            serde_json::to_string(&json!({"case_id": case_id, "item_id": item_id}))
-                .unwrap_or_default(),
-            now + 6 * 3600,
-            now
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    audit::append(
+    evidence::capture_forensic_bundle(
         db,
+        None,
         organization_id,
+        target_url,
+        title,
+        comment_id,
+        case_id_in,
         actor,
-        "evidence.captured",
-        &case_id.to_string(),
-        &json!({
-            "item_id": item_id,
-            "sha256": manifest_sha256,
-            "target_url": effective_url,
-        }),
+        None,
     )
-    .map_err(|e| e.to_string())?;
+}
 
-    Ok(json!({
-        "ok": true,
-        "case_id": case_id,
-        "item_id": item_id,
-        "manifest_sha256": manifest_sha256,
-        "bundle_zip_path": bundle_path,
-        "layers": layers,
-    }))
+pub fn capture_forensic_evidence_on_disk(
+    db: &Connection,
+    db_path: &std::path::Path,
+    organization_id: &str,
+    target_url: &str,
+    title: &str,
+    comment_id: Option<i64>,
+    case_id_in: Option<i64>,
+    actor: &str,
+    transport: Option<&SharedTransport>,
+) -> Result<Value, String> {
+    let data_dir = evidence::resolve_data_dir(db_path);
+    evidence::capture_forensic_bundle(
+        db,
+        Some(&data_dir),
+        organization_id,
+        target_url,
+        title,
+        comment_id,
+        case_id_in,
+        actor,
+        transport,
+    )
 }
 
 pub fn seed_demo_workspace(

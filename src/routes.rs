@@ -31,7 +31,7 @@ use crate::providers::ProviderError;
 use crate::store::{self, query_maps, query_one_map};
 use crate::transport::{build_url_with_params, SharedTransport};
 use crate::vault::{Vault, VaultError};
-use crate::{audit, evaluator, settings, worker};
+use crate::{audit, evaluator, evidence, fleet, settings, worker};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -940,6 +940,7 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
         audience: audience.clone(),
         vault: vault.clone(),
         env_map: env_map.clone(),
+        transport: cfg.transport.clone(),
     };
 
     let mut local_hosts: HashSet<String> = ["localhost", "127.0.0.1", "::1", "testserver"]
@@ -1057,6 +1058,14 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
             post(sync_channel_handler),
         )
         .route(
+            "/api/admin/channels/:channel_id/subscribe",
+            post(subscribe_channel_webhook_handler),
+        )
+        .route(
+            "/api/admin/channels/:channel_id/browser-sync",
+            post(browser_sync_channel_handler),
+        )
+        .route(
             "/api/admin/channels/:channel_id/policy",
             post(update_channel_policy_handler),
         )
@@ -1103,8 +1112,32 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
             post(capture_evidence_handler),
         )
         .route(
+            "/api/admin/evidence/:case_id/export",
+            get(export_evidence_case_handler),
+        )
+        .route(
+            "/api/admin/evidence/:case_id/verify",
+            get(verify_evidence_case_handler),
+        )
+        .route(
+            "/api/admin/evidence/:case_id/check",
+            post(check_evidence_case_handler),
+        )
+        .route(
             "/api/admin/fleet",
             get(list_fleet_handler).post(save_fleet_runtime_handler),
+        )
+        .route(
+            "/api/admin/fleet/:runtime_id/probe",
+            post(probe_fleet_runtime_handler),
+        )
+        .route(
+            "/api/admin/fleet/:runtime_id/resume",
+            post(resume_fleet_runtime_handler),
+        )
+        .route(
+            "/api/admin/playbooks",
+            get(list_playbooks_handler).post(save_playbook_handler),
         )
         .route(
             "/api/admin/rules",
@@ -1889,6 +1922,8 @@ async fn overview_handler(
             "healthy": healthy,
             "runtimes": fleet_rows,
         },
+        "worker_summary": store::jobs_summary(&db, &st.org),
+        "playbooks": fleet::playbooks_list(&db, &st.org, shop_id, None),
         "agent_hub": st.hub_summary(false),
         "bridge": st.bridge_summary(),
         "mcp_gateway": st.gateway_summary(),
@@ -2147,6 +2182,56 @@ async fn sync_channel_handler(
     let session_hash = st.require_admin(&method, &headers)?;
     st.check_rate(&format!("sync:{session_hash}"), 15, 60)?;
     Ok(Json(st.conns.sync_channel(channel_id, 25, 50)?))
+}
+
+async fn subscribe_channel_webhook_handler(
+    State(st): State<Arc<AppState>>,
+    Path(channel_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    let session_hash = st.require_admin(&method, &headers)?;
+    st.check_rate(&format!("subscribe:{session_hash}"), 15, 60)?;
+    let body = parse_json_body(&raw_body)?;
+    let fields = body
+        .get("fields")
+        .and_then(|v| v.as_str())
+        .unwrap_or("feed,messages,mention");
+    Ok(Json(st.conns.subscribe_channel_webhooks(channel_id, fields)?))
+}
+
+async fn browser_sync_channel_handler(
+    State(st): State<Arc<AppState>>,
+    Path(channel_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    let session_hash = st.require_admin(&method, &headers)?;
+    st.check_rate(&format!("browser_sync:{session_hash}"), 15, 60)?;
+    let body = parse_json_body(&raw_body)?;
+    let runtime_id = body
+        .get("runtime_id")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    let inline_posts = body.get("posts").and_then(|v| v.as_array()).map(|a| a.as_slice());
+    let reschedule = body
+        .get("reschedule")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let res = fleet::run_browser_channel_fetch(
+        &st.path,
+        &st.org,
+        channel_id,
+        runtime_id,
+        inline_posts,
+        reschedule,
+        Some(st.conns.providers.transport()),
+        &st.env_map,
+        "owner",
+    )
+    .map_err(|e| AppError::new(StatusCode::CONFLICT, e))?;
+    Ok(Json(res))
 }
 
 async fn update_channel_policy_handler(
@@ -2592,7 +2677,15 @@ async fn request_post_archive_handler(
         )?;
         Ok(vec![j1, j2])
     })?;
-    let worker_res = worker::run_pending_jobs(&st.path, &st.org, 5, "care-worker");
+    let worker_res = worker::run_pending_jobs_with_runtime(
+        &st.path,
+        &st.org,
+        5,
+        "care-worker",
+        Some(&st.conns),
+        Some(st.conns.providers.transport()),
+        &st.env_map,
+    );
     Ok(Json(json!({
         "ok": true,
         "post_id": post_id,
@@ -2957,17 +3050,81 @@ async fn capture_evidence_handler(
         .get("case_id")
         .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
     let res = store::with_write_tx_str(&st.path, |db| {
-        conn_mod::capture_forensic_evidence(
+        conn_mod::capture_forensic_evidence_on_disk(
             db,
+            &st.path,
             &st.org,
             target_url,
             title,
             comment_id,
             case_id,
             "owner",
+            Some(st.conns.providers.transport()),
         )
     })
     .map_err(|e| AppError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(Json(res))
+}
+
+async fn export_evidence_case_handler(
+    State(st): State<Arc<AppState>>,
+    Path(case_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    st.require_admin(&method, &headers)?;
+    let db = store::connect_readonly(&st.path)?;
+    let data_dir = evidence::resolve_data_dir(&st.path);
+    let (filename, zip_bytes) = evidence::export_case_zip(&db, &data_dir, &st.org, case_id)
+        .map_err(|e| AppError::new(StatusCode::NOT_FOUND, e))?;
+    let mut resp = (StatusCode::OK, zip_bytes).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    if let Ok(cd) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, cd);
+    }
+    Ok(resp)
+}
+
+async fn verify_evidence_case_handler(
+    State(st): State<Arc<AppState>>,
+    Path(case_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let db = store::connect_readonly(&st.path)?;
+    let data_dir = evidence::resolve_data_dir(&st.path);
+    let res = evidence::verify_case_custody(&db, &data_dir, &st.org, case_id)
+        .map_err(|e| AppError::new(StatusCode::NOT_FOUND, e))?;
+    Ok(Json(res))
+}
+
+async fn check_evidence_case_handler(
+    State(st): State<Arc<AppState>>,
+    Path(case_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let body = parse_json_body(&raw_body)?;
+    let item_id = body
+        .get("item_id")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    let res = store::with_write_tx_str(&st.path, |db| {
+        evidence::run_watchdog_check(
+            db,
+            &st.org,
+            Some(case_id),
+            item_id,
+            Some(st.conns.providers.transport()),
+            "owner",
+        )
+    })
+    .map_err(|e| AppError::new(StatusCode::NOT_FOUND, e))?;
     Ok(Json(res))
 }
 
@@ -3125,6 +3282,126 @@ async fn save_fleet_runtime_handler(
     })))
 }
 
+async fn probe_fleet_runtime_handler(
+    State(st): State<Arc<AppState>>,
+    Path(runtime_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let res = fleet::probe_runtime(
+        &st.path,
+        &st.org,
+        runtime_id,
+        Some(st.conns.providers.transport()),
+        &st.env_map,
+        "owner",
+    )
+    .map_err(|e| AppError::new(StatusCode::CONFLICT, e))?;
+    Ok(Json(res))
+}
+
+async fn resume_fleet_runtime_handler(
+    State(st): State<Arc<AppState>>,
+    Path(runtime_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let res = fleet::resume_runtime(&st.path, &st.org, runtime_id, "owner")
+        .map_err(|e| AppError::new(StatusCode::NOT_FOUND, e))?;
+    Ok(Json(res))
+}
+
+async fn list_playbooks_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let q = query_map(&uri);
+    let shop_id = q.get("shop_id").and_then(|s| s.trim().parse::<i64>().ok());
+    let channel_id = q
+        .get("channel_id")
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let db = store::connect_readonly(&st.path)?;
+    Ok(Json(json!({
+        "playbooks": fleet::playbooks_list(&db, &st.org, shop_id, channel_id)
+    })))
+}
+
+async fn save_playbook_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let body = parse_json_body(&raw_body)?;
+    let playbook_id = body
+        .get("id")
+        .or_else(|| body.get("playbook_id"))
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    let shop_id = body
+        .get("shop_id")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .filter(|&x| x > 0);
+    let channel_id = body
+        .get("channel_id")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .filter(|&x| x > 0);
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let threshold = body
+        .get("auto_suggest_threshold")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(80);
+    let auto_consult = match body.get("auto_consult_enabled") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "on"),
+        Some(Value::Number(n)) => n.as_i64().map(|x| x != 0).unwrap_or(false),
+        _ => false,
+    };
+    let knowledge_md = body
+        .get("consultation_knowledge_md")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let forbidden: Vec<String> = match body.get("forbidden_topics") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let res = store::with_write_tx_str(&st.path, |db| {
+        fleet::upsert_playbook(
+            db,
+            &st.org,
+            playbook_id,
+            shop_id,
+            channel_id,
+            name,
+            threshold,
+            auto_consult,
+            knowledge_md,
+            &forbidden,
+            "owner",
+        )
+    })
+    .map_err(|e| AppError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(Json(res))
+}
+
 async fn list_rules_handler(
     State(st): State<Arc<AppState>>,
     method: Method,
@@ -3224,11 +3501,14 @@ async fn trigger_worker_jobs_handler(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     st.require_admin(&method, &headers)?;
-    Ok(Json(worker::run_pending_jobs(
+    Ok(Json(worker::run_pending_jobs_with_runtime(
         &st.path,
         &st.org,
         15,
         "care-worker",
+        Some(&st.conns),
+        Some(st.conns.providers.transport()),
+        &st.env_map,
     )))
 }
 

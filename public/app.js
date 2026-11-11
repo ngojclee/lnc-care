@@ -88,6 +88,7 @@ const state = {
   postDetail: null,
   evidenceCases: [],
   fleet: { runtimes: [], leases: [] },
+  playbooks: [],
   discovered: {},
   selectedAppProvider: 'meta',
   rules: [],
@@ -1105,14 +1106,17 @@ function renderPostsPage() {
       <div>
         <div class="field-label">Archived media & screenshots (${(p.archives || []).length})</div>
         ${(p.archives || []).length
-          ? `<div class="stack-sm">${p.archives.map(a => `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap"><span><code>${esc(a.kind)}</code> · <span class="cell-sub">${esc(a.path)}</span></span>${copyChip(a.sha256 || '')}</div>`).join('')}</div>`
+          ? `<div class="stack-sm">${p.archives.map(a => `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap"><span><code>${esc(a.kind)}</code> · <span class="cell-sub">${esc(a.path)} (${num(a.bytes || 0)} B)</span></span>${copyChip(a.sha256 || '')}</div>`).join('')}</div>`
           : '<div class="cell-sub">Click Archive to enqueue worker media and screenshot preservation.</div>'}
       </div>
     </div>`;
   }
 
+  const ws = state.overview?.worker_summary || {};
+  const workerSub = `Worker queue: ${num(ws.pending || 0)} pending · ${num(ws.completed || 0)} completed · ${num(ws.failed || 0)} failed`;
+
   host.innerHTML = `<div class="grid-wide">
-    ${card('Ingested posts & reels', table(['Channel', 'Kind', 'Caption', '#Reactions', '#Comments', '#Archives', 'Actions'], rows, 'No posts ingested yet.'), { flush: true })}
+    ${card('Ingested posts & reels', table(['Channel', 'Kind', 'Caption', '#Reactions', '#Comments', '#Archives', 'Actions'], rows, 'No posts ingested yet.'), { sub: workerSub, flush: true })}
     ${card('Snapshot & archive inspector', detailHtml)}
   </div>`;
 
@@ -1179,14 +1183,20 @@ function renderEvidencePage() {
 
   const rows = state.evidenceCases.map(c => {
     const item = (c.items || [])[0] || {};
+    const st = item.alive_status || 'alive';
+    const stTone = st === 'deleted' ? 'b-err' : (st === 'edited' ? 'b-warn' : 'b-ok');
     return `<tr>
       <td class="mono">#${c.id}</td>
       <td><div class="cell-main">${esc(c.title)}</div><div class="cell-sub">${esc(item.captured_text || '')}</div></td>
       <td><div class="cell-main">${esc(c.subject_name || 'Unknown')}</div><div class="cell-sub mono">UID: ${esc(c.subject_uid || '-')}</div></td>
       <td style="overflow-wrap:anywhere"><a href="${esc(item.target_url || '#')}" target="_blank" rel="noopener noreferrer">${esc(item.target_url || '-')} &#8599;</a></td>
       <td>${copyChip(c.bundle_sha256 || '')}</td>
-      <td>${badge(`${item.alive_status || 'alive'} (+6h/+24h/+72h)`, item.alive_status === 'deleted' ? 'b-err' : 'b-ok')}</td>
-      <td class="mono">${esc(c.bundle_zip_path || '-')}</td>
+      <td>${badge(`${st} (+6h/+24h/+72h)`, stTone)}</td>
+      <td><div class="row-actions">
+        <a class="btn btn-sm" href="/api/admin/evidence/${c.id}/export" download>Download .zip</a>
+        <button type="button" class="btn btn-sm" data-verify-evidence="${c.id}">Verify SHA-256</button>
+        <button type="button" class="btn btn-sm" data-check-evidence="${c.id}">Check alive</button>
+      </div></td>
     </tr>`;
   });
 
@@ -1194,9 +1204,24 @@ function renderEvidencePage() {
       ${card('Capture forensic evidence', formHtml, { sub: 'Preserve defamatory or abusive content before the author edits or deletes it.' })}
       ${card('Five-layer preservation standard', stdHtml, { sub: 'Append-only WORM storage suitable for platform abuse reports and legal intake.' })}
     </div>
-    ${card('Sealed evidence cases', table(['Case', 'Title & excerpt', 'Subject', 'Target URL', 'SHA-256 manifest', 'Watchdog', 'Bundle path'], rows, 'No forensic evidence cases sealed yet.'), { flush: true })}`;
+    ${card('Sealed evidence cases', table(['Case', 'Title & excerpt', 'Subject', 'Target URL', 'SHA-256 seal', 'Watchdog', 'Actions'], rows, 'No forensic evidence cases sealed yet.'), { flush: true })}`;
 
   wireCopyButtons(host);
+  host.querySelectorAll('[data-verify-evidence]').forEach(btn => {
+    btn.onclick = () => busy(btn, async () => {
+      const cid = Number(btn.dataset.verifyEvidence);
+      const r = await api(`/api/admin/evidence/${cid}/verify`);
+      toast(r.valid ? `Case #${cid} custody verified (SHA-256 intact)` : `Case #${cid} custody mismatch!`, r.valid ? 'ok' : 'err');
+    });
+  });
+  host.querySelectorAll('[data-check-evidence]').forEach(btn => {
+    btn.onclick = () => busy(btn, async () => {
+      const cid = Number(btn.dataset.checkEvidence);
+      const r = await api(`/api/admin/evidence/${cid}/check`, { method: 'POST', body: {} });
+      toast(`Watchdog checked case #${cid}: ${r.alive_status}`, r.alive_status === 'deleted' ? 'err' : 'ok');
+      await loadEvidence();
+    });
+  });
   $('#evidence-form')?.addEventListener('submit', ev => {
     ev.preventDefault();
     const fd = new FormData(ev.currentTarget);
@@ -1223,7 +1248,13 @@ function renderEvidencePage() {
 async function loadFleet() {
   const host = $('#body-fleet');
   try {
-    state.fleet = await api('/api/admin/fleet');
+    const q = state.shopId ? `?shop_id=${encodeURIComponent(state.shopId)}` : '';
+    const [fleetData, pbData] = await Promise.all([
+      api('/api/admin/fleet'),
+      api(`/api/admin/playbooks${q}`).catch(() => ({ playbooks: [] }))
+    ]);
+    state.fleet = fleetData;
+    state.playbooks = pbData.playbooks || [];
     renderFleetPage();
   } catch (err) {
     host.innerHTML = paintTableError(1, err);
@@ -1248,7 +1279,7 @@ function renderFleetPage() {
       </label>
       <label class="field"><span class="field-label">Runtime adapter</span>
         <select name="adapter">
-          <option value="veilbrowser">VeilBrowser (isolated Chromium)</option>
+          <option value="veilbrowser">VeilBrowser (Camoufox + Xray TUN)</option>
           <option value="meta_api">Official Meta Graph API</option>
           <option value="orbine_mobile">Orbine ARM64 mobile container</option>
           <option value="scrapling_public">Scrapling public fetch</option>
@@ -1262,28 +1293,68 @@ function renderFleetPage() {
 
   const guardHtml = `<dl class="kv">
     <dt>Personal main safety</dt><dd><code>personal_main</code> enforces <code>daily_write_budget = 0</code> in schema and backend.</dd>
-    <dt>Sticky exit IP check</dt><dd>Worker verifies proxy exit IP & ASN before opening any social URL.</dd>
-    <dt>Single-worker lease</dt><dd>SQLite <code>runtime_leases</code> prevents concurrent multi-tab collisions.</dd>
-    <dt>Circuit breaker</dt><dd>Any login wall or CAPTCHA halts automation and alerts the operator.</dd>
+    <dt>Sticky exit IP check</dt><dd>Pre-flight gate verifies residential exit IP &amp; ASN before opening any social URL.</dd>
+    <dt>Single-worker lease</dt><dd>SQLite <code>runtime_leases</code> enforces concurrency ceiling (<code>MAX_CONCURRENT_BROWSER_SESSIONS</code>).</dd>
+    <dt>Circuit breaker</dt><dd>Any login wall, CAPTCHA or IP mismatch halts runtime and sends Cygnus Telegram alert.</dd>
   </dl>`;
 
-  const rows = (state.fleet.runtimes || []).map(r => `<tr>
-    <td class="mono">#${r.id}</td>
-    <td class="cell-main">${esc(r.label)}</td>
-    <td>${esc(r.platform)}</td>
-    <td>${badge(r.account_role, r.account_role === 'personal_main' ? 'b-warn' : 'b-dim')}</td>
-    <td class="mono">${esc(r.adapter)}</td>
-    <td class="mono">${esc(r.runtime_profile_id)}</td>
-    <td class="mono">${esc(r.expected_exit_ip || 'Direct')} (${esc(r.expected_country)})</td>
-    <td>${badge(r.health_status, r.health_status === 'healthy' ? 'b-ok' : 'b-err')}</td>
-    <td class="num mono">${r.reads_today}/${r.daily_read_budget} R · ${r.writes_today}/${r.daily_write_budget} W</td>
+  const rows = (state.fleet.runtimes || []).map(r => {
+    const hCls = r.health_status === 'healthy' ? 'b-ok' : (r.health_status === 'leased' ? 'b-acc' : 'b-err');
+    return `<tr>
+      <td class="mono">#${r.id}</td>
+      <td><div class="cell-main">${esc(r.label)}</div>${r.last_checkpoint_reason ? `<div class="cell-sub" style="color:var(--danger)">${esc(r.last_checkpoint_reason)}</div>` : ''}</td>
+      <td>${esc(r.platform)}</td>
+      <td>${badge(r.account_role, r.account_role === 'personal_main' ? 'b-warn' : 'b-dim')}</td>
+      <td class="mono">${esc(r.adapter)}</td>
+      <td class="mono">${esc(r.runtime_profile_id)}</td>
+      <td class="mono">${esc(r.expected_exit_ip || 'Direct')} (${esc(r.expected_country)})</td>
+      <td>${badge(r.health_status, hCls)}</td>
+      <td class="num mono">${r.reads_today}/${r.daily_read_budget} R · ${r.writes_today}/${r.daily_write_budget} W</td>
+      <td><div class="row-actions">
+        <button type="button" class="btn btn-sm" data-probe-runtime="${r.id}">Probe IP</button>
+        ${r.health_status !== 'healthy' ? `<button type="button" class="btn btn-sm btn-primary" data-resume-runtime="${r.id}">Resume</button>` : ''}
+      </div></td>
+    </tr>`;
+  });
+
+  const leaseRows = (state.fleet.leases || []).slice(0, 10).map(l => `<tr>
+    <td class="mono">#${l.id}</td>
+    <td class="mono">Runtime #${l.runtime_id}</td>
+    <td>${esc(l.worker_id)}</td>
+    <td class="mono">${esc(l.observed_exit_ip || '-')}</td>
+    <td>${badge(l.status, l.status === 'aborted_anomaly' ? 'b-err' : (l.status === 'active' ? 'b-acc' : 'b-ok'))}</td>
+    <td class="cell-sub">${when(l.acquired_at)}</td>
   </tr>`);
+
+  const pbRows = (state.playbooks || []).map(pb => `<tr>
+    <td class="cell-main">${esc(pb.name)}</td>
+    <td class="num mono">${pb.auto_suggest_threshold}/100</td>
+    <td>${pb.auto_consult_enabled ? badge('Enabled', 'b-ok') : badge('Draft assist', 'b-dim')}</td>
+    <td class="cell-sub">${esc((pb.consultation_knowledge_md || '').slice(0, 120))}</td>
+  </tr>`);
+
+  const pbHtml = `${table(['Playbook', '#Threshold', 'Mode', 'Brand knowledge excerpt'], pbRows, 'No consultation playbooks saved yet.')}
+    <hr class="section-sep">
+    <form id="playbook-form">
+      <div class="field-grid">
+        <label class="field"><span class="field-label">Playbook name</span><input type="text" name="name" placeholder="LuxeClaw EU Press-On Sizing Playbook" required></label>
+        <label class="field"><span class="field-label">Consult score threshold (10-99)</span><input type="number" name="auto_suggest_threshold" min="10" max="99" value="80" required></label>
+      </div>
+      <label class="field"><span class="field-label">Brand &amp; sizing guidance (injected into AI private consultation draft)</span>
+        <textarea name="consultation_knowledge_md" rows="2" placeholder="Free EU sizing kit on 2+ sets; 48h Colissimo tracked shipping from Paris." required></textarea>
+      </label>
+      <button type="submit" class="btn btn-sm btn-primary">Save consultation playbook</button>
+    </form>`;
 
   host.innerHTML = `<div class="grid-2">
       ${card('Register account runtime', formHtml, { sub: 'Bind isolated profiles across Official API, VeilBrowser and Orbine.' })}
       ${card('Antidetect & safety guardrails', guardHtml, { sub: 'Zero CAPTCHA bypass — human operator completes any challenge.' })}
     </div>
-    ${card('Active runtime pool', table(['ID', 'Label', 'Platform', 'Role', 'Adapter', 'Profile ID', 'Exit IP', 'Health', '#Daily budget'], rows, 'No account runtimes registered yet.'), { flush: true })}`;
+    ${card('Active runtime pool', table(['ID', 'Label', 'Platform', 'Role', 'Adapter', 'Profile ID', 'Exit IP', 'Health', '#Daily budget', 'Actions'], rows, 'No account runtimes registered yet.'), { flush: true })}
+    <div class="grid-2">
+      ${card('Recent runtime concurrency leases', table(['Lease', 'Runtime', 'Holder', 'Verified IP', 'Status', 'Acquired'], leaseRows, 'No runtime leases recorded yet.'), { flush: true })}
+      ${card('Consultation playbooks', pbHtml, { sub: 'Scoped brand guidelines applied during rubric consultation drafting.' })}
+    </div>`;
 
   enhanceAllSelects(host);
   $('#fleet-form')?.addEventListener('submit', ev => {
@@ -1304,6 +1375,48 @@ function renderFleetPage() {
       toast('Runtime profile saved', 'ok');
       await loadFleet();
       await refreshOverview();
+    });
+  });
+
+  host.querySelectorAll('[data-probe-runtime]').forEach(btn => {
+    btn.onclick = () => busy(btn, async () => {
+      const rid = Number(btn.dataset.probeRuntime);
+      const r = await api(`/api/admin/fleet/${rid}/probe`, { method: 'POST' });
+      if (r.tripped) {
+        toast(`Circuit breaker tripped on #${rid}: ${r.reason}`, 'err');
+      } else {
+        toast(`Runtime #${rid} healthy (exit IP: ${r.exit_ip || 'verified'})`, 'ok');
+      }
+      await loadFleet();
+      await refreshOverview();
+    });
+  });
+
+  host.querySelectorAll('[data-resume-runtime]').forEach(btn => {
+    btn.onclick = () => busy(btn, async () => {
+      const rid = Number(btn.dataset.resumeRuntime);
+      await api(`/api/admin/fleet/${rid}/resume`, { method: 'POST' });
+      toast(`Runtime #${rid} resumed to healthy`, 'ok');
+      await loadFleet();
+      await refreshOverview();
+    });
+  });
+
+  $('#playbook-form')?.addEventListener('submit', ev => {
+    ev.preventDefault();
+    const fd = new FormData(ev.currentTarget);
+    busy(ev.currentTarget.querySelector('button'), async () => {
+      await api('/api/admin/playbooks', {
+        method: 'POST',
+        body: {
+          shop_id: state.shopId,
+          name: fd.get('name'),
+          auto_suggest_threshold: Number(fd.get('auto_suggest_threshold')),
+          consultation_knowledge_md: fd.get('consultation_knowledge_md')
+        }
+      });
+      toast('Consultation playbook saved', 'ok');
+      await loadFleet();
     });
   });
 }
@@ -1387,7 +1500,7 @@ function renderChannelsPage() {
     <td>${esc(ch.kind || 'page')}</td>
     <td class="mono">${esc(ch.adapter || 'meta_api')}</td>
     <td><code>${esc(ch.reply_policy || 'draft_only')}</code> · <span class="cell-sub">${ch.auto_suggest_threshold || 80}/100</span></td>
-    <td>${ch.approved ? badge('Approved', 'b-ok') : badge('Pending approval', 'b-warn')}</td>
+    <td>${ch.approved ? badge('Approved', 'b-ok') : badge('Pending approval', 'b-warn')} ${ch.approved && ch.adapter === 'meta_api' ? (ch.webhook_subscribed ? badge('Webhook active', 'b-acc') : badge('Polling', 'b-dim')) : ''}</td>
     <td><div class="row-actions">
       ${ch.connection_id && o.shops.length && !ch.approved
         ? `<select data-shop-for="${esc(ch.external_id)}" aria-label="Target shop">${shopOpts}</select>
@@ -1395,6 +1508,8 @@ function renderChannelsPage() {
         : ''}
       ${ch.id && ch.approved ? `<button type="button" class="btn btn-sm" data-policy-channel="${ch.id}" data-policy="${esc(ch.reply_policy || 'draft_only')}" data-threshold="${ch.auto_suggest_threshold || 80}" data-name="${esc(ch.name)}">Policy</button>` : ''}
       ${ch.id && ch.adapter === 'meta_api' && ch.approved ? `<button type="button" class="btn btn-sm" data-sync-channel="${ch.id}">Sync now</button>` : ''}
+      ${ch.id && ch.adapter === 'meta_api' && ch.provider === 'meta' && ch.approved ? `<button type="button" class="btn btn-sm" data-sub-webhook="${ch.id}">${ch.webhook_subscribed ? 'Re-subscribe' : 'Subscribe webhook'}</button>` : ''}
+      ${ch.id && (ch.adapter === 'veilbrowser' || ch.adapter === 'orbine_mobile') && ch.approved ? `<button type="button" class="btn btn-sm" data-browser-sync="${ch.id}">Browser sync</button>` : ''}
     </div></td>
   </tr>`);
 
@@ -1505,6 +1620,27 @@ function renderChannelsPage() {
       const r = await api(`/api/admin/channels/${Number(btn.dataset.syncChannel)}/sync`, { method: 'POST' });
       toast(`Synced ${r.posts} posts & ${r.comments} comments`, 'ok');
       await refreshOverview();
+      renderChannelsPage();
+    });
+  });
+
+  host.querySelectorAll('[data-sub-webhook]').forEach(btn => {
+    btn.onclick = () => busy(btn, async () => {
+      const cid = Number(btn.dataset.subWebhook);
+      const r = await api(`/api/admin/channels/${cid}/subscribe`, { method: 'POST', body: { fields: 'feed,messages,mention' } });
+      toast(`Realtime Meta webhook active (${r.webhook_fields})`, 'ok');
+      await refreshOverview();
+      renderChannelsPage();
+    });
+  });
+
+  host.querySelectorAll('[data-browser-sync]').forEach(btn => {
+    btn.onclick = () => busy(btn, async () => {
+      const cid = Number(btn.dataset.browserSync);
+      const r = await api(`/api/admin/channels/${cid}/browser-sync`, { method: 'POST', body: {} });
+      toast(`Browser sync complete (${r.adapter}): ${r.posts} posts, ${r.comments} comments`, 'ok');
+      await refreshOverview();
+      renderChannelsPage();
     });
   });
 
@@ -1516,8 +1652,8 @@ function renderChannelsPage() {
           <label class="field"><span class="field-label">Reply policy</span>
             <select name="reply_policy">
               <option value="draft_only"${btn.dataset.policy === 'draft_only' ? ' selected' : ''}>Draft only (human approval required)</option>
-              <option value="guarded_reply"${btn.dataset.policy === 'guarded_reply' ? ' selected' : ''}>Guarded reply (idempotent + audited)</option>
-              <option value="rule_auto_reply"${btn.dataset.policy === 'rule_auto_reply' ? ' selected' : ''}>Rule auto-reply (explicit owner rule)</option>
+              <option value="operator_direct"${btn.dataset.policy === 'operator_direct' ? ' selected' : ''}>Operator direct (idempotent + audited)</option>
+              <option value="agent_direct"${btn.dataset.policy === 'agent_direct' ? ' selected' : ''}>Agent direct (explicit owner policy)</option>
             </select>
           </label>
           <label class="field"><span class="field-label">Auto-suggest score threshold (10-99)</span>

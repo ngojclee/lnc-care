@@ -708,4 +708,56 @@ impl Providers {
             _ => Ok(Vec::new()),
         }
     }
+
+    pub fn transport(&self) -> &SharedTransport {
+        &self.transport
+    }
+
+    pub fn subscribe_page_webhooks(
+        &self,
+        page_id: &str,
+        page_token: &str,
+        fields: &str,
+    ) -> Result<Value, ProviderError> {
+        let eff_fields = if fields.trim().is_empty() {
+            "feed,messages"
+        } else {
+            fields.trim()
+        };
+        let url = build_url_with_params(
+            &format!("https://graph.facebook.com/{META_VERSION}/{page_id}/subscribed_apps"),
+            &[("subscribed_fields", eff_fields.to_string())],
+        );
+        let res = self
+            .transport
+            .execute(TransportRequest {
+                method: "POST".to_string(),
+                url,
+                headers: vec![
+                    ("Authorization".to_string(), format!("Bearer {page_token}")),
+                    ("Accept".to_string(), "application/json".to_string()),
+                ],
+                body: Some(Vec::new()),
+                timeout_ms: 15_000,
+            })
+            .map_err(|_| ProviderError::new("provider_webhook_subscribe_failed", 502))?;
+        if res.status != 200 {
+            return Err(ProviderError::new("provider_webhook_subscribe_failed", 502));
+        }
+        let body = res
+            .json()
+            .map_err(|_| ProviderError::new("provider_webhook_subscribe_failed", 502))?;
+        let success = body
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !success {
+            return Err(ProviderError::new("provider_webhook_subscribe_rejected", 502));
+        }
+        Ok(json!({
+            "ok": true,
+            "page_id": page_id,
+            "subscribed_fields": eff_fields,
+        }))
+    }
 }
