@@ -1601,13 +1601,14 @@ function renderConnectorPage() {
   const gwHtml = `<dl class="kv">
     <dt>Gateway URL</dt><dd>${gw.gateway_url ? copyChip(gw.gateway_url) : badge('Not configured', 'b-dim')}</dd>
     <dt>Service API key</dt><dd>${gw.has_api_key ? badge('Configured (svc:lnc-care)', 'b-ok') : badge('Missing', 'b-warn')}</dd>
+    <dt>MCP session</dt><dd>${gw.has_session ? badge('Active (Mcp-Session-Id cached)', 'b-ok') : badge('Auto handshake on first call', 'b-dim')}</dd>
     <dt>Allowed peer prefixes</dt><dd><code>${esc((gw.allowed_prefixes || ['ads__']).join(', '))}</code></dd>
     <dt>Topology</dt><dd class="cell-sub">${esc(gw.route || 'lnc-care -> LNC-Agent-Hub (/mcp) -> Business MCP Hub (:8790/mcp) -> lnc-ads (/mcp)')}</dd>
   </dl>`;
 
   const prompts = [
     ['Triage LuxeClaw inbox', 'List pending comments in shop LuxeClaw with care__comments_list, evaluate top consult leads and prepare reply drafts.'],
-    ['Cross-reference ad post', 'Inspect comment thread #1 in LNC Care and call care__ads_gateway_call with ads__page_posts_list for LuxeClaw to check active ad context.'],
+    ['Cross-reference ad post', 'Inspect comment thread #1 in LNC Care and call care__ads_context_lookup with ads__page_posts_list for LuxeClaw to check active ad context.'],
     ['Seal defamation bundle', 'Capture a 5-layer forensic evidence bundle with care__evidence_capture for the abusive comment and verify its SHA-256 manifest.']
   ].map(([title, prompt]) => `<tr>
     <td class="cell-main">${esc(title)}</td>

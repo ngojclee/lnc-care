@@ -65,7 +65,7 @@ def test_static_blueprint_assets_icons_and_english_only_ui(tmp_path):
         assert (ROOT / "docs" / doc_asset).exists()
 
     info = client.get("/api/app-info").json()
-    assert info["version"] == VERSION == "0.3.0.1"
+    assert info["version"] == VERSION == "0.3.0.2"
 
     # Static blueprint & English-only checks on HTML / CSS / JS
     index_html = (ROOT / "app" / "public" / "index.html").read_text(encoding="utf-8")

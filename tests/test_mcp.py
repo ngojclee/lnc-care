@@ -265,11 +265,43 @@ def test_mcp_hub_wire_headers_v3_v4_no_trailing_slash_and_omnichannel_tools(tmp_
 
     monkeypatch.setenv("PROVIDER_WRITES_ENABLED", "true")
 
+    gw_state = {"session_id": None, "initialized": False}
+
     def fake_gw_handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "http://10.21.4.101:8380/mcp"
         assert request.headers.get("authorization") == "Bearer lnc_k_care_svc_key"
         rpc = json.loads(request.content.decode())
-        assert rpc["method"] == "tools/call"
+        method = rpc.get("method")
+        if method == "initialize":
+            gw_state["session_id"] = "sess_hub_fastmcp_01"
+            gw_state["initialized"] = False
+            return httpx.Response(
+                200,
+                headers={"mcp-session-id": gw_state["session_id"]},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": rpc["id"],
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"tools": {"listChanged": True}},
+                        "serverInfo": {"name": "Business MCP Hub", "version": "1.28.1"},
+                    },
+                },
+            )
+        if method == "notifications/initialized":
+            if request.headers.get("mcp-session-id") != gw_state["session_id"]:
+                return httpx.Response(400, text="Bad Request: Missing session ID")
+            gw_state["initialized"] = True
+            return httpx.Response(202)
+
+        if not gw_state["session_id"] or not request.headers.get("mcp-session-id"):
+            return httpx.Response(400, text="Bad Request: Missing session ID")
+        if request.headers.get("mcp-session-id") != gw_state["session_id"] or not gw_state["initialized"]:
+            return httpx.Response(
+                404,
+                json={"jsonrpc": "2.0", "id": "server-error", "error": {"code": -32600, "message": "Session not found"}},
+            )
+        assert method == "tools/call"
         assert rpc["params"]["name"] == "ads__page_posts_list"
         return httpx.Response(
             200,
@@ -434,4 +466,156 @@ def test_mcp_hub_wire_headers_v3_v4_no_trailing_slash_and_omnichannel_tools(tmp_
         assert ads_payload["ok"] is True
         assert ads_payload["data"]["shop"] == "LuxeClaw"
         assert ads_payload["data"]["posts"][0]["ad_id"] == "ad_77"
+
+
+def test_mcp_gateway_session_cache_and_reinit_on_400_and_404():
+    import httpx
+    import pytest
+    from app.mcp_gateway import McpGatewayClient, McpGatewayConfig, McpGatewayError
+
+    state = {
+        "init_calls": 0,
+        "notify_calls": 0,
+        "active_session": None,
+        "force_next_400": False,
+        "always_404": False,
+    }
+
+    def stateful_fastmcp_handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("authorization") == "Bearer lnc_k_care_svc_key"
+        rpc = json.loads(request.content.decode())
+        method = rpc.get("method")
+
+        if method == "initialize":
+            state["init_calls"] += 1
+            sid = f"mcp_sess_{state['init_calls']}"
+            state["active_session"] = sid
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": sid},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": rpc["id"],
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"tools": {"listChanged": True}},
+                        "serverInfo": {"name": "Business MCP Hub", "version": "1.28.1"},
+                    },
+                },
+            )
+
+        if method == "notifications/initialized":
+            assert "id" not in rpc
+            if request.headers.get("mcp-session-id") != state["active_session"]:
+                return httpx.Response(400, text="Bad Request: Missing session ID")
+            state["notify_calls"] += 1
+            return httpx.Response(202)
+
+        if state["always_404"]:
+            return httpx.Response(
+                404,
+                json={"jsonrpc": "2.0", "id": "server-error", "error": {"code": -32600, "message": "Session not found"}},
+            )
+
+        if state["force_next_400"]:
+            state["force_next_400"] = False
+            return httpx.Response(400, text="Bad Request: Missing session ID")
+
+        req_sid = request.headers.get("mcp-session-id")
+        if not req_sid:
+            return httpx.Response(400, text="Bad Request: Missing session ID")
+        if req_sid != state["active_session"]:
+            return httpx.Response(
+                404,
+                json={"jsonrpc": "2.0", "id": "server-error", "error": {"code": -32600, "message": "Session not found"}},
+            )
+
+        if method == "tools/list":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": rpc["id"],
+                    "result": {
+                        "tools": [
+                            {"name": "ads__shops_list"},
+                            {"name": "ads__page_posts_list"},
+                            {"name": "care__channels_list"},
+                        ]
+                    },
+                },
+            )
+
+        assert method == "tools/call"
+        sse_body = (
+            "event: message\n"
+            + "data: "
+            + json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": rpc["id"],
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps({"shops": [{"name": "LuxeClaw"}], "session_seen": req_sid}),
+                            }
+                        ]
+                    },
+                }
+            )
+            + "\n\n"
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse_body,
+        )
+
+    gw = McpGatewayClient(
+        McpGatewayConfig(gateway_url="http://10.21.4.101:8380/mcp", api_key="lnc_k_care_svc_key"),
+        transport=httpx.MockTransport(stateful_fastmcp_handler),
+    )
+
+    assert gw.status_summary()["has_session"] is False
+
+    # 1. First call initializes + sends notifications/initialized + caches Mcp-Session-Id
+    r1 = gw.call_tool("ads__shops_list", {})
+    assert r1["ok"] is True
+    assert r1["data"]["session_seen"] == "mcp_sess_1"
+    assert state["init_calls"] == 1
+    assert state["notify_calls"] == 1
+    assert gw.status_summary()["has_session"] is True
+    assert "mcp_sess_1" not in json.dumps(gw.status_summary())
+
+    # 2. Subsequent call reuses cached Mcp-Session-Id without re-initializing
+    ads_tools = gw.list_tools(prefix="ads__")
+    assert [t["name"] for t in ads_tools] == ["ads__shops_list", "ads__page_posts_list"]
+    assert state["init_calls"] == 1
+    assert state["notify_calls"] == 1
+
+    # 3. Upstream Hub restarts / evicts session -> HTTP 404 triggers 1x re-init & transparent retry
+    state["active_session"] = "evicted_on_server"
+    r2 = gw.call_tool("ads__shops_list", {})
+    assert r2["ok"] is True
+    assert r2["data"]["session_seen"] == "mcp_sess_2"
+    assert state["init_calls"] == 2
+    assert state["notify_calls"] == 2
+
+    # 4. Upstream returns HTTP 400 Missing session ID -> triggers 1x re-init & transparent retry
+    state["force_next_400"] = True
+    r3 = gw.call_tool("ads__shops_list", {})
+    assert r3["ok"] is True
+    assert r3["data"]["session_seen"] == "mcp_sess_3"
+    assert state["init_calls"] == 3
+    assert state["notify_calls"] == 3
+
+    # 5. Persistent 404 stops after 1 re-init attempt (no infinite retry loop)
+    state["always_404"] = True
+    with pytest.raises(McpGatewayError) as exc_info:
+        gw.call_tool("ads__shops_list", {})
+    assert exc_info.value.code == "mcp_gateway_http_404"
+    assert exc_info.value.status == 502
+    assert state["init_calls"] == 4
+
 

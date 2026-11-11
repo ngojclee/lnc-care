@@ -1,7 +1,7 @@
-# Handoff — LNC Care (`v0.3.0.1`)
+# Handoff — LNC Care (`v0.3.0.2`)
 
-Updated: 2026-11-10.
-Status: **LIVE** on `http://10.21.4.101:8482` and `https://care-mcp.lengoc.me` (Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, FR Caddy Fleet + FR/VN Unbound DNS live, full `lnc-internal-app-blueprint` UI + `#keys` API/Management key contract, `19/19` `pytest` passing).
+Updated: 2026-11-11.
+Status: **LIVE** on `http://10.21.4.101:8482` and `https://care-mcp.lengoc.me` (Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, FR Caddy Fleet + FR/VN Unbound DNS live, full `lnc-internal-app-blueprint` UI + `#keys` API/Management key contract, 26 `care__*` tools live on Business MCP Hub + LNC-Agent-Hub, `20/20` `pytest` passing).
 
 ## UI & Blueprint Architecture (`lnc-internal-app-blueprint` Full Standard)
 
@@ -25,7 +25,7 @@ Status: **LIVE** on `http://10.21.4.101:8482` and `https://care-mcp.lengoc.me` (
 
 2. **Unified MCP Routing (`app/mcp_server.py` + `app/mcp_gateway.py`)**:
    - Inbound `/mcp` (and `/mcp/`) exposes **26 `care__*` tools** (`audience = lnc-care`) behind `Bearer LNC_CONNECTOR_TOKEN` + Business MCP Hub v3/v4 HMAC headers (`x-mcp-hub-client-*` or `X-LNC-Delegation`) with single-use SQLite nonce replay protection.
-   - Outbound cross-app `ads__*` tool calls (`care__ads_context_lookup` / `POST /api/admin/mcp-gateway/call`) route strictly through `LNC_MCP_GATEWAY_URL=http://10.21.4.101:8380/mcp` (`LNC-Agent-Hub (/mcp) -> Business MCP Hub (:8790/mcp) -> lnc-ads (/mcp)`).
+   - Outbound cross-app `ads__*` tool calls (`care__ads_context_lookup` / `POST /api/admin/mcp-gateway/call`) route strictly through `LNC_MCP_GATEWAY_URL=http://10.21.4.101:8380/mcp` (`LNC-Agent-Hub (/mcp) -> Business MCP Hub (:8790/mcp) -> lnc-ads (/mcp)`) with automatic MCP Streamable HTTP session handshake (`initialize` + `notifications/initialized`), thread-safe `Mcp-Session-Id` caching, and 1x automatic re-initialization on HTTP `400`/`404` session expiry.
 
 3. **3-Way Universal Operator SSO & Meta Webhooks (`app/main.py`)**:
    - `GET /api/auth/sso/redirect?peer=lnc-agent-hub|lnc-ads` and `GET /api/auth/sso/consume` redeem both `lnc_sso_*` tickets (`LNC-Agent-Hub`) and single-use HMAC peer tickets (`lnc-ads`), paired with English topbar buttons `Open Agent Hub ↗` and `Open LNC Ads ↗`.

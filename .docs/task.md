@@ -1,6 +1,6 @@
 # LNC Care: task checklist
 
-Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) + Full `lnc-internal-app-blueprint` UI Standard COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-10, `VERSION 0.3.0.1`, `pytest` 19/19 passed). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
+Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) + Full `lnc-internal-app-blueprint` UI Standard COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.3.0.2`, `pytest` 20/20 passed). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
 
 ## Phase 0: evidence and decisions
 
@@ -152,8 +152,8 @@ Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `L
 - [x] FR Caddy Fleet (`automations/edge-fleet` `0088114`) + Let's Encrypt cert (`care-mcp.lengoc.me`) + FR/VN Unbound internal DNS (`internal-dns` `2e1c799`) live (`HTTP=200 SSL=0` from LAN, `403` outside `@acl_2`).
 - [x] Ecosystem alignment (`VERSION 0.2.0.0`, `15/15 pytest`): `app/agent_hub.py` (`/v1/platform/*` + encrypted local SQLite Vault cache `TTL=900s` + automatic LAN fallback to `lnc-ads` `:8480`), `app/internal_bridge.py` (`LNC_INTERNAL_BRIDGE_SECRET` HMAC + 3-way Universal SSO `/api/auth/sso/{redirect,consume}`), and `app/mcp_gateway.py` (`LNC_MCP_GATEWAY_URL=http://10.21.4.101:8380/mcp` for `ads__*`).
 - [x] Full `lnc-internal-app-blueprint` UI & `#keys` standard (`VERSION 0.3.0.1`, `19/19 pytest`): LN UI Engine lite dual light/dark tokens (`#F2CEC2`/`#5E2419`), pixel-aligned `56px` `.side-brand`/`.topbar` divider, 12 hash-slug pages (`#conversations` & `#keys` added), 3-row `.side-foot`, `lite-select` rounded dropdowns, 100% English UI copy, `lnc-icon` 1024x1024 PNG + multi-size ICO (`app/public/*` + `docs/icon.*`), service API keys (`/api/keys*` + Bearer `/api/status`), bootstrap-to-runtime PBKDF2 management key rotation (`/api/mgmt/rotate`), and `env_or_cfg` Hub pairing secrets.
-- [ ] Hub managed connector `lnc-care`, pairing, scopes, grants; live
-  discovery shows `care__*`.
+- [x] Hub managed connector `lnc-care`, pairing, scopes, grants; live
+  discovery shows 26 `care__*` tools on Business MCP Hub (`:8790`) + LNC-Agent-Hub (`:8380/mcp`), Vault `pconn_0mwbf9p0xbbac3c585e8ab6c5` synced to local encrypted cache, and stateful `Mcp-Session-Id` handshake + 1x `400/404` auto re-init in `McpGatewayClient` (`VERSION 0.3.0.2`, `20/20 pytest`).
 - [ ] Update skill `lnm-care` (tool surface, inbox workflow, reply policy,
   errors) and cross-links in `lnm-ads`/`lnm-accounts`.
 - [ ] Release report in `.docs/reports/`.
