@@ -1,6 +1,6 @@
 # LNC Care: task checklist
 
-Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) + Full `lnc-internal-app-blueprint` UI Standard COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.3.0.2`, `pytest` 20/20 passed). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
+Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) + Full-Width `lnc-internal-app-blueprint` UI Standard COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.3.0.3`, `pytest` 21/21 passed). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
 
 ## Phase 0: evidence and decisions
 

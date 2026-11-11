@@ -1,7 +1,7 @@
-# Handoff — LNC Care (`v0.3.0.2`)
+# Handoff — LNC Care (`v0.3.0.3`)
 
 Updated: 2026-11-11.
-Status: **LIVE** on `http://10.21.4.101:8482` and `https://care-mcp.lengoc.me` (Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, FR Caddy Fleet + FR/VN Unbound DNS live, full `lnc-internal-app-blueprint` UI + `#keys` API/Management key contract, 26 `care__*` tools live on Business MCP Hub + LNC-Agent-Hub, `20/20` `pytest` passing).
+Status: **LIVE** on `http://10.21.4.101:8482` and `https://care-mcp.lengoc.me` (Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, FR Caddy Fleet + FR/VN Unbound DNS live, full-width `lnc-internal-app-blueprint` UI + `#keys` API/Management key contract, 26 `care__*` tools live on Business MCP Hub + LNC-Agent-Hub, `21/21` `pytest` passing).
 
 ## UI & Blueprint Architecture (`lnc-internal-app-blueprint` Full Standard)
 

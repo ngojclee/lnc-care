@@ -880,6 +880,12 @@ def create_app(
             db.execute("BEGIN IMMEDIATE")
             return conn_mod.seed_demo_workspace(db, org, actor="owner")
 
+    @app.post("/api/admin/purge-demo")
+    def purge_demo(_: str = Depends(require_admin)):
+        with store.connect(path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            return conn_mod.purge_demo_workspace(db, org, actor="owner")
+
     @app.post("/api/admin/shops")
     async def create_shop(request: Request, _: str = Depends(require_admin)):
         body = await request.json()

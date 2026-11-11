@@ -1265,3 +1265,137 @@ def seed_demo_workspace(db, organization_id: str, actor: str = "owner") -> dict:
         {"channels": len(channel_ids), "posts": len(post_ids), "comments": len(comment_ids)},
     )
     return {"ok": True, "shop_id": shop_id, "channels": len(channel_ids), "comments": len(comment_ids)}
+
+
+def purge_demo_workspace(db, organization_id: str, *, actor: str = "owner") -> dict:
+    """Remove synthetic seed-demo records while preserving all real synced Vault/OAuth channels and data."""
+    demo_cm_exts = ("cm_9001", "cm_9002", "cm_9003", "cm_9004", "cm_9005", "cm_9006")
+    cm_rows = db.execute(
+        f"SELECT id FROM comments WHERE organization_id=? AND external_id IN ({','.join('?' * len(demo_cm_exts))})",
+        (organization_id, *demo_cm_exts),
+    ).fetchall()
+    cm_ids = [r["id"] for r in cm_rows]
+
+    if cm_ids:
+        ph = ",".join("?" * len(cm_ids))
+        db.execute(f"DELETE FROM evidence_items WHERE organization_id=? AND comment_id IN ({ph})", (organization_id, *cm_ids))
+        db.execute(f"DELETE FROM ticket_handoffs WHERE organization_id=? AND comment_id IN ({ph})", (organization_id, *cm_ids))
+        db.execute(f"DELETE FROM reply_drafts WHERE organization_id=? AND comment_id IN ({ph})", (organization_id, *cm_ids))
+        db.execute(f"DELETE FROM comment_actions WHERE organization_id=? AND comment_id IN ({ph})", (organization_id, *cm_ids))
+        db.execute(f"DELETE FROM evaluation_feedback WHERE organization_id=? AND comment_id IN ({ph})", (organization_id, *cm_ids))
+        db.execute(f"DELETE FROM comment_evaluations WHERE organization_id=? AND comment_id IN ({ph})", (organization_id, *cm_ids))
+        db.execute(f"DELETE FROM comment_states WHERE organization_id=? AND comment_id IN ({ph})", (organization_id, *cm_ids))
+        db.execute(f"DELETE FROM comments WHERE organization_id=? AND id IN ({ph})", (organization_id, *cm_ids))
+
+    db.execute(
+        "DELETE FROM evidence_items WHERE organization_id=? AND target_url LIKE '%ngocle/posts/903%'",
+        (organization_id,),
+    )
+    db.execute(
+        """DELETE FROM evidence_cases
+           WHERE organization_id=?
+             AND title LIKE 'Defamation Case #01%'
+             AND NOT EXISTS (
+                 SELECT 1 FROM evidence_items ei
+                 WHERE ei.organization_id=evidence_cases.organization_id AND ei.case_id=evidence_cases.id
+             )""",
+        (organization_id,),
+    )
+
+    demo_post_exts = ("235513372986478_901", "17841464987749627_902", "fb_personal_post_903")
+    post_rows = db.execute(
+        f"""SELECT id FROM posts
+            WHERE organization_id=?
+              AND external_id IN ({','.join('?' * len(demo_post_exts))})
+              AND NOT EXISTS (
+                  SELECT 1 FROM comments cm
+                  WHERE cm.organization_id=posts.organization_id AND cm.post_id=posts.id
+              )""",
+        (organization_id, *demo_post_exts),
+    ).fetchall()
+    post_ids = [r["id"] for r in post_rows]
+    if post_ids:
+        pph = ",".join("?" * len(post_ids))
+        db.execute(f"DELETE FROM post_snapshots WHERE organization_id=? AND post_id IN ({pph})", (organization_id, *post_ids))
+        db.execute(f"DELETE FROM post_archives WHERE organization_id=? AND post_id IN ({pph})", (organization_id, *post_ids))
+        db.execute(f"DELETE FROM posts WHERE organization_id=? AND id IN ({pph})", (organization_id, *post_ids))
+
+    conv_rows = db.execute(
+        "SELECT id FROM conversations WHERE organization_id=? AND external_id='conv_9001'",
+        (organization_id,),
+    ).fetchall()
+    for cv in conv_rows:
+        db.execute("DELETE FROM messages WHERE organization_id=? AND conversation_id=?", (organization_id, cv["id"]))
+        db.execute("DELETE FROM ticket_handoffs WHERE organization_id=? AND conversation_id=?", (organization_id, cv["id"]))
+        db.execute("DELETE FROM conversations WHERE organization_id=? AND id=?", (organization_id, cv["id"]))
+
+    db.execute("DELETE FROM leads WHERE organization_id=? AND external_id='lead_demo_01'", (organization_id,))
+
+    demo_ch = db.execute(
+        "SELECT id FROM channels WHERE organization_id=? AND external_id='fb_personal_founder'",
+        (organization_id,),
+    ).fetchone()
+    removed_channels = 0
+    if demo_ch:
+        dcid = demo_ch["id"]
+        has_posts = db.execute("SELECT 1 FROM posts WHERE organization_id=? AND channel_id=?", (organization_id, dcid)).fetchone()
+        has_convs = db.execute("SELECT 1 FROM conversations WHERE organization_id=? AND channel_id=?", (organization_id, dcid)).fetchone()
+        if not has_posts and not has_convs:
+            db.execute("DELETE FROM operator_channel_preferences WHERE organization_id=? AND channel_id=?", (organization_id, dcid))
+            db.execute("DELETE FROM channel_shop_bindings WHERE organization_id=? AND channel_id=?", (organization_id, dcid))
+            db.execute("DELETE FROM channel_snapshots WHERE organization_id=? AND channel_id=?", (organization_id, dcid))
+            db.execute("DELETE FROM channels WHERE organization_id=? AND id=?", (organization_id, dcid))
+            removed_channels = 1
+
+    demo_prof_ids = (
+        "meta_page_235513372986478",
+        "vb_prof_founder_01",
+        "vb_prof_consult_01",
+        "vb_prof_consult_02",
+        "vb_prof_scout_01",
+        "orbine_arm64_pixel7_01",
+    )
+    rt_rows = db.execute(
+        f"SELECT id FROM account_runtimes WHERE organization_id=? AND runtime_profile_id IN ({','.join('?' * len(demo_prof_ids))})",
+        (organization_id, *demo_prof_ids),
+    ).fetchall()
+    rt_ids = [r["id"] for r in rt_rows]
+    if rt_ids:
+        rph = ",".join("?" * len(rt_ids))
+        db.execute(f"DELETE FROM runtime_leases WHERE organization_id=? AND runtime_id IN ({rph})", (organization_id, *rt_ids))
+        db.execute(f"DELETE FROM account_runtimes WHERE organization_id=? AND id IN ({rph})", (organization_id, *rt_ids))
+
+    demo_shop = db.execute(
+        "SELECT id FROM shops WHERE organization_id=? AND name='LuxeClaw Atelier'",
+        (organization_id,),
+    ).fetchone()
+    other_shop = db.execute(
+        "SELECT id FROM shops WHERE organization_id=? AND name!='LuxeClaw Atelier' LIMIT 1",
+        (organization_id,),
+    ).fetchone()
+    if demo_shop and other_shop:
+        dsid = demo_shop["id"]
+        db.execute("DELETE FROM consultation_playbooks WHERE organization_id=? AND shop_id=? AND name='LuxeClaw Default Playbook'", (organization_id, dsid))
+        db.execute("DELETE FROM operator_channel_preferences WHERE organization_id=? AND shop_id=?", (organization_id, dsid))
+        db.execute("DELETE FROM channel_shop_bindings WHERE organization_id=? AND shop_id=?", (organization_id, dsid))
+        db.execute("DELETE FROM shop_connection_bindings WHERE organization_id=? AND shop_id=?", (organization_id, dsid))
+        has_leads = db.execute("SELECT 1 FROM leads WHERE organization_id=? AND shop_id=?", (organization_id, dsid)).fetchone()
+        has_handoffs = db.execute("SELECT 1 FROM ticket_handoffs WHERE organization_id=? AND shop_id=?", (organization_id, dsid)).fetchone()
+        if not has_leads and not has_handoffs:
+            db.execute("DELETE FROM shops WHERE organization_id=? AND id=?", (organization_id, dsid))
+
+    audit.append(
+        db,
+        organization_id,
+        actor,
+        "workspace.demo_purged",
+        organization_id,
+        {"removed_comments": len(cm_ids), "removed_posts": len(post_ids), "removed_channels": removed_channels},
+    )
+    return {
+        "ok": True,
+        "removed_comments": len(cm_ids),
+        "removed_posts": len(post_ids),
+        "removed_channels": removed_channels,
+        "removed_runtimes": len(rt_ids),
+    }

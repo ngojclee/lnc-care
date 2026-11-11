@@ -65,7 +65,7 @@ def test_static_blueprint_assets_icons_and_english_only_ui(tmp_path):
         assert (ROOT / "docs" / doc_asset).exists()
 
     info = client.get("/api/app-info").json()
-    assert info["version"] == VERSION == "0.3.0.2"
+    assert info["version"] == VERSION == "0.3.0.3"
 
     # Static blueprint & English-only checks on HTML / CSS / JS
     index_html = (ROOT / "app" / "public" / "index.html").read_text(encoding="utf-8")
@@ -288,3 +288,37 @@ def test_ui_saved_hub_pairing_secrets_env_or_cfg_on_mcp(tmp_path):
         json={"connector_bearer": "attempt-override"},
     )
     assert blocked.status_code == 422
+
+
+def test_full_width_layout_and_purge_demo_preserves_real_channels(tmp_path):
+    style_css = (ROOT / "app" / "public" / "style.css").read_text(encoding="utf-8")
+    assert ".content{flex:1;padding:22px 28px;max-width:none;width:100%;margin:0}" in style_css
+    assert ".queue-author{" in style_css and "text-overflow:ellipsis" not in style_css.split(".queue-author{")[1].split("}")[0]
+    assert ".queue-snippet{" in style_css and "text-overflow:ellipsis" not in style_css.split(".queue-snippet{")[1].split("}")[0]
+
+    app = create_app(
+        db_path=tmp_path / "purge.db",
+        master_key=MASTER_KEY,
+        management_key=MGMT_KEY,
+    )
+    client = TestClient(app)
+    csrf = client.post("/api/auth/login", json={"key": MGMT_KEY}).json()["csrf_token"]
+    h = {"X-CSRF-Token": csrf}
+
+    # Create a real shop first, seed demo, then purge demo
+    assert client.post("/api/admin/shops", headers=h, json={"name": "LuxeClaw"}).status_code == 200
+    seeded = client.post("/api/admin/seed-demo", headers=h).json()
+    assert seeded["ok"] is True
+    assert len(client.get("/api/admin/comments").json()["comments"]) == 6
+
+    purged = client.post("/api/admin/purge-demo", headers=h).json()
+    assert purged["ok"] is True
+    assert purged["removed_comments"] == 6
+    assert purged["removed_channels"] == 1
+    assert client.get("/api/admin/comments").json()["comments"] == []
+
+    ov = client.get("/api/admin/overview").json()
+    ext_ids = {c["external_id"] for c in ov["channels"]}
+    assert "fb_personal_founder" not in ext_ids
+    assert {"235513372986478", "17841464987749627"}.issubset(ext_ids)
+

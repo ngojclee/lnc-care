@@ -367,7 +367,7 @@ function renderShell() {
   const page = currentPage();
   $$('.side a[data-page]').forEach(a => a.classList.toggle('on', a.dataset.page === page));
   $$('.page').forEach(sec => sec.classList.toggle('on', sec.id === `page-${page}`));
-  $('#main-content')?.classList.toggle('wide', page === 'inbox' || page === 'conversations');
+  $('#main-content')?.classList.add('wide');
 
   const o = state.overview;
   const orgName = o?.organization?.name || 'LNC Care';
@@ -452,15 +452,20 @@ function renderOverviewPage() {
     ['Healthy runtimes', `${o.fleet_summary?.healthy || 0} / ${o.fleet_summary?.total || 0}`, 'Graph API · VeilBrowser · Orbine']
   ].map(([l, n, s]) => `<div class="stat"><div class="l">${esc(l)}</div><div class="n">${esc(n)}</div><div class="s">${esc(s)}</div></div>`).join('');
 
-  const chRows = (o.channels || []).map(ch => `<tr>
-    <td><div class="cell-main">${esc(ch.name)}</div><div class="cell-sub">${esc(ch.handle || ch.external_id)}</div></td>
-    <td>${provBadge(ch.provider)}</td>
-    <td class="mono">${esc(ch.adapter)}</td>
-    <td class="num">${num(ch.followers_count)}</td>
-    <td class="num">${num(ch.posts_count)}</td>
-    <td class="num">${num(ch.comments_count)}</td>
-    <td>${badge(ch.reply_policy || 'draft_only', ch.approved ? 'b-ok' : 'b-warn')}</td>
-  </tr>`);
+  const hasDemoData = (o.channels || []).some(ch => ch.external_id === 'fb_personal_founder') || (inb.total || 0) > 0;
+  const chRows = (o.channels || []).map(ch => {
+    const isDemoCh = ch.external_id === 'fb_personal_founder';
+    const subParts = [ch.handle, ch.external_id && ch.external_id !== ch.handle ? ch.external_id : ''].filter(Boolean);
+    return `<tr>
+      <td><div class="cell-main">${esc(ch.name)} ${isDemoCh ? badge('Demo', 'b-dim') : ''}</div><div class="cell-sub">${esc(subParts.join(' · '))}</div></td>
+      <td>${provBadge(ch.provider)}</td>
+      <td class="mono">${esc(ch.adapter)}</td>
+      <td class="num">${num(ch.followers_count)}</td>
+      <td class="num">${num(ch.posts_count)}</td>
+      <td class="num">${num(ch.comments_count)}</td>
+      <td>${badge(ch.reply_policy || 'draft_only', ch.approved ? 'b-ok' : 'b-warn')}</td>
+    </tr>`;
+  });
 
   const vaultModeBadge = hub.mode === 'vault_synced'
     ? badge('Agent Hub synced', 'b-ok')
@@ -489,7 +494,7 @@ function renderOverviewPage() {
       ${card('Owned & discovered channels', table(['Channel', 'Provider', 'Adapter', '#Followers', '#Posts', '#Comments', 'Reply policy'], chRows, 'No channels registered yet. Sync Shared Vault or load the demo workspace.'), {
         sub: 'Channels bound to the active shop or discovered from shared OAuth.',
         flush: true,
-        tools: `<button type="button" class="btn btn-sm" id="btn-run-worker">Run worker queue</button><button type="button" class="btn btn-sm" id="btn-seed-demo">Load demo workspace</button>`
+        tools: `<button type="button" class="btn btn-sm" id="btn-run-worker">Run worker queue</button><button type="button" class="btn btn-sm" id="btn-seed-demo">Load demo workspace</button>${hasDemoData ? `<button type="button" class="btn btn-sm btn-danger" id="btn-purge-demo">Clear demo data</button>` : ''}`
       })}
       <div class="stack-sm" style="gap:16px">
         ${card('Ecosystem & safety boundary', govHtml, { sub: 'Independent local vault cache with automatic Hub & LAN fallback.' })}
@@ -502,6 +507,20 @@ function renderOverviewPage() {
     toast(`Demo workspace loaded (${res.channels} channels, ${res.comments} comments)`, 'ok');
     await refreshOverview();
   }));
+  $('#btn-purge-demo')?.addEventListener('click', async ev => {
+    const ok = await confirmModal({
+      title: 'Clear demo mockup data?',
+      body: 'Remove seeded demo comments, demo posts and synthetic demo profiles while keeping all real Vault/OAuth channels intact?',
+      confirm: 'Clear demo data',
+      danger: true
+    });
+    if (!ok) return;
+    await busy(ev.currentTarget, async () => {
+      const res = await api('/api/admin/purge-demo', { method: 'POST' });
+      toast(`Cleared ${res.removed_comments || 0} demo comments and ${res.removed_posts || 0} demo posts`, 'ok');
+      await refreshOverview();
+    });
+  });
   $('#btn-run-worker')?.addEventListener('click', ev => busy(ev.currentTarget, async () => {
     const res = await api('/api/admin/jobs/run', { method: 'POST' });
     toast(`Processed ${res.processed || 0} background jobs`, 'ok');
@@ -579,11 +598,17 @@ function renderInboxStudio() {
       for (const cm of items) {
         const sc = cm.evaluation ? Number(cm.evaluation.overall_score || 0) : 50;
         const scFmt = Number.isInteger(sc) ? String(sc) : sc.toFixed(1);
+        const isDemoCm = String(cm.external_id || '').startsWith('cm_900');
+        const metaLine = [cm.author_meta, cm.channel_name, cm.created_at ? when(cm.created_at) : ''].filter(Boolean).join(' · ');
         queueListHtml += `<div class="queue-card${cm.id === state.selectedCommentId ? ' on' : ''}" data-cm-id="${cm.id}">
           <div class="queue-avatar">${esc(initials(cm.author_name))}</div>
-          <div>
-            <div class="queue-author">${esc(cm.author_name)}</div>
-            <div class="queue-meta">${esc(cm.author_meta || cm.channel_name)}</div>
+          <div class="queue-body">
+            <div class="queue-author-row">
+              <span class="queue-author">${esc(cm.author_name)}</span>
+              ${cm.author_external_id ? `<span class="queue-uid">ID: ${esc(cm.author_external_id)}</span>` : ''}
+              ${isDemoCm ? badge('Demo', 'b-dim') : ''}
+            </div>
+            <div class="queue-meta">${esc(metaLine)}</div>
             <div class="queue-snippet">${esc(cm.text)}</div>
           </div>
           <div class="queue-score">${esc(scFmt)}</div>
@@ -592,7 +617,8 @@ function renderInboxStudio() {
     }
   }
 
-  host.innerHTML = `<div class="seg-bar" id="triage-bucket-bar">${segHtml}</div>
+  const hasDemoComments = state.comments.some(cm => String(cm.external_id || '').startsWith('cm_900'));
+  host.innerHTML = `<div class="seg-bar" id="triage-bucket-bar">${segHtml}${hasDemoComments ? `<button type="button" class="btn btn-sm btn-danger" id="inbox-purge-btn" style="margin-left:auto">Clear demo data</button>` : ''}</div>
     <div class="triage-split">
       <div class="triage-queue-pane">
         <div class="triage-queue-controls">
@@ -634,6 +660,22 @@ function renderInboxStudio() {
     await refreshOverview();
     await loadInbox();
   }));
+  $('#inbox-purge-btn')?.addEventListener('click', async ev => {
+    const ok = await confirmModal({
+      title: 'Clear demo mockup data?',
+      body: 'Remove seeded demo comments, demo posts and synthetic demo profiles while keeping all real Vault/OAuth channels intact?',
+      confirm: 'Clear demo data',
+      danger: true
+    });
+    if (!ok) return;
+    await busy(ev.currentTarget, async () => {
+      const res = await api('/api/admin/purge-demo', { method: 'POST' });
+      state.selectedCommentId = null;
+      toast(`Cleared ${res.removed_comments || 0} demo comments`, 'ok');
+      await refreshOverview();
+      await loadInbox();
+    });
+  });
   host.querySelectorAll('[data-cm-id]').forEach(el => {
     el.onclick = () => {
       state.selectedCommentId = Number(el.dataset.cmId);
@@ -718,7 +760,7 @@ function renderInboxDetailPane() {
 
       <div class="comment-context-box">
         <div class="comment-context-head">
-          <span><b>${esc(cm.author_name)}</b> · ${esc(cm.author_meta || 'Audience member')} · on <b>${esc(cm.channel_name)}</b> (<code>${esc(cm.adapter)}</code>)</span>
+          <span><b>${esc(cm.author_name)}</b> ${cm.author_external_id ? `<span class="queue-uid">ID: ${esc(cm.author_external_id)}</span>` : ''} · ${esc(cm.author_meta || 'Audience member')} · on <b>${esc(cm.channel_name)}</b> (<code>${esc(cm.adapter)}</code>)</span>
           <button type="button" class="btn btn-sm" id="re-eval-btn">Re-evaluate</button>
         </div>
         <div class="comment-context-text">"${esc(cm.text)}"</div>
@@ -891,10 +933,10 @@ async function loadConversations() {
 function renderConversationsPage() {
   const host = $('#body-conversations');
   const convRows = state.conversations.map(cv => `<tr data-conv-id="${cv.id}" style="cursor:pointer${cv.id === state.selectedConversationId ? ';background:var(--primary-light)' : ''}">
-    <td><div class="cell-main">${esc(cv.participant_name)}</div><div class="cell-sub">${esc(cv.channel_name)}</div></td>
+    <td><div class="cell-main">${esc(cv.participant_name)}</div><div class="cell-sub">${esc([cv.participant_id ? `ID: ${cv.participant_id}` : '', cv.channel_name].filter(Boolean).join(' · '))}</div></td>
     <td>${badge(cv.status, cv.status === 'replied' ? 'b-ok' : (cv.status === 'open' ? 'b-warn' : 'b-dim'))}</td>
     <td class="num">${num(cv.unread_count)}</td>
-    <td>${esc((cv.last_message_preview || '').slice(0, 70))}</td>
+    <td>${esc(cv.last_message_preview || '')}</td>
     <td class="cell-sub">${when(cv.updated_at)}</td>
   </tr>`);
 
@@ -1032,7 +1074,7 @@ function renderPostsPage() {
     return `<tr data-post-row="${p.id}" style="cursor:pointer${p.id === state.selectedPostId ? ';background:var(--primary-light)' : ''}">
       <td><div class="cell-main">${esc(p.channel_name)}</div><div class="cell-sub">${esc(p.provider)}</div></td>
       <td>${badge(p.kind || 'post', 'b-dim')}</td>
-      <td>${esc((p.caption || '').slice(0, 76))}${(p.caption || '').length > 76 ? '...' : ''}</td>
+      <td>${esc(p.caption || '')}</td>
       <td class="num">${num(snap.reactions || 0)}</td>
       <td class="num">${num(snap.comments_count || 0)}</td>
       <td class="num">${num((p.archives || []).length)}</td>
@@ -1139,9 +1181,9 @@ function renderEvidencePage() {
     const item = (c.items || [])[0] || {};
     return `<tr>
       <td class="mono">#${c.id}</td>
-      <td><div class="cell-main">${esc(c.title)}</div><div class="cell-sub">${esc((item.captured_text || '').slice(0, 88))}</div></td>
+      <td><div class="cell-main">${esc(c.title)}</div><div class="cell-sub">${esc(item.captured_text || '')}</div></td>
       <td><div class="cell-main">${esc(c.subject_name || 'Unknown')}</div><div class="cell-sub mono">UID: ${esc(c.subject_uid || '-')}</div></td>
-      <td><a href="${esc(item.target_url || '#')}" target="_blank" rel="noopener noreferrer">${esc((item.target_url || '').slice(0, 40))}... &#8599;</a></td>
+      <td style="overflow-wrap:anywhere"><a href="${esc(item.target_url || '#')}" target="_blank" rel="noopener noreferrer">${esc(item.target_url || '-')} &#8599;</a></td>
       <td>${copyChip(c.bundle_sha256 || '')}</td>
       <td>${badge(`${item.alive_status || 'alive'} (+6h/+24h/+72h)`, item.alive_status === 'deleted' ? 'b-err' : 'b-ok')}</td>
       <td class="mono">${esc(c.bundle_zip_path || '-')}</td>
