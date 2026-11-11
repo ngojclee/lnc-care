@@ -1,8 +1,11 @@
 .git
 .docs
+.agents
+target
+data
+tests
+docs
+temp_scripts
 __pycache__
 .pytest_cache
 .ruff_cache
-data
-tests
-temp_scripts

@@ -61,7 +61,7 @@ services:
         bind:
           create_host_path: false
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      test: ["CMD", "/app/lnc-care", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -74,7 +74,7 @@ services:
 
   lnc-care-worker:
     build: .
-    command: ["python", "-m", "app.worker"]
+    command: ["/app/lnc-care", "worker"]
     restart: unless-stopped
     user: "10001:10001"
     read_only: true

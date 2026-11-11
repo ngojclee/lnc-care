@@ -1,7 +1,8 @@
+/target/
+data/
+temp_scripts/
+.env
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-data/
-temp_scripts/
-.env

@@ -1,1 +1,0 @@
-"""LNC Care application package."""

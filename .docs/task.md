@@ -1,6 +1,6 @@
 # LNC Care: task checklist
 
-Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) + Full-Width `lnc-internal-app-blueprint` UI Standard COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.3.0.3`, `pytest` 21/21 passed). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
+Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `LNC Ads v1.2.0`) + Full-Width `lnc-internal-app-blueprint` UI Standard + **1:1 Native Rust Backend Rewrite (`Axum 0.7` + `Rusqlite 0.32` WAL)** COMPLETED & LIVE on `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.4.0.0`, `cargo test` 20/20 passed, legacy Python removed). Follow `.docs/plan.md` gates. Check boxes only with evidence (test output, screenshot, API response without secrets).
 
 ## Phase 0: evidence and decisions
 
@@ -154,6 +154,7 @@ Status: Phase 1 + Ecosystem Alignment (`LNC-Agent-Hub` + `Business MCP Hub` + `L
 - [x] Full `lnc-internal-app-blueprint` UI & `#keys` standard (`VERSION 0.3.0.1`, `19/19 pytest`): LN UI Engine lite dual light/dark tokens (`#F2CEC2`/`#5E2419`), pixel-aligned `56px` `.side-brand`/`.topbar` divider, 12 hash-slug pages (`#conversations` & `#keys` added), 3-row `.side-foot`, `lite-select` rounded dropdowns, 100% English UI copy, `lnc-icon` 1024x1024 PNG + multi-size ICO (`app/public/*` + `docs/icon.*`), service API keys (`/api/keys*` + Bearer `/api/status`), bootstrap-to-runtime PBKDF2 management key rotation (`/api/mgmt/rotate`), and `env_or_cfg` Hub pairing secrets.
 - [x] Hub managed connector `lnc-care`, pairing, scopes, grants; live
   discovery shows 26 `care__*` tools on Business MCP Hub (`:8790`) + LNC-Agent-Hub (`:8380/mcp`), Vault `pconn_0mwbf9p0xbbac3c585e8ab6c5` synced to local encrypted cache, and stateful `Mcp-Session-Id` handshake + 1x `400/404` auto re-init in `McpGatewayClient` (`VERSION 0.3.0.2`, `20/20 pytest`).
+- [x] **1:1 Native Rust Backend Migration (`VERSION 0.4.0.0`, `20/20 cargo test`)**: ported all 15 backend modules (`src/{lib,main,transport,audit,vault,settings,store,evaluator,providers,worker,internal_bridge,agent_hub,connections,mcp_gateway,mcp_server,routes}.rs`) to `Axum 0.7` + `Rusqlite 0.32` (WAL) with 100% SQLite/AES-256-GCM/PBKDF2/SHA-256/MCP/SSO wire compatibility, removed legacy Python `app/` + `requirements.txt` + `tests/*.py`, updated multi-stage `Dockerfile` (`rust:1-slim-bookworm` -> `debian:bookworm-slim`) & `stack.yml`, and redeployed Stack `#59` on `10.21.4.101:8482`.
 - [ ] Update skill `lnm-care` (tool surface, inbox workflow, reply policy,
   errors) and cross-links in `lnm-ads`/`lnm-accounts`.
 - [ ] Release report in `.docs/reports/`.

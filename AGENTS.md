@@ -1,6 +1,6 @@
 # LNC Care project instructions
 
-Status: LIVE ON PORTAINER `10.21.4.101:8482` & `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.3.0.3`, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, FR Caddy Fleet + FR/VN Unbound DNS live, full-width `lnc-internal-app-blueprint` LN UI Engine lite + `#keys` API/Management key contract + LNC-Agent-Hub + Business MCP Hub + LNC Ads v1.2.0 ecosystem-aligned with stateful `Mcp-Session-Id` handshake, 21/21 `pytest` passing). Read `.docs/handoff.md` first, then `.docs/plan.md`, `.docs/multi-account-antidetect-plan.md`, and `.docs/task.md`.
+Status: LIVE ON PORTAINER `10.21.4.101:8482` & `https://care-mcp.lengoc.me` (2026-11-11, `VERSION 0.4.0.0`, **100% Native Rust Backend (`Axum 0.7` + `Rusqlite 0.32` WAL, legacy Python removed)**, Gitea `apps/lnc-care` + GitHub mirror `ngojclee/lnc-care`, Portainer `portainer-fr4` Stack `#59` `lnc-care` on endpoint `paris3` `#4`, FR Caddy Fleet + FR/VN Unbound DNS live, full-width `lnc-internal-app-blueprint` LN UI Engine lite + `#keys` API/Management key contract + LNC-Agent-Hub + Business MCP Hub + LNC Ads v1.2.0 ecosystem-aligned with stateful `Mcp-Session-Id` handshake, `20/20` `cargo test` passing). Read `.docs/handoff.md` first, then `.docs/plan.md`, `.docs/multi-account-antidetect-plan.md`, and `.docs/task.md`.
 
 Purpose: care console for OWNED social channels (Facebook Pages, Instagram
 professional accounts, later TikTok business accounts and YouTube): ingest
@@ -11,9 +11,9 @@ hide through guarded, audited writes. Publishing stays in Postiz
 
 Conventions (same family as `lnc-ads`):
 
-- `lnc-internal-app-blueprint` Shape 0: FastAPI + SQLite + vanilla
-  `app/public/` UI at `/admin` with hash-slug pages, `/login.html`,
-  `/api/auth/status`, `/health`, `/api/admin/*`. English-only operator UI.
+- `lnc-internal-app-blueprint` Shape 0 (Native Rust): Rust `Axum 0.7` + `Rusqlite 0.32` (WAL) + vanilla
+  `public/` UI at `/admin` with hash-slug pages, `/login.html`,
+  `/api/auth/status`, `/health`, `/api/admin/*`. Single `/app/lnc-care` binary (`serve`, `worker`, `healthcheck`, `rotate-vault`). English-only operator UI.
 - `business-mcp-connector`: one app-owned `/mcp` with Hub v3/v4 HMAC
   delegation, nonce replay guard, per-tool scopes, deny unknown tools.
   Audience `lnc-care`, Hub namespace `care__*`.
