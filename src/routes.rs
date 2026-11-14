@@ -1,35 +1,39 @@
 //! Axum HTTP router for LNC Care (`/admin`, `/api/*`, `/webhooks/meta`, `/mcp`).
 
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64_URL;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use rusqlite::params;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::agent_hub::{self, AgentHubClient, AgentHubConfig, AgentHubError};
+use crate::auth_core::{self, OriginVerdict};
 use crate::connections::{self as conn_mod, Connections};
 use crate::internal_bridge::{self, AdsBridgeClient, BridgeClientError, BridgeConfig};
 use crate::mcp_gateway::{self, McpGatewayClient, McpGatewayConfig, McpGatewayError};
 use crate::mcp_server::{self, McpServerConfig, AUDIENCE, SCOPES};
+use crate::oidc::{self, OidcCache, OidcConfig};
 use crate::providers::ProviderError;
 use crate::store::{self, query_maps, query_one_map};
-use crate::transport::{build_url_with_params, SharedTransport};
+use crate::transport::{build_url_with_params, SharedTransport, UreqTransport};
 use crate::vault::{Vault, VaultError};
 use crate::{audit, evaluator, evidence, fleet, settings, worker};
 
@@ -78,6 +82,17 @@ pub struct AppState {
     pub env_map: HashMap<String, String>,
     pub local_hosts: HashSet<String>,
     pub attempts: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    pub oidc: OidcConfig,
+    pub oidc_cache: Arc<Mutex<OidcCache>>,
+    pub transport: SharedTransport,
+    /// `COOKIE_SECURE`: Some(true|false) forces the flag, None = auto (HTTPS request / X-Forwarded-Proto).
+    pub cookie_secure_mode: Option<bool>,
+    pub public_base_env: String,
+    pub trusted_proxies: Vec<String>,
+    /// Argon2id PHC of the env `MANAGEMENT_KEY`, hashed lazily on first sign-in attempt.
+    pub env_mgmt_phc: Arc<OnceLock<String>>,
+    pub session_idle_secs: i64,
+    pub session_max_secs: i64,
 }
 
 #[derive(Debug)]
@@ -143,7 +158,7 @@ impl From<rusqlite::Error> for AppError {
     }
 }
 
-fn now_unix() -> i64 {
+pub fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -178,41 +193,17 @@ fn ct_eq_str(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).unwrap_u8() == 1
 }
 
-fn session_cookie_value(key: &str, sid: &str, exp: i64) -> String {
-    let msg = format!("{sid}.{exp}");
-    let sig = hmac_hex(key, msg.as_bytes());
-    format!("{sid}.{exp}.{sig}")
-}
-
-fn verify_session_cookie(key: &str, cookie: Option<&str>) -> Option<String> {
-    let raw = cookie.filter(|s| !s.is_empty() && !key.is_empty())?;
-    let mut parts = raw.splitn(3, '.');
-    let sid = parts.next()?;
-    let exp_s = parts.next()?;
-    let sig = parts.next()?;
-    let exp: i64 = exp_s.parse().ok()?;
-    if exp <= now_unix() {
-        return None;
-    }
-    let expected = hmac_hex(key, format!("{sid}.{exp}").as_bytes());
-    if !ct_eq_str(sig, &expected) {
-        return None;
-    }
-    Some(hex::encode(Sha256::digest(raw.as_bytes())))
-}
-
-fn parse_cookies(headers: &HeaderMap) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for val in headers.get_all(header::COOKIE).iter() {
-        if let Ok(s) = val.to_str() {
-            for part in s.split(';') {
-                if let Some((k, v)) = part.trim().split_once('=') {
-                    out.insert(k.trim().to_string(), v.trim().to_string());
-                }
-            }
-        }
-    }
-    out
+fn query_has_secret_param(uri: &Uri) -> bool {
+    uri.query()
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes()).any(|(k, _)| {
+                matches!(
+                    k.to_ascii_lowercase().as_str(),
+                    "token" | "key" | "api_key" | "apikey" | "access_token" | "secret" | "password"
+                )
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn query_map(uri: &Uri) -> HashMap<String, String> {
@@ -238,27 +229,15 @@ fn is_https(headers: &HeaderMap, uri: &Uri) -> bool {
             .eq_ignore_ascii_case("https")
 }
 
-fn append_admin_cookies(resp_headers: &mut HeaderMap, sig_key: &str, secure: bool) -> String {
-    let sid = random_urlsafe(24);
-    let csrf = random_urlsafe(24);
-    let sess_val = session_cookie_value(sig_key, &sid, now_unix() + 43200);
-    let sec_flag = if secure { "; Secure" } else { "" };
-    let c1 = format!("lnc_care_session={sess_val}; HttpOnly; SameSite=Lax; Path=/{sec_flag}");
-    let c2 = format!("lnc_care_csrf={csrf}; SameSite=Lax; Path=/{sec_flag}");
-    if let Ok(hv) = HeaderValue::from_str(&c1) {
+fn append_session_cookie(resp_headers: &mut HeaderMap, cookie: &str) {
+    if let Ok(hv) = HeaderValue::from_str(cookie) {
         resp_headers.append(header::SET_COOKIE, hv);
     }
-    if let Ok(hv) = HeaderValue::from_str(&c2) {
-        resp_headers.append(header::SET_COOKIE, hv);
-    }
-    csrf
 }
 
-fn append_delete_cookies(resp_headers: &mut HeaderMap) {
-    if let Ok(hv) = HeaderValue::from_str("lnc_care_session=; Path=/; Max-Age=0") {
-        resp_headers.append(header::SET_COOKIE, hv);
-    }
-    if let Ok(hv) = HeaderValue::from_str("lnc_care_csrf=; Path=/; Max-Age=0") {
+fn append_delete_cookies(resp_headers: &mut HeaderMap, secure: bool) {
+    let c = auth_core::clear_cookie_header(auth_core::SESSION_COOKIE, "/", secure);
+    if let Ok(hv) = HeaderValue::from_str(&c) {
         resp_headers.append(header::SET_COOKIE, hv);
     }
 }
@@ -306,13 +285,10 @@ impl AppState {
         };
         let parsed: Value = serde_json::from_str(&raw)
             .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "management_state_corrupt"))?;
-        let valid = parsed.get("salt").and_then(|v| v.as_str()).is_some()
-            && parsed.get("hash").and_then(|v| v.as_str()).is_some()
-            && parsed
-                .get("session_secret")
-                .and_then(|v| v.as_str())
-                .is_some();
-        if !valid {
+        let argon = parsed.get("phc").and_then(|v| v.as_str()).is_some();
+        let legacy = parsed.get("salt").and_then(|v| v.as_str()).is_some()
+            && parsed.get("hash").and_then(|v| v.as_str()).is_some();
+        if !argon && !legacy {
             return Err(AppError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "management_state_corrupt",
@@ -321,46 +297,109 @@ impl AppState {
         Ok(Some(parsed))
     }
 
-    fn session_signing_key(&self) -> Result<String, AppError> {
-        if !self.env_mgmt_key.is_empty() {
-            return Ok(self.env_mgmt_key.clone());
+    fn env_phc(&self) -> Option<&str> {
+        if self.env_mgmt_key.is_empty() {
+            return None;
         }
-        Ok(self
-            .load_runtime_mgmt()?
-            .and_then(|rt| rt.get("session_secret").and_then(|v| v.as_str()).map(String::from))
-            .unwrap_or_default())
+        Some(
+            self.env_mgmt_phc
+                .get_or_init(|| auth_core::hash_argon2id(&self.env_mgmt_key).unwrap_or_default())
+                .as_str(),
+        )
     }
 
-    fn verify_mgmt_secret(&self, candidate: &str) -> Result<bool, AppError> {
+    /// Argon2id verification (constant-time inside the KDF). Env `MANAGEMENT_KEY` wins; otherwise the
+    /// runtime state is used (Argon2id PHC, or a legacy PBKDF2 row that is upgraded on first sign-in).
+    pub fn verify_mgmt_secret(&self, candidate: &str) -> Result<bool, AppError> {
         if candidate.is_empty() {
             return Ok(false);
         }
-        if !self.env_mgmt_key.is_empty() {
-            return Ok(ct_eq_str(candidate, &self.env_mgmt_key));
+        if let Some(phc) = self.env_phc() {
+            return Ok(!phc.is_empty() && auth_core::verify_argon2id(candidate, phc));
         }
         let Some(rt) = self.load_runtime_mgmt()? else {
             return Ok(false);
         };
+        if let Some(phc) = rt.get("phc").and_then(|v| v.as_str()) {
+            return Ok(auth_core::verify_argon2id(candidate, phc));
+        }
         let salt = rt.get("salt").and_then(|v| v.as_str()).unwrap_or("");
         let hash = rt.get("hash").and_then(|v| v.as_str()).unwrap_or("");
-        let digest = pbkdf2_hex(candidate, salt);
-        Ok(ct_eq_str(&digest, hash))
+        Ok(ct_eq_str(&pbkdf2_hex(candidate, salt), hash))
+    }
+
+    /// Re-hash a legacy PBKDF2 runtime key as Argon2id after a successful sign-in (best effort).
+    fn upgrade_legacy_mgmt(&self, candidate: &str) {
+        if !self.env_mgmt_key.is_empty() {
+            return;
+        }
+        let Ok(Some(rt)) = self.load_runtime_mgmt() else {
+            return;
+        };
+        if rt.get("phc").is_some() {
+            return;
+        }
+        let Ok(phc) = auth_core::hash_argon2id(candidate) else {
+            return;
+        };
+        let prefix = rt.get("prefix").cloned().unwrap_or(Value::Null);
+        let created = rt.get("created_at").cloned().unwrap_or(Value::Null);
+        let state_obj = json!({ "algo": "argon2id", "phc": phc, "prefix": prefix, "created_at": created });
+        let _ = store::with_write_tx(&self.path, |db| -> Result<(), rusqlite::Error> {
+            db.execute(
+                "INSERT INTO runtime_settings(organization_id, key, value) VALUES (?1, '__mgmt_state', ?2)
+                 ON CONFLICT(organization_id, key) DO UPDATE SET value=excluded.value",
+                params![self.org, state_obj.to_string()],
+            )?;
+            Ok(())
+        });
+    }
+
+    fn connector_revoked(&self, db: &rusqlite::Connection) -> bool {
+        db.query_row(
+            "SELECT value FROM runtime_settings WHERE organization_id=?1 AND key='__connector_revoked'",
+            params![self.org],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    }
+
+    fn session_epoch(&self) -> i64 {
+        store::connect_readonly(&self.path)
+            .map(|db| auth_core::current_epoch(&db, &self.org))
+            .unwrap_or(1)
     }
 
     fn mgmt_inventory(&self) -> Result<Value, AppError> {
+        let epoch = self.session_epoch();
+        let mut auth_methods = vec!["management_key"];
+        if self.oidc.is_active() {
+            auth_methods.push("oidc");
+        }
+        let common = |v: Value| -> Value {
+            let mut v = v;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("hash_algo".into(), json!("argon2id"));
+                obj.insert("session_epoch".into(), json!(epoch));
+                obj.insert("oidc_enabled".into(), json!(self.oidc.is_active()));
+                obj.insert("auth_methods".into(), json!(auth_methods));
+            }
+            v
+        };
         if !self.env_mgmt_key.is_empty() {
             let pfx = if self.env_mgmt_key.len() > 8 {
                 format!("{}…", &self.env_mgmt_key[..8])
             } else {
                 "env_****".to_string()
             };
-            return Ok(json!({
+            return Ok(common(json!({
                 "configured": true,
                 "prefix": pfx,
                 "source": "environment",
                 "rotatable": false,
                 "bootstrap_ignored": false,
-            }));
+            })));
         }
         if let Some(rt) = self.load_runtime_mgmt()? {
             let p_raw = rt.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
@@ -370,22 +409,22 @@ impl AppState {
             } else {
                 "care_mgmt…".to_string()
             };
-            return Ok(json!({
+            return Ok(common(json!({
                 "configured": true,
                 "prefix": pfx,
                 "created_at": rt.get("created_at").cloned().unwrap_or(Value::Null),
                 "source": "runtime",
                 "rotatable": true,
                 "bootstrap_ignored": !self.bootstrap_mgmt_key.is_empty(),
-            }));
+            })));
         }
-        Ok(json!({
+        Ok(common(json!({
             "configured": false,
             "prefix": "",
             "source": "none",
             "rotatable": true,
             "bootstrap_ignored": false,
-        }))
+        })))
     }
 
     fn current_settings(&self) -> Result<settings::LoadedSettings, AppError> {
@@ -393,7 +432,9 @@ impl AppState {
         Ok(settings::load(&db, &self.org, &self.env_map))
     }
 
-    fn public_base(&self, headers: &HeaderMap, uri: &Uri) -> Result<String, AppError> {
+    /// Public origin for redirects. `X-Forwarded-Host` is deliberately NOT trusted; the validated
+    /// `Host` header (host gate) or `PUBLIC_BASE_URL` decides.
+    pub fn public_base(&self, headers: &HeaderMap, uri: &Uri) -> Result<String, AppError> {
         let cfg = self.current_settings()?;
         if !cfg.public_base_url.is_empty() {
             return Ok(cfg.public_base_url.trim_end_matches('/').to_string());
@@ -405,21 +446,17 @@ impl AppState {
             .or_else(|| uri.scheme_str())
             .unwrap_or("http")
             .trim();
-        let host = header_str(headers, "x-forwarded-host")
-            .split(',')
-            .next()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                let h = header_str(headers, "host");
-                if h.is_empty() { None } else { Some(h) }
-            })
-            .or_else(|| uri.authority().map(|a| a.as_str()))
-            .unwrap_or("localhost")
-            .trim();
+        let host = {
+            let h = header_str(headers, "host");
+            if h.is_empty() { None } else { Some(h) }
+        }
+        .or_else(|| uri.authority().map(|a| a.as_str()))
+        .unwrap_or("localhost")
+        .trim();
         Ok(format!("{proto}://{host}").trim_end_matches('/').to_string())
     }
 
-    fn check_rate(&self, bucket: &str, limit: usize, window_secs: u64) -> Result<(), AppError> {
+    pub fn check_rate(&self, bucket: &str, limit: usize, window_secs: u64) -> Result<(), AppError> {
         let now = Instant::now();
         let mut map = self.attempts.lock().unwrap();
         let items = map.entry(bucket.to_string()).or_default();
@@ -434,65 +471,212 @@ impl AppState {
         Ok(())
     }
 
+    /// Failure-only limiter: peek without recording.
+    fn rate_exceeded(&self, bucket: &str, limit: usize, window_secs: u64) -> bool {
+        let now = Instant::now();
+        let mut map = self.attempts.lock().unwrap();
+        let items = map.entry(bucket.to_string()).or_default();
+        items.retain(|t| now.duration_since(*t).as_secs() < window_secs);
+        items.len() >= limit
+    }
+
+    fn rate_record(&self, bucket: &str) {
+        self.attempts
+            .lock()
+            .unwrap()
+            .entry(bucket.to_string())
+            .or_default()
+            .push(Instant::now());
+    }
+
+    pub fn cookie_secure(&self, headers: &HeaderMap, uri: &Uri) -> bool {
+        match self.cookie_secure_mode {
+            Some(v) => v,
+            None => is_https(headers, uri),
+        }
+    }
+
+    /// Client address for rate limits/audit. Forwarded headers are honoured only from trusted proxies.
+    pub fn client_ip(&self, peer: Option<IpAddr>, headers: &HeaderMap) -> String {
+        let xff_first = header_str(headers, "x-forwarded-for")
+            .split(',')
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        match peer {
+            Some(p) => {
+                let p_s = p.to_string();
+                let trusted =
+                    p.is_loopback() || self.trusted_proxies.iter().any(|t| t == "*" || *t == p_s);
+                if trusted {
+                    xff_first.unwrap_or(p_s)
+                } else {
+                    p_s
+                }
+            }
+            None => xff_first.unwrap_or_else(|| "local".to_string()),
+        }
+    }
+
+    fn csrf_allowed_hosts(&self, headers: &HeaderMap) -> Vec<String> {
+        let mut hosts = vec![auth_core::host_only(header_str(headers, "host"))];
+        if let Ok(cfg) = self.current_settings() {
+            if let Some(h) = auth_core::url_host(&cfg.public_base_url) {
+                hosts.push(h);
+            }
+        }
+        if let Some(h) = auth_core::url_host(&self.public_base_env) {
+            hosts.push(h);
+        }
+        if let Some(h) = auth_core::url_host(&self.oidc.redirect_uri) {
+            hosts.push(h);
+        }
+        hosts.retain(|h| !h.is_empty());
+        hosts
+    }
+
+    pub fn session_from_headers(
+        &self,
+        headers: &HeaderMap,
+        touch: bool,
+    ) -> Option<auth_core::SessionInfo> {
+        let token = auth_core::cookie_value(headers, auth_core::SESSION_COOKIE)?;
+        let db = store::connect(&self.path).ok()?;
+        auth_core::lookup_session(
+            &db,
+            &self.org,
+            &token,
+            now_unix(),
+            touch,
+            self.session_idle_secs,
+        )
+    }
+
+    /// Per-session CSRF token: HMAC-SHA256(HKDF `csrf` subkey, session digest). JS-memory only.
+    pub fn csrf_token_for(&self, sess: &auth_core::SessionInfo) -> String {
+        auth_core::hmac_hex_bytes(&self.vault.derive_key("csrf"), sess.token_hash.as_bytes())
+    }
+
+    /// Mints a server-side session and returns `(Set-Cookie header value, csrf token)`.
+    pub fn start_session(
+        &self,
+        headers: &HeaderMap,
+        uri: &Uri,
+        auth_method: &str,
+        username: &str,
+    ) -> Result<(String, String), AppError> {
+        let token = store::with_write_tx(&self.path, |db| {
+            auth_core::create_session(
+                db,
+                &self.org,
+                auth_method,
+                username,
+                now_unix(),
+                self.session_idle_secs,
+                self.session_max_secs,
+            )
+        })?;
+        let csrf = auth_core::hmac_hex_bytes(
+            &self.vault.derive_key("csrf"),
+            auth_core::sha256_hex(&token).as_bytes(),
+        );
+        Ok((
+            auth_core::cookie_header(
+                auth_core::SESSION_COOKIE,
+                &token,
+                "/",
+                self.session_max_secs,
+                self.cookie_secure(headers, uri),
+            ),
+            csrf,
+        ))
+    }
+
+    pub fn mgmt_configured(&self) -> bool {
+        !self.env_mgmt_key.is_empty()
+            || self
+                .load_runtime_mgmt()
+                .map(|rt| rt.is_some())
+                .unwrap_or(false)
+    }
+
+    pub fn check_copy_rate(&self, peer: Option<IpAddr>, headers: &HeaderMap) -> Result<(), AppError> {
+        let ip = self.client_ip(peer, headers);
+        self.check_rate(&format!("copy:{ip}"), 15, 300)
+            .map_err(|_| AppError::new(StatusCode::TOO_MANY_REQUESTS, "copy_rate_limited"))
+    }
+
+    fn api_key_pepper(&self) -> [u8; 32] {
+        self.vault.derive_key("api-key-pepper")
+    }
+
     fn verify_api_key(&self, token: &str) -> Result<Option<String>, AppError> {
         let tok = token.trim();
         if tok.is_empty() {
             return Ok(None);
-        }
-        if self.verify_mgmt_secret(tok)? {
-            return Ok(Some("mgmt".to_string()));
         }
         for (idx, ek) in self.env_api_keys.iter().enumerate() {
             if ct_eq_str(tok, ek) {
                 return Ok(Some(format!("env:{idx}")));
             }
         }
-        let key_hash = hex::encode(Sha256::digest(tok.as_bytes()));
+        let legacy = hex::encode(Sha256::digest(tok.as_bytes()));
+        let digest = auth_core::api_key_digest(&self.api_key_pepper(), tok);
         let db = store::connect_readonly(&self.path)?;
         let row: Option<(i64, String)> = db
             .query_row(
-                "SELECT id, status FROM api_keys WHERE organization_id=?1 AND key_hash=?2",
-                params![self.org, key_hash],
+                "SELECT id, status FROM api_keys WHERE organization_id=?1 AND key_hash IN (?2, ?3)",
+                params![self.org, legacy, digest],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok();
         if let Some((id, status)) = row {
             if status == "enabled" {
+                let now = now_unix();
+                if let Ok(w) = store::connect(&self.path) {
+                    let _ = w.execute(
+                        "UPDATE api_keys SET last_used_at=?1 WHERE id=?2 AND last_used_at < ?1 - 60",
+                        params![now, id],
+                    );
+                }
                 return Ok(Some(format!("key:{id}")));
             }
         }
         Ok(None)
     }
 
-    fn require_admin(&self, method: &Method, headers: &HeaderMap) -> Result<String, AppError> {
-        let sig_key = self.session_signing_key()?;
-        let cookies = parse_cookies(headers);
-        let session_hash = verify_session_cookie(&sig_key, cookies.get("lnc_care_session").map(|s| s.as_str()))
+    /// Admin session gate. Unsafe methods additionally need the per-session `X-CSRF-Token`
+    /// and a same-origin `Origin`/`Referer`/`Sec-Fetch-Site` (spoofed `X-Forwarded-Host` is ignored).
+    pub fn require_admin(&self, method: &Method, headers: &HeaderMap) -> Result<String, AppError> {
+        let sess = self
+            .session_from_headers(headers, true)
             .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, "Authentication required"))?;
         if matches!(
             *method,
             Method::POST | Method::PUT | Method::PATCH | Method::DELETE
         ) {
-            let csrf_cookie = cookies.get("lnc_care_csrf").map(|s| s.as_str()).unwrap_or("");
-            let csrf_header = header_str(headers, "x-csrf-token");
-            if csrf_cookie.is_empty() || !ct_eq_str(csrf_cookie, csrf_header) {
+            if auth_core::origin_verdict(headers, &self.csrf_allowed_hosts(headers))
+                == OriginVerdict::CrossOrigin
+            {
+                return Err(AppError::new(StatusCode::FORBIDDEN, "csrf_origin_mismatch"));
+            }
+            let supplied = header_str(headers, "x-csrf-token");
+            if supplied.is_empty() || !ct_eq_str(supplied, &self.csrf_token_for(&sess)) {
                 return Err(AppError::new(StatusCode::FORBIDDEN, "CSRF token required"));
             }
         }
-        Ok(session_hash)
+        Ok(sess.token_hash)
     }
 
-    fn require_api_or_admin(&self, headers: &HeaderMap, uri: &Uri) -> Result<String, AppError> {
+    fn require_api_or_admin(&self, headers: &HeaderMap, _uri: &Uri) -> Result<String, AppError> {
         let auth = header_str(headers, "authorization");
-        let q = query_map(uri);
         let raw_tok = if auth.len() > 7 && auth[..7].eq_ignore_ascii_case("bearer ") {
             auth[7..].trim().to_string()
         } else if !header_str(headers, "x-api-key").trim().is_empty() {
             header_str(headers, "x-api-key").trim().to_string()
         } else if !header_str(headers, "x-token").trim().is_empty() {
             header_str(headers, "x-token").trim().to_string()
-        } else if let Some(t) = q.get("token").filter(|s| !s.trim().is_empty()) {
-            t.trim().to_string()
         } else {
             String::new()
         };
@@ -507,9 +691,8 @@ impl AppState {
             ));
         }
 
-        let sig_key = self.session_signing_key()?;
-        let cookies = parse_cookies(headers);
-        verify_session_cookie(&sig_key, cookies.get("lnc_care_session").map(|s| s.as_str()))
+        self.session_from_headers(headers, true)
+            .map(|s| s.token_hash)
             .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, "Authentication required"))
     }
 
@@ -585,6 +768,7 @@ impl AppState {
             .unwrap_or(false);
         json!({
             "connector_bearer": {
+                "copy_available": self.bearer.is_empty() && has_ui_bearer,
                 "configured": !self.bearer.is_empty() || has_ui_bearer,
                 "source": if !self.bearer.is_empty() {
                     "environment"
@@ -595,6 +779,7 @@ impl AppState {
                 },
             },
             "delegation_secret": {
+                "copy_available": self.del_secret.is_empty() && has_ui_secret,
                 "configured": !self.del_secret.is_empty() || has_ui_secret,
                 "source": if !self.del_secret.is_empty() {
                     "environment"
@@ -610,7 +795,7 @@ impl AppState {
     fn keys_inventory_payload(&self, db: &rusqlite::Connection) -> Result<Value, AppError> {
         let rows = query_maps(
             db,
-            "SELECT id, label, prefix, status, created_at FROM api_keys WHERE organization_id=? ORDER BY id DESC",
+            "SELECT id, label, prefix, last4, status, created_at, last_used_at FROM api_keys WHERE organization_id=? ORDER BY id DESC",
             &[self.org.clone().into()],
         );
         let mut items = Vec::new();
@@ -620,10 +805,13 @@ impl AppState {
                 "id": format!("env-{}", idx + 1),
                 "label": format!("LNC_API_KEYS #{}", idx + 1),
                 "prefix": pfx,
+                "last4": auth_core::last4(ek),
                 "status": "enabled",
                 "enabled": true,
                 "created_at": self.boot_ts,
+                "last_used_at": Value::Null,
                 "copy_available": false,
+                "env_managed": true,
                 "source": "environment",
             }));
         }
@@ -638,14 +826,18 @@ impl AppState {
             } else {
                 false
             };
+            let last_used = r.get("last_used_at").and_then(|v| v.as_i64()).unwrap_or(0);
             items.push(json!({
                 "id": id_val,
                 "label": r.get("label").cloned().unwrap_or(Value::String(String::new())),
                 "prefix": r.get("prefix").cloned().unwrap_or(Value::String(String::new())),
+                "last4": r.get("last4").cloned().unwrap_or(Value::String(String::new())),
                 "status": status_str,
                 "enabled": status_str == "enabled",
                 "created_at": r.get("created_at").cloned().unwrap_or(Value::Number(0.into())),
+                "last_used_at": if last_used > 0 { json!(last_used) } else { Value::Null },
                 "copy_available": has_copy,
+                "env_managed": false,
                 "source": "runtime",
             }));
         }
@@ -712,6 +904,45 @@ async fn host_gate_mw(State(state): State<Arc<AppState>>, req: Request, next: Ne
         }
     }
     next.run(req).await
+}
+
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
+fn apply_security_headers(h: &mut HeaderMap, path: &str) {
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("same-origin"),
+    );
+    let asset = [".svg", ".png", ".ico"].iter().any(|ext| path.ends_with(ext));
+    if !asset {
+        h.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, private"),
+        );
+    }
+}
+
+/// Baseline security headers on every response + refusal of secrets in query strings.
+async fn security_mw(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    if path != "/webhooks/meta" && query_has_secret_param(req.uri()) {
+        let mut resp = (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "detail": "query_secret_forbidden", "error": "query_secret_forbidden" })),
+        )
+            .into_response();
+        apply_security_headers(resp.headers_mut(), &path);
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    apply_security_headers(resp.headers_mut(), &path);
+    resp
 }
 
 fn serve_static_file(dir: &StdPath, filename: &str, content_type: &'static str) -> Response {
@@ -872,14 +1103,13 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
                 )
                 .ok();
             if exists.is_none() {
-                let salt = random_hex(16);
-                let digest = pbkdf2_hex(&bootstrap_mgmt_key, &salt);
+                let phc = auth_core::hash_argon2id(&bootstrap_mgmt_key)
+                    .map_err(|e| format!("management key hash failed: {e}"))?;
                 let pfx: String = bootstrap_mgmt_key.chars().take(12).collect();
                 let state_obj = json!({
-                    "salt": salt,
-                    "hash": digest,
+                    "algo": "argon2id",
+                    "phc": phc,
                     "prefix": pfx,
-                    "session_secret": random_urlsafe(32),
                     "created_at": now_unix(),
                 });
                 db.execute(
@@ -957,6 +1187,50 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
         }
     }
 
+    let cookie_secure_mode = match env_map
+        .get("COOKIE_SECURE")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("true" | "1" | "yes") => Some(true),
+        Some("false" | "0" | "no") => Some(false),
+        _ => None,
+    };
+    let trusted_proxies: Vec<String> = env_map
+        .get("FORWARDED_ALLOW_IPS")
+        .map(|s| s.as_str())
+        .unwrap_or("10.21.0.3")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let ttl = |key: &str, default: i64, min: i64, max: i64| -> i64 {
+        env_map
+            .get(key)
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map(|v| v.clamp(min, max))
+            .unwrap_or(default)
+    };
+    let session_idle_secs = ttl(
+        "SESSION_IDLE_TTL_SECONDS",
+        auth_core::SESSION_IDLE_SECS,
+        300,
+        7 * 24 * 3600,
+    );
+    let session_max_secs = ttl(
+        "SESSION_MAX_TTL_SECONDS",
+        auth_core::SESSION_MAX_SECS,
+        600,
+        30 * 24 * 3600,
+    )
+    .max(session_idle_secs);
+    let oidc_cfg = OidcConfig::from_env(&env_map);
+    let public_base_env = env_first(&env_map, &["PUBLIC_BASE_URL"]);
+    let oidc_transport: SharedTransport = cfg
+        .transport
+        .clone()
+        .unwrap_or_else(UreqTransport::shared);
+
     let state = Arc::new(AppState {
         path,
         public_dir,
@@ -980,6 +1254,15 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
         env_map,
         local_hosts,
         attempts: Arc::new(Mutex::new(HashMap::new())),
+        oidc: oidc_cfg,
+        oidc_cache: Arc::new(Mutex::new(OidcCache::default())),
+        transport: oidc_transport,
+        cookie_secure_mode,
+        public_base_env,
+        trusted_proxies,
+        env_mgmt_phc: Arc::new(OnceLock::new()),
+        session_idle_secs,
+        session_max_secs,
     });
 
     let router = Router::new()
@@ -991,7 +1274,9 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
         .route("/api/app-info", get(app_info_handler))
         .route("/api/auth/status", get(auth_status_handler))
         .route("/api/auth/login", post(login_handler))
-        .route("/api/auth/logout", get(logout_handler).post(logout_handler))
+        .route("/api/auth/logout", post(logout_handler))
+        .route("/api/auth/oidc/login", get(oidc::oidc_login))
+        .route("/api/auth/oidc/callback", get(oidc::oidc_callback))
         .route("/api/auth/sso/redirect", get(sso_redirect_handler))
         .route("/api/auth/sso/consume", get(sso_consume_handler))
         .route(
@@ -1198,11 +1483,38 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
             post(revoke_api_key_handler),
         )
         .route("/api/mgmt/rotate", post(rotate_mgmt_key_handler))
+        .route("/api/mgmt/revoke-sessions", post(revoke_sessions_handler))
+        .route("/api/keys/:key_id/rotate", post(rotate_api_key_handler))
+        .route(
+            "/api/admin/credentials/inference/:key_id/rotate",
+            post(rotate_api_key_handler),
+        )
         .route(
             "/api/admin/credentials/management/rotate",
             post(rotate_mgmt_key_handler),
         )
         .route("/api/admin/connector", get(connector_info_handler))
+        .route("/api/mcp-connectors", get(connector_info_handler))
+        .route(
+            "/api/mcp-connectors/inbound-mcp",
+            axum::routing::delete(inbound_clear_handler),
+        )
+        .route(
+            "/api/mcp-connectors/inbound-mcp/copy",
+            post(inbound_copy_handler),
+        )
+        .route(
+            "/api/mcp-connectors/inbound-mcp/rotate",
+            post(inbound_rotate_handler),
+        )
+        .route(
+            "/api/mcp-connectors/inbound-mcp/revoke",
+            post(inbound_revoke_handler),
+        )
+        .route(
+            "/api/mcp-connectors/inbound-mcp/test",
+            post(inbound_test_handler),
+        )
         .route("/api/admin/audit", get(get_audit_handler))
         .route("/api/admin/audit/verify", get(verify_audit_handler))
         .route(
@@ -1222,9 +1534,14 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
         .route("/admin/style.css", get(style_css_handler))
         .route("/app.js", get(app_js_handler))
         .route("/admin/app.js", get(app_js_handler))
+        .route("/theme-init.js", get(theme_init_js_handler))
+        .route("/admin/theme-init.js", get(theme_init_js_handler))
+        .route("/login.js", get(login_js_handler))
+        .route("/admin/login.js", get(login_js_handler))
         .route("/mcp", any(connector_mcp_handler))
         .route("/mcp/", any(connector_mcp_handler))
         .layer(middleware::from_fn_with_state(state.clone(), host_gate_mw))
+        .layer(middleware::from_fn(security_mw))
         .with_state(state);
 
     Ok(router)
@@ -1411,57 +1728,77 @@ async fn auth_status_handler(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
-    let sig_key = st.session_signing_key()?;
-    let cookies = parse_cookies(&headers);
-    let authenticated =
-        verify_session_cookie(&sig_key, cookies.get("lnc_care_session").map(|s| s.as_str()))
-            .is_some();
-    let csrf_val = if authenticated {
-        cookies.get("lnc_care_csrf").cloned().unwrap_or_default()
-    } else {
-        String::new()
-    };
-    Ok(Json(json!({
+    let sess = st.session_from_headers(&headers, true);
+    let authenticated = sess.is_some();
+    let mut body = json!({
         "ok": authenticated,
         "authenticated": authenticated,
         "service": st.audience,
         "version": crate::VERSION,
-        "csrf": csrf_val,
-        "csrf_token": csrf_val,
-    })))
+        "oidc_enabled": st.oidc.is_active(),
+        "management_configured": st.mgmt_configured(),
+        "auth_method": sess.as_ref().map(|s| s.auth_method.clone()),
+        "username": sess.as_ref().map(|s| s.username.clone()),
+    });
+    if let Some(s) = &sess {
+        let csrf = st.csrf_token_for(s);
+        body["csrf_token"] = json!(csrf);
+        body["csrf"] = json!(csrf);
+    }
+    Ok(Json(body))
 }
 
 async fn login_handler(
     State(st): State<Arc<AppState>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     uri: Uri,
     raw_body: Bytes,
 ) -> Result<Response, AppError> {
-    let client_ip = header_str(&headers, "x-forwarded-for")
-        .split(',')
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("local");
-    st.check_rate(&format!("login:{client_ip}"), 8, 300)?;
+    let ip = st.client_ip(peer.as_ref().map(|p| p.0 .0.ip()), &headers);
+    let bucket = format!("login_fail:{ip}");
+    // Pre-hash limiter: 8 failures / 5 min / IP -> 429 before any Argon2id work.
+    if st.rate_exceeded(&bucket, 8, 300) {
+        return Err(AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded",
+        ));
+    }
     let body = parse_json_body(&raw_body)?;
     let key = body
         .get("key")
         .or_else(|| body.get("token"))
         .or_else(|| body.get("password"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !st.verify_mgmt_secret(key)? {
+        .unwrap_or("")
+        .to_string();
+    let st2 = st.clone();
+    let key2 = key.clone();
+    let ok = tokio::task::spawn_blocking(move || st2.verify_mgmt_secret(&key2))
+        .await
+        .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "auth_worker_failed"))??;
+    if !ok {
+        st.rate_record(&bucket);
         return Err(AppError::new(
             StatusCode::UNAUTHORIZED,
             "Invalid management key",
         ));
     }
-    let sig_key = st.session_signing_key()?;
-    let mut resp_headers = HeaderMap::new();
-    let csrf = append_admin_cookies(&mut resp_headers, &sig_key, is_https(&headers, &uri));
+    {
+        let st3 = st.clone();
+        let key3 = key.clone();
+        let _ = tokio::task::spawn_blocking(move || st3.upgrade_legacy_mgmt(&key3)).await;
+    }
+    let (cookie, csrf) = st.start_session(&headers, &uri, "management_key", "owner")?;
     store::with_write_tx(&st.path, |db| {
-        audit::append(db, &st.org, "owner", "auth.login", "admin_session", &json!({}))
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            "auth.login",
+            "admin_session",
+            &json!({ "method": "management_key", "ip": ip }),
+        )
     })?;
     let mut resp = Json(json!({
         "ok": true,
@@ -1470,26 +1807,50 @@ async fn login_handler(
         "csrf_token": csrf,
     }))
     .into_response();
-    for (k, v) in resp_headers.iter() {
-        resp.headers_mut().append(k.clone(), v.clone());
-    }
+    append_session_cookie(resp.headers_mut(), &cookie);
     Ok(resp)
 }
 
 async fn logout_handler(
     State(st): State<Arc<AppState>>,
-    method: Method,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Result<Response, AppError> {
-    if method == Method::POST {
-        st.require_admin(&method, &headers)?;
+    // Local-only sign-out: clears this app's session; never calls the IdP end_session_endpoint.
+    let verdict = auth_core::origin_verdict(&headers, &st.csrf_allowed_hosts(&headers));
+    if verdict == OriginVerdict::CrossOrigin {
+        return Err(AppError::new(StatusCode::FORBIDDEN, "csrf_origin_mismatch"));
     }
-    let mut resp = if method == Method::GET {
-        redirect_303("/login.html")
-    } else {
-        Json(json!({ "ok": true })).into_response()
-    };
-    append_delete_cookies(resp.headers_mut());
+    let sess = st.session_from_headers(&headers, false);
+    let csrf_ok = sess
+        .as_ref()
+        .map(|s| {
+            let supplied = header_str(&headers, "x-csrf-token");
+            !supplied.is_empty() && ct_eq_str(supplied, &st.csrf_token_for(s))
+        })
+        .unwrap_or(false);
+    if verdict != OriginVerdict::SameOrigin && !csrf_ok {
+        return Err(AppError::new(StatusCode::FORBIDDEN, "csrf_origin_mismatch"));
+    }
+    if let (Some(token), Some(s)) = (
+        auth_core::cookie_value(&headers, auth_core::SESSION_COOKIE),
+        sess.as_ref(),
+    ) {
+        let _ = store::with_write_tx(&st.path, |db| -> Result<(), rusqlite::Error> {
+            auth_core::delete_session_by_token(db, &token);
+            let _ = audit::append(
+                db,
+                &st.org,
+                &s.username,
+                "auth.logout",
+                "admin_session",
+                &json!({ "method": s.auth_method, "local_only": true }),
+            );
+            Ok(())
+        });
+    }
+    let mut resp = Json(json!({ "ok": true, "local_only": true })).into_response();
+    append_delete_cookies(resp.headers_mut(), st.cookie_secure(&headers, &uri));
     Ok(resp)
 }
 
@@ -1585,8 +1946,7 @@ async fn sso_consume_handler(
     uri: Uri,
 ) -> Result<Response, AppError> {
     st.check_rate("sso_consume:local", 20, 60)?;
-    let sig_key = st.session_signing_key()?;
-    if sig_key.is_empty() {
+    if !st.mgmt_configured() && !st.oidc.is_active() {
         return Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "management_key_not_configured",
@@ -1625,8 +1985,9 @@ async fn sso_consume_handler(
     let safe_dest =
         internal_bridge::safe_relative_next(q.get("next").map(|s| s.as_str()), "/admin/#inbox");
     let mut resp = redirect_303(&safe_dest);
-    append_admin_cookies(resp.headers_mut(), &sig_key, is_https(&headers, &uri));
     let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("owner");
+    let (sso_cookie, _) = st.start_session(&headers, &uri, "sso_ticket", sub)?;
+    append_session_cookie(resp.headers_mut(), &sso_cookie);
     let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or(via);
     store::with_write_tx(&st.path, |db| {
         audit::append(
@@ -2115,9 +2476,9 @@ async fn oauth_callback_handler(
     headers: HeaderMap,
     uri: Uri,
 ) -> Result<Response, AppError> {
-    let sig_key = st.session_signing_key()?;
-    let cookies = parse_cookies(&headers);
-    let session_hash = verify_session_cookie(&sig_key, cookies.get("lnc_care_session").map(|s| s.as_str()))
+    let session_hash = st
+        .session_from_headers(&headers, true)
+        .map(|s| s.token_hash)
         .ok_or_else(|| AppError::new(StatusCode::UNAUTHORIZED, "Authentication required"))?;
     let q = query_map(&uri);
     let state_param = q.get("state").map(|s| s.as_str()).unwrap_or("");
@@ -4174,6 +4535,7 @@ async fn create_api_key_handler(
     let custom = body
         .get("secret")
         .or_else(|| body.get("custom"))
+        .or_else(|| body.get("custom_secret"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim();
@@ -4189,7 +4551,9 @@ async fn create_api_key_handler(
         format!("care_{}", random_urlsafe(24))
     };
     let prefix: String = raw_key.chars().take(12).collect();
-    let key_hash = hex::encode(Sha256::digest(raw_key.as_bytes()));
+    let last4 = auth_core::last4(&raw_key);
+    // Dual persistence: HMAC-SHA256(pepper) auth digest here, AES-256-GCM copy envelope in the vault.
+    let key_hash = auth_core::api_key_digest(&st.api_key_pepper(), &raw_key);
     let now = now_unix();
 
     let key_id = store::with_write_tx(&st.path, |db| -> Result<i64, AppError> {
@@ -4207,9 +4571,9 @@ async fn create_api_key_handler(
             ));
         }
         db.execute(
-            "INSERT INTO api_keys (organization_id, label, prefix, key_hash, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'enabled', ?5)",
-            params![st.org, label, prefix, key_hash, now],
+            "INSERT INTO api_keys (organization_id, label, prefix, last4, key_hash, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'enabled', ?6)",
+            params![st.org, label, prefix, last4, key_hash, now],
         )?;
         let kid = db.last_insert_rowid();
         if st.vault.ready {
@@ -4228,16 +4592,20 @@ async fn create_api_key_handler(
     })?;
 
     Ok(Json(json!({
+        "ok": true,
         "key": raw_key,
         "secret": raw_key,
         "item": {
             "id": key_id,
             "label": label,
             "prefix": prefix,
+            "last4": last4,
             "status": "enabled",
             "enabled": true,
             "created_at": now,
+            "last_used_at": Value::Null,
             "copy_available": st.vault.ready,
+            "env_managed": false,
             "source": "runtime",
         }
     })))
@@ -4245,11 +4613,13 @@ async fn create_api_key_handler(
 
 async fn copy_api_key_handler(
     State(st): State<Arc<AppState>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path(key_id): Path<i64>,
     method: Method,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     st.require_admin(&method, &headers)?;
+    st.check_copy_rate(peer.as_ref().map(|p| p.0 .0.ip()), &headers)?;
     let res = store::with_write_tx(&st.path, |db| -> Result<Value, AppError> {
         let row: Option<(String, String)> = db
             .query_row(
@@ -4279,19 +4649,99 @@ async fn copy_api_key_handler(
             .as_ref()
             .and_then(|s| s.get("secret").and_then(|v| v.as_str()))
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| AppError::new(StatusCode::CONFLICT, "Secret is not stored for copy"))?
+            .ok_or_else(|| {
+                AppError::new(StatusCode::CONFLICT, "copy_unavailable_rotate_required")
+            })?
             .to_string();
         audit::append(
             db,
             &st.org,
             "owner",
-            "api_key.copied",
+            "secret.copy",
             &key_id.to_string(),
-            &json!({ "label": label }),
+            &json!({ "kind": "api_key", "label": label }),
         )?;
-        Ok(json!({ "key": sec_str, "secret": sec_str }))
+        Ok(json!({ "ok": true, "key": sec_str, "secret": sec_str, "copied_field": "api_key" }))
     })?;
     Ok(Json(res))
+}
+
+async fn rotate_api_key_handler(
+    State(st): State<Arc<AppState>>,
+    Path(key_id): Path<i64>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let body = parse_json_body(&raw_body)?;
+    let custom = body
+        .get("secret")
+        .or_else(|| body.get("custom_secret"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let raw_key = if !custom.is_empty() {
+        if custom.len() < 24 {
+            return Err(AppError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Custom secret must be at least 24 characters",
+            ));
+        }
+        custom
+    } else {
+        format!("care_{}", random_urlsafe(24))
+    };
+    let prefix: String = raw_key.chars().take(12).collect();
+    let last4 = auth_core::last4(&raw_key);
+    let key_hash = auth_core::api_key_digest(&st.api_key_pepper(), &raw_key);
+    let label = store::with_write_tx(&st.path, |db| -> Result<String, AppError> {
+        let (label, status): (String, String) = db
+            .query_row(
+                "SELECT label, status FROM api_keys WHERE organization_id=?1 AND id=?2",
+                params![st.org, key_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| AppError::new(StatusCode::NOT_FOUND, "API key not found"))?;
+        if status == "revoked" {
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                "revoked_key_cannot_rotate",
+            ));
+        }
+        db.execute(
+            "UPDATE api_keys SET prefix=?1, last4=?2, key_hash=?3 WHERE organization_id=?4 AND id=?5",
+            params![prefix, last4, key_hash, st.org, key_id],
+        )?;
+        st.vault
+            .put(db, &st.org, "api_key", &key_id.to_string(), &json!({ "secret": raw_key }))?;
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            "api_key.rotated",
+            &key_id.to_string(),
+            &json!({ "prefix": prefix }),
+        )?;
+        Ok(label)
+    })?;
+    Ok(Json(json!({
+        "ok": true,
+        "key": raw_key,
+        "secret": raw_key,
+        "item": {
+            "id": key_id,
+            "label": label,
+            "prefix": prefix,
+            "last4": last4,
+            "status": "enabled",
+            "enabled": true,
+            "copy_available": true,
+            "env_managed": false,
+            "source": "runtime",
+        }
+    })))
 }
 
 async fn rename_api_key_handler(
@@ -4447,19 +4897,17 @@ async fn delete_api_key_handler(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     st.require_admin(&method, &headers)?;
+    // Remove works directly on active, disabled or revoked keys (modal-confirmed in the UI).
     store::with_write_tx(&st.path, |db| -> Result<(), AppError> {
-        let status: String = db
+        let exists = db
             .query_row(
-                "SELECT status FROM api_keys WHERE organization_id=?1 AND id=?2",
+                "SELECT id FROM api_keys WHERE organization_id=?1 AND id=?2",
                 params![st.org, key_id],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0),
             )
-            .map_err(|_| AppError::new(StatusCode::NOT_FOUND, "API key not found"))?;
-        if status != "revoked" {
-            return Err(AppError::new(
-                StatusCode::CONFLICT,
-                "Revoke the API key before deleting its record",
-            ));
+            .is_ok();
+        if !exists {
+            return Err(AppError::new(StatusCode::NOT_FOUND, "API key not found"));
         }
         let _ = st.vault.delete(db, &st.org, "api_key", &key_id.to_string());
         db.execute(
@@ -4483,6 +4931,7 @@ async fn rotate_mgmt_key_handler(
     State(st): State<Arc<AppState>>,
     method: Method,
     headers: HeaderMap,
+    uri: Uri,
     raw_body: Bytes,
 ) -> Result<Response, AppError> {
     st.require_admin(&method, &headers)?;
@@ -4497,19 +4946,28 @@ async fn rotate_mgmt_key_handler(
         .get("current_key")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .trim();
+        .trim()
+        .to_string();
     let rt_existing = st.load_runtime_mgmt()?;
-    if rt_existing.is_some() && (current_key.is_empty() || !st.verify_mgmt_secret(current_key)?) {
-        return Err(AppError::new(
-            StatusCode::UNAUTHORIZED,
-            "Current management key is required to confirm rotation",
-        ));
+    if rt_existing.is_some() {
+        let st2 = st.clone();
+        let ck = current_key.clone();
+        let ok = tokio::task::spawn_blocking(move || st2.verify_mgmt_secret(&ck))
+            .await
+            .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "auth_worker_failed"))??;
+        if current_key.is_empty() || !ok {
+            return Err(AppError::new(
+                StatusCode::UNAUTHORIZED,
+                "Current management key is required to confirm rotation",
+            ));
+        }
     }
     let custom = body
         .get("secret")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .trim();
+        .trim()
+        .to_string();
     if !custom.is_empty() && custom.len() < 16 {
         return Err(AppError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -4517,36 +4975,39 @@ async fn rotate_mgmt_key_handler(
         ));
     }
     let new_secret = if !custom.is_empty() {
-        custom.to_string()
+        custom
     } else {
         format!("care_mgmt_{}", random_urlsafe(24))
     };
-    let salt = random_hex(16);
-    let digest = pbkdf2_hex(&new_secret, &salt);
     let pfx12: String = new_secret.chars().take(12).collect();
     let pfx8: String = new_secret.chars().take(8).collect();
+    let ns = new_secret.clone();
+    let phc = tokio::task::spawn_blocking(move || auth_core::hash_argon2id(&ns))
+        .await
+        .map_err(|_| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "auth_worker_failed"))?
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let state_obj = json!({
-        "salt": salt,
-        "hash": digest,
+        "algo": "argon2id",
+        "phc": phc,
         "prefix": pfx12,
-        "session_secret": random_urlsafe(32),
         "created_at": now_unix(),
     });
-    store::with_write_tx(&st.path, |db| -> Result<(), rusqlite::Error> {
+    let epoch = store::with_write_tx(&st.path, |db| -> Result<i64, rusqlite::Error> {
         db.execute(
             "INSERT INTO runtime_settings(organization_id, key, value) VALUES (?1, '__mgmt_state', ?2)
              ON CONFLICT(organization_id, key) DO UPDATE SET value=excluded.value",
             params![st.org, state_obj.to_string()],
         )?;
+        let epoch = auth_core::bump_epoch(db, &st.org)?;
         audit::append(
             db,
             &st.org,
             "owner",
             "mgmt_key.rotated",
             "runtime",
-            &json!({ "prefix": pfx8 }),
+            &json!({ "prefix": pfx8, "session_epoch": epoch }),
         )?;
-        Ok(())
+        Ok(epoch)
     })?;
 
     let mut resp = Json(json!({
@@ -4554,9 +5015,34 @@ async fn rotate_mgmt_key_handler(
         "key": new_secret,
         "prefix": pfx12,
         "source": "runtime",
+        "session_epoch": epoch,
     }))
     .into_response();
-    append_delete_cookies(resp.headers_mut());
+    append_delete_cookies(resp.headers_mut(), st.cookie_secure(&headers, &uri));
+    Ok(resp)
+}
+
+async fn revoke_sessions_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response, AppError> {
+    st.require_admin(&method, &headers)?;
+    let epoch = store::with_write_tx(&st.path, |db| -> Result<i64, rusqlite::Error> {
+        let epoch = auth_core::bump_epoch(db, &st.org)?;
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            "sessions.revoke_all",
+            "*",
+            &json!({ "session_epoch": epoch }),
+        )?;
+        Ok(epoch)
+    })?;
+    let mut resp = Json(json!({ "ok": true, "revoked_all": true, "session_epoch": epoch })).into_response();
+    append_delete_cookies(resp.headers_mut(), st.cookie_secure(&headers, &uri));
     Ok(resp)
 }
 
@@ -4569,9 +5055,9 @@ async fn connector_info_handler(
     st.require_admin(&method, &headers)?;
     let cfg = st.current_settings()?;
     let base = st.public_base(&headers, &uri)?;
-    let p_sec = {
+    let (p_sec, revoked) = {
         let db = store::connect_readonly(&st.path)?;
-        st.pairing_secrets_summary(&db)
+        (st.pairing_secrets_summary(&db), st.connector_revoked(&db))
     };
     let b_conf = p_sec["connector_bearer"]["configured"]
         .as_bool()
@@ -4579,26 +5065,254 @@ async fn connector_info_handler(
     let d_conf = p_sec["delegation_secret"]["configured"]
         .as_bool()
         .unwrap_or(false);
+    let b_copy = p_sec["connector_bearer"]["copy_available"]
+        .as_bool()
+        .unwrap_or(false);
+    let d_copy = p_sec["delegation_secret"]["copy_available"]
+        .as_bool()
+        .unwrap_or(false);
     let mut avail: Vec<&str> = SCOPES.to_vec();
     avail.sort();
     let tools_map = mcp_server::tool_scopes_map();
+    let tool_count = tools_map.len();
+    let paired = b_conf && d_conf;
     Ok(Json(json!({
         "audience": st.audience,
         "namespace": "care__*",
         "endpoint": if !base.is_empty() { format!("{base}/mcp") } else { "/mcp".to_string() },
         "transport": "streamable-http",
-        "ready": b_conf && d_conf,
+        "ready": paired && !revoked,
+        "paired": paired,
+        "revoked": revoked,
+        "enabled": paired && !revoked,
+        "status": if revoked { "revoked" } else if paired { "active" } else { "unpaired" },
         "bearer_configured": b_conf,
         "bearer_source": p_sec["connector_bearer"]["source"],
+        "bearer_copy_available": b_copy,
         "delegation_secret_configured": d_conf,
         "delegation_secret_source": p_sec["delegation_secret"]["source"],
+        "delegation_copy_available": d_copy,
         "require_delegation": st.require_delegation,
         "writes_enabled": st.writes_enabled,
         "writes_by_provider": mcp_server::writes_by_provider_summary(st.writes_enabled, &st.env_map),
         "max_scopes": cfg.mcp_max_scopes,
         "available_scopes": avail,
         "tools": tools_map,
+        "tool_count": tool_count,
         "mcp_gateway": st.gateway_summary(),
+    })))
+}
+
+#[derive(Deserialize, Default)]
+struct InboundFieldQuery {
+    field: Option<String>,
+}
+
+fn inbound_field(q: &InboundFieldQuery) -> Result<(&'static str, &'static str), AppError> {
+    match q.field.as_deref().map(str::trim) {
+        None | Some("") | Some("bearer") => Ok(("bearer", "connector_bearer")),
+        Some("delegation") => Ok(("delegation", "delegation_secret")),
+        _ => Err(AppError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "field must be bearer or delegation",
+        )),
+    }
+}
+
+fn inbound_env_pinned(st: &AppState, field: &str) -> bool {
+    if field == "delegation" {
+        !st.del_secret.is_empty()
+    } else {
+        !st.bearer.is_empty()
+    }
+}
+
+async fn inbound_copy_handler(
+    State(st): State<Arc<AppState>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    method: Method,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<InboundFieldQuery>,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    st.check_copy_rate(peer.as_ref().map(|p| p.0 .0.ip()), &headers)?;
+    let (field, key) = inbound_field(&q)?;
+    if inbound_env_pinned(&st, field) {
+        return Err(AppError::new(StatusCode::CONFLICT, "env_managed_immutable"));
+    }
+    let secret = store::with_write_tx(&st.path, |db| -> Result<String, AppError> {
+        let pair = st
+            .vault
+            .get(db, &st.org, "pairing", "connector")?
+            .unwrap_or_else(|| json!({}));
+        let val = pair
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                AppError::new(StatusCode::CONFLICT, "copy_unavailable_rotate_required")
+            })?
+            .to_string();
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            "secret.copy",
+            "inbound-mcp",
+            &json!({ "kind": "mcp_connector", "field": field }),
+        )?;
+        Ok(val)
+    })?;
+    Ok(Json(json!({ "ok": true, "secret": secret, "copied_field": field })))
+}
+
+async fn inbound_rotate_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<InboundFieldQuery>,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let (field, key) = inbound_field(&q)?;
+    if inbound_env_pinned(&st, field) {
+        return Err(AppError::new(StatusCode::CONFLICT, "env_managed_immutable"));
+    }
+    let body = parse_json_body(&raw_body)?;
+    let custom = body
+        .get("secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !custom.is_empty() && custom.len() < 16 {
+        return Err(AppError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Replacement secret must be at least 16 characters",
+        ));
+    }
+    let new_val = if !custom.is_empty() {
+        custom
+    } else if field == "delegation" {
+        format!("lncd_{}", random_urlsafe(24))
+    } else {
+        format!("lncb_{}", random_urlsafe(24))
+    };
+    store::with_write_tx(&st.path, |db| -> Result<(), AppError> {
+        let mut pair = st
+            .vault
+            .get(db, &st.org, "pairing", "connector")?
+            .unwrap_or_else(|| json!({}));
+        pair[key] = json!(new_val);
+        st.vault.put(db, &st.org, "pairing", "connector", &pair)?;
+        db.execute(
+            "INSERT INTO runtime_settings(organization_id, key, value) VALUES (?1, '__connector_revoked', '0')
+             ON CONFLICT(organization_id, key) DO UPDATE SET value='0'",
+            params![st.org],
+        )?;
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            "mcp_connector.rotated",
+            "inbound-mcp",
+            &json!({ "field": field }),
+        )?;
+        Ok(())
+    })?;
+    Ok(Json(json!({ "ok": true, "secret": new_val, "copied_field": field })))
+}
+
+async fn inbound_clear_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<InboundFieldQuery>,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let (field, key) = inbound_field(&q)?;
+    if inbound_env_pinned(&st, field) {
+        return Err(AppError::new(StatusCode::CONFLICT, "env_managed_immutable"));
+    }
+    store::with_write_tx(&st.path, |db| -> Result<(), AppError> {
+        let mut pair = st
+            .vault
+            .get(db, &st.org, "pairing", "connector")?
+            .unwrap_or_else(|| json!({}));
+        if let Some(obj) = pair.as_object_mut() {
+            obj.remove(key);
+        }
+        let empty = pair.as_object().map(|o| o.is_empty()).unwrap_or(true);
+        if empty {
+            st.vault.delete(db, &st.org, "pairing", "connector");
+        } else {
+            st.vault.put(db, &st.org, "pairing", "connector", &pair)?;
+        }
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            "mcp_connector.removed",
+            "inbound-mcp",
+            &json!({ "field": field }),
+        )?;
+        Ok(())
+    })?;
+    Ok(Json(json!({ "ok": true, "field": field })))
+}
+
+async fn inbound_revoke_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let body = parse_json_body(&raw_body)?;
+    let revoked = body.get("revoked").and_then(|v| v.as_bool()).unwrap_or(true);
+    store::with_write_tx(&st.path, |db| -> Result<(), AppError> {
+        db.execute(
+            "INSERT INTO runtime_settings(organization_id, key, value) VALUES (?1, '__connector_revoked', ?2)
+             ON CONFLICT(organization_id, key) DO UPDATE SET value=excluded.value",
+            params![st.org, if revoked { "1" } else { "0" }],
+        )?;
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            if revoked { "mcp_connector.revoked" } else { "mcp_connector.reactivated" },
+            "inbound-mcp",
+            &json!({}),
+        )?;
+        Ok(())
+    })?;
+    Ok(Json(json!({
+        "ok": true,
+        "status": if revoked { "revoked" } else { "active" },
+        "revoked": revoked,
+    })))
+}
+
+async fn inbound_test_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let (summary, revoked) = {
+        let db = store::connect_readonly(&st.path)?;
+        (st.pairing_secrets_summary(&db), st.connector_revoked(&db))
+    };
+    let tools_map = mcp_server::tool_scopes_map();
+    let names: Vec<String> = tools_map.keys().map(|k| format!("care__{k}")).collect();
+    let paired = summary["connector_bearer"]["configured"].as_bool().unwrap_or(false)
+        && summary["delegation_secret"]["configured"].as_bool().unwrap_or(false);
+    Ok(Json(json!({
+        "ok": true,
+        "paired": paired,
+        "revoked": revoked,
+        "tool_count": names.len(),
+        "tools": names,
     })))
 }
 
@@ -4636,6 +5350,22 @@ async fn get_settings_handler(
     let mut res = settings::load_with_sources(&db, &st.org, &st.env_map);
     if let Some(obj) = res.as_object_mut() {
         obj.insert("secrets".to_string(), st.pairing_secrets_summary(&db));
+        obj.insert(
+            "auth".to_string(),
+            json!({
+                "oidc_enabled": st.oidc.is_active(),
+                "oidc_issuer_host": st.oidc.issuer_host(),
+                "oidc_allowed_users": st.oidc.allowed_users,
+                "session_idle_seconds": st.session_idle_secs,
+                "session_max_seconds": st.session_max_secs,
+                "management_hash_algo": "argon2id",
+                "cookie_secure": match st.cookie_secure_mode {
+                    Some(true) => "always",
+                    Some(false) => "never",
+                    None => "auto",
+                },
+            }),
+        );
     }
     Ok(Json(res))
 }
@@ -4723,14 +5453,17 @@ async fn post_settings_handler(
 async fn root_handler(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> Result<Response, AppError> {
-    let sig_key = st.session_signing_key()?;
-    let cookies = parse_cookies(&headers);
-    if verify_session_cookie(&sig_key, cookies.get("lnc_care_session").map(|s| s.as_str())).is_some()
-    {
+    if st.session_from_headers(&headers, false).is_some() {
         Ok(redirect_303("/admin/"))
     } else {
-        Ok(redirect_303("/login.html"))
+        // Preserve auth_error / error query so the login page can explain OIDC failures.
+        let target = match uri.query() {
+            Some(q) if !q.is_empty() => format!("/login.html?{q}"),
+            _ => "/login.html".to_string(),
+        };
+        Ok(redirect_303(&target))
     }
 }
 
@@ -4742,10 +5475,7 @@ async fn admin_page_handler(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let sig_key = st.session_signing_key()?;
-    let cookies = parse_cookies(&headers);
-    if verify_session_cookie(&sig_key, cookies.get("lnc_care_session").map(|s| s.as_str())).is_none()
-    {
+    if st.session_from_headers(&headers, false).is_none() {
         return Ok(redirect_303("/login.html"));
     }
     Ok(serve_static_file(
@@ -4775,6 +5505,22 @@ async fn app_js_handler(State(st): State<Arc<AppState>>) -> Response {
     serve_static_file(
         &st.public_dir,
         "app.js",
+        "application/javascript; charset=utf-8",
+    )
+}
+
+async fn theme_init_js_handler(State(st): State<Arc<AppState>>) -> Response {
+    serve_static_file(
+        &st.public_dir,
+        "theme-init.js",
+        "application/javascript; charset=utf-8",
+    )
+}
+
+async fn login_js_handler(State(st): State<Arc<AppState>>) -> Response {
+    serve_static_file(
+        &st.public_dir,
+        "login.js",
         "application/javascript; charset=utf-8",
     )
 }

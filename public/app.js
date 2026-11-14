@@ -3,8 +3,23 @@
 
 const PAGES = [
   'overview', 'inbox', 'conversations', 'posts', 'evidence', 'fleet',
-  'channels', 'rules', 'connector', 'audit', 'keys', 'settings'
+  'channels', 'rules', 'audit', 'api-keys', 'mcp-connectors', 'settings'
 ];
+
+const PAGE_ALIASES = {
+  keys: 'api-keys',
+  tokens: 'api-keys',
+  connector: 'mcp-connectors',
+  mcp: 'mcp-connectors',
+  integrations: 'mcp-connectors',
+  connections: 'mcp-connectors',
+  'llm-providers': 'settings',
+  providers: 'settings',
+  models: 'settings',
+  ai: 'settings',
+  general: 'settings',
+  admin: 'settings'
+};
 
 const TITLES = {
   overview: 'Overview',
@@ -15,9 +30,9 @@ const TITLES = {
   fleet: 'Account fleet',
   channels: 'Channels & OAuth',
   rules: 'Triage rules',
-  connector: 'MCP connector',
   audit: 'Audit log',
-  keys: 'API keys',
+  'api-keys': 'API Keys',
+  'mcp-connectors': 'MCP Connectors',
   settings: 'Settings'
 };
 
@@ -62,13 +77,17 @@ const ERRORS = {
   agent_hub_or_bridge_not_configured: 'Neither LNC Agent Hub nor the LNC Ads LAN bridge is configured.',
   shared_oauth_broker_unavailable: 'Shared OAuth broker is currently unreachable.',
   management_key_env_managed: 'Management key is controlled by environment variable and cannot be rotated in UI.',
-  mcp_gateway_not_configured: 'LNC_MCP_GATEWAY_URL is not configured on this service.'
+  mcp_gateway_not_configured: 'LNC_MCP_GATEWAY_URL is not configured on this service.',
+  copy_unavailable_rotate_required: 'Copy is unavailable for this legacy key. Rotate it to enable Copy.',
+  copy_rate_limited: 'Too many copy requests. Wait 5 minutes and try again.',
+  env_managed_immutable: 'Managed by container environment variable — cannot be modified in UI.'
 };
 
 const ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 
 const state = {
   csrf: '',
+  auth: null,
   shopId: null,
   overview: null,
   comments: [],
@@ -93,6 +112,8 @@ const state = {
   selectedAppProvider: 'meta',
   rules: [],
   connector: null,
+  mcpSecretBanner: null,
+  mcpTestResult: null,
   audit: { events: [], valid: true, checked: 0 },
   auditFilter: '',
   keysInventory: { keys: [], mgmt: {} },
@@ -145,10 +166,41 @@ function paintTableError(cols, err) {
   return `<div class="table-wrap"><table class="data-table"><tbody><tr><td colspan="${cols}" class="table-err">Failed to load: ${esc(errorText(err))}</td></tr></tbody></table></div>`;
 }
 
-/* ---------- lite-select (rounded popup matching trigger radius) ---------- */
+/* ---------- lite-select (portaled popup matching trigger radius) ---------- */
+function cleanupOrphanSelectMenus() {
+  document.querySelectorAll('body > .select-menu').forEach(menu => {
+    const sel = menu._selectEl;
+    const wrap = menu._selectWrap;
+    if (!sel || !sel.isConnected || !wrap || !wrap.isConnected) {
+      menu.remove();
+    }
+  });
+}
+
+function closeAllSelects(exceptWrap = null) {
+  $$('.select.open').forEach(wrap => {
+    if (wrap !== exceptWrap && typeof wrap._closeMenu === 'function') {
+      wrap._closeMenu(false);
+    }
+  });
+  document.querySelectorAll('body > .select-menu.open').forEach(menu => {
+    if (!exceptWrap || menu._selectWrap !== exceptWrap) {
+      menu.classList.remove('open', 'above');
+      menu._selectWrap?.classList.remove('open', 'above');
+      menu._selectWrap?.querySelector('.select-btn')?.setAttribute('aria-expanded', 'false');
+    }
+  });
+}
+
 function enhanceSelect(select) {
   if (!select) return;
-  if (select._enhanceRender) { select._enhanceRender(); return; }
+  if (select._enhanceRender) {
+    if (select._selectMenu && !select._selectMenu.isConnected) {
+      document.body.appendChild(select._selectMenu);
+    }
+    select._enhanceRender();
+    return;
+  }
   select.classList.add('select-src');
   const wrap = document.createElement('div');
   wrap.className = 'select';
@@ -161,13 +213,50 @@ function enhanceSelect(select) {
   if (select.disabled) btn.disabled = true;
   if (select.getAttribute('aria-label')) btn.setAttribute('aria-label', select.getAttribute('aria-label'));
   btn.innerHTML = '<span class="select-value"></span><span class="select-arrow" aria-hidden="true">&#9662;</span>';
+
   const menu = document.createElement('div');
   menu.className = 'select-menu';
   menu.setAttribute('role', 'listbox');
+  menu._selectEl = select;
+  menu._selectWrap = wrap;
+  document.body.appendChild(menu);
+  select._selectMenu = menu;
 
-  const closeMenu = () => {
-    wrap.classList.remove('open');
+  let activeIdx = 0;
+
+  const closeMenu = (restoreFocus = false) => {
+    wrap.classList.remove('open', 'above');
+    menu.classList.remove('open', 'above');
     btn.setAttribute('aria-expanded', 'false');
+    if (restoreFocus && btn.isConnected) btn.focus();
+  };
+
+  const positionMenu = () => {
+    if (!select.isConnected || !wrap.isConnected || btn.offsetParent === null) {
+      closeMenu(false);
+      if (!select.isConnected) menu.remove();
+      return;
+    }
+    const rect = btn.getBoundingClientRect();
+    const spaceBelow = window.innerHeight - rect.bottom - 12;
+    const spaceAbove = rect.top - 12;
+    const estHeight = Math.min(280, menu.scrollHeight || (select.options.length * 36 + 12));
+    const dropUp = spaceBelow < estHeight && spaceAbove > spaceBelow;
+    menu.style.minWidth = `${Math.round(rect.width)}px`;
+    menu.style.maxWidth = 'min(440px, calc(100vw - 24px))';
+    const menuW = Math.max(rect.width, menu.offsetWidth || rect.width);
+    menu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - menuW - 12))}px`;
+    if (dropUp) {
+      menu.style.top = 'auto';
+      menu.style.bottom = `${Math.max(32, Math.round(window.innerHeight - rect.top + 6))}px`;
+      menu.classList.add('above');
+      wrap.classList.add('above');
+    } else {
+      menu.style.bottom = 'auto';
+      menu.style.top = `${Math.round(rect.bottom + 5)}px`;
+      menu.classList.remove('above');
+      wrap.classList.remove('above');
+    }
   };
 
   const renderMenu = () => {
@@ -175,22 +264,35 @@ function enhanceSelect(select) {
     btn.disabled = select.disabled;
     btn.querySelector('.select-value').textContent = select.selectedOptions[0]?.textContent ?? '';
     menu.innerHTML = '';
-    [...select.options].forEach(option => {
+    const opts = [...select.options];
+    activeIdx = Math.max(0, opts.findIndex(o => o.value === value));
+    opts.forEach((option, idx) => {
       const item = document.createElement('button');
       item.type = 'button';
+      item.disabled = option.disabled;
       item.setAttribute('role', 'option');
       item.setAttribute('aria-selected', String(option.value === value));
+      if (idx === activeIdx) item.classList.add('is-active');
       item.textContent = option.textContent;
       item.addEventListener('click', ev => {
         ev.preventDefault();
         ev.stopPropagation();
+        if (option.disabled) return;
         select.value = option.value;
         select.dispatchEvent(new Event('change', { bubbles: true }));
-        closeMenu();
-        btn.focus();
+        renderMenu();
+        closeMenu(true);
       });
       menu.append(item);
     });
+  };
+
+  const moveActive = delta => {
+    const items = [...menu.querySelectorAll('button[role="option"]:not(:disabled)')];
+    if (!items.length) return;
+    activeIdx = (activeIdx + delta + items.length) % items.length;
+    items.forEach((el, i) => el.classList.toggle('is-active', i === activeIdx));
+    items[activeIdx]?.scrollIntoView({ block: 'nearest' });
   };
 
   btn.addEventListener('click', ev => {
@@ -198,43 +300,79 @@ function enhanceSelect(select) {
     ev.stopPropagation();
     if (btn.disabled) return;
     const next = !wrap.classList.contains('open');
-    $$('.select.open').forEach(other => {
-      if (other !== wrap) {
-        other.classList.remove('open');
-        other.querySelector('.select-btn')?.setAttribute('aria-expanded', 'false');
-      }
-    });
-    wrap.classList.toggle('open', next);
-    btn.setAttribute('aria-expanded', String(next));
-    if (next) renderMenu();
+    closeAllSelects(wrap);
+    if (!next) {
+      closeMenu(false);
+      return;
+    }
+    renderMenu();
+    wrap.classList.add('open');
+    menu.classList.add('open');
+    btn.setAttribute('aria-expanded', 'true');
+    positionMenu();
   });
 
-  wrap.addEventListener('keydown', ev => {
-    if (ev.key === 'Escape') { closeMenu(); btn.focus(); }
-  });
+  const onKey = ev => {
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      if (!wrap.classList.contains('open')) {
+        btn.click();
+      } else {
+        moveActive(ev.key === 'ArrowDown' ? 1 : -1);
+      }
+    } else if (ev.key === 'Enter' && wrap.classList.contains('open')) {
+      ev.preventDefault();
+      const items = [...menu.querySelectorAll('button[role="option"]:not(:disabled)')];
+      (items[activeIdx] || menu.querySelector('button[role="option"].is-active'))?.click();
+    } else if (ev.key === 'Escape' && wrap.classList.contains('open')) {
+      ev.preventDefault();
+      closeMenu(true);
+    }
+  };
+
+  btn.addEventListener('keydown', onKey);
+  menu.addEventListener('keydown', onKey);
 
   select.addEventListener('change', renderMenu);
   if (select.form) select.form.addEventListener('reset', () => setTimeout(renderMenu, 0));
+  wrap._closeMenu = closeMenu;
+  wrap._positionMenu = positionMenu;
+  wrap._menu = menu;
   select._enhanceRender = renderMenu;
   select.after(wrap);
-  wrap.append(btn, menu);
+  wrap.append(btn);
   renderMenu();
 }
 
-const enhanceAllSelects = (root = document) => root.querySelectorAll('select').forEach(enhanceSelect);
+function enhanceAllSelects(root = document) {
+  cleanupOrphanSelectMenus();
+  root.querySelectorAll('select').forEach(enhanceSelect);
+}
 
 document.addEventListener('mousedown', ev => {
   $$('.select.open').forEach(wrap => {
-    if (!wrap.contains(ev.target)) {
-      wrap.classList.remove('open');
-      wrap.querySelector('.select-btn')?.setAttribute('aria-expanded', 'false');
+    if (!wrap.contains(ev.target) && !wrap._menu?.contains(ev.target)) {
+      wrap._closeMenu?.(false);
     }
   });
 });
 
+window.addEventListener('resize', () => {
+  $$('.select.open').forEach(wrap => wrap._positionMenu?.());
+});
+
+window.addEventListener('scroll', () => {
+  $$('.select.open').forEach(wrap => wrap._positionMenu?.());
+}, true);
+
+window.addEventListener('popstate', () => {
+  closeAllSelects();
+  cleanupOrphanSelectMenus();
+});
+
 /* ---------- HTTP, toast, modal, clipboard ---------- */
 async function api(url, options = {}) {
-  const method = options.method || 'GET';
+  const method = (options.method || 'GET').toUpperCase();
   const headers = { ...(options.headers || {}) };
   let body = options.body;
   if (body && typeof body !== 'string') {
@@ -243,6 +381,7 @@ async function api(url, options = {}) {
   }
   if (method !== 'GET' && method !== 'HEAD') {
     headers['X-CSRF-Token'] = state.csrf;
+    headers['X-Requested-With'] = 'XMLHttpRequest';
   }
   const res = await fetch(url, { credentials: 'same-origin', ...options, method, headers, body });
   if (res.status === 401) {
@@ -262,29 +401,63 @@ function toast(message, kind = 'ok') {
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
   el.innerHTML = `<div class="msg">${esc(message)}</div><button type="button" class="x" aria-label="Dismiss">&times;</button>`;
-  el.querySelector('.x').onclick = () => el.remove();
+  el.querySelector('.x').addEventListener('click', () => el.remove());
   host.append(el);
   setTimeout(() => el.remove(), kind === 'err' ? 8500 : 4200);
 }
 const fail = err => toast(errorText(err), 'err');
 
-function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+async function copyText(text, onFallbackReveal) {
+  if (!text) return false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fall through to execCommand fallback
+  }
   const area = document.createElement('textarea');
   area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.top = '-9999px';
+  area.style.left = '-9999px';
+  area.style.opacity = '0';
   document.body.append(area);
+  area.focus();
   area.select();
-  const ok = document.execCommand('copy');
-  area.remove();
-  return ok ? Promise.resolve() : Promise.reject(new Error('Copy failed'));
+  area.setSelectionRange(0, text.length);
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  } finally {
+    area.remove();
+  }
+  if (!ok) {
+    if (typeof onFallbackReveal === 'function') {
+      onFallbackReveal(text);
+    } else {
+      modal(`<h3>Copy value manually</h3>
+        <p class="cell-sub" style="margin:8px 0 12px">Clipboard write is unavailable in this browser context. Copy the value below:</p>
+        <input type="text" readonly value="${esc(text)}" id="fallback-copy-input">
+        <div class="acts"><button type="button" class="btn btn-primary" data-close>Done</button></div>`);
+      const inp = $('#fallback-copy-input');
+      if (inp) { inp.focus(); inp.select(); }
+    }
+  }
+  return ok;
 }
 
 function wireCopyButtons(root = document) {
   root.querySelectorAll('[data-copy]').forEach(btn => {
-    btn.onclick = ev => {
+    btn.addEventListener('click', async ev => {
       ev.stopPropagation();
-      copyText(btn.dataset.copy).then(() => toast('Copied to clipboard', 'ok'), fail);
-    };
+      const ok = await copyText(btn.dataset.copy);
+      if (ok) toast('Copied to clipboard', 'ok');
+    });
   });
 }
 
@@ -295,11 +468,13 @@ function modal(html, { wide = false } = {}) {
   const onKey = ev => { if (ev.key === 'Escape') close(); };
   const close = () => {
     document.removeEventListener('keydown', onKey);
+    closeAllSelects();
     root.innerHTML = '';
+    cleanupOrphanSelectMenus();
   };
   document.addEventListener('keydown', onKey);
   back.addEventListener('click', ev => { if (ev.target === back) close(); });
-  back.querySelectorAll('[data-close]').forEach(b => { b.onclick = close; });
+  back.querySelectorAll('[data-close]').forEach(b => { b.addEventListener('click', close); });
   enhanceAllSelects(back);
   wireCopyButtons(back);
   return { root: back, close };
@@ -315,11 +490,11 @@ function confirmModal({ title, body, confirm = 'Confirm', danger = false }) {
       `<button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-ok>${esc(confirm)}</button>` +
       `</div>`
     );
-    m.root.querySelector('[data-ok]').onclick = () => {
+    m.root.querySelector('[data-ok]').addEventListener('click', () => {
       settled = true;
       m.close();
       resolve(true);
-    };
+    });
     const obs = new MutationObserver(() => {
       if (!document.body.contains(m.root) && !settled) {
         obs.disconnect();
@@ -344,10 +519,19 @@ async function busy(btn, fn) {
 }
 
 /* ---------- Shell & Routing ---------- */
+function resolvePageSlug(rawSlug) {
+  const mapped = PAGE_ALIASES[rawSlug] || rawSlug;
+  return PAGES.includes(mapped) ? mapped : 'overview';
+}
+
 function currentPage() {
   const raw = (location.hash || '#overview').slice(1);
-  const [slug] = raw.split('?');
-  return PAGES.includes(slug) ? slug : 'overview';
+  const [slug, q] = raw.split('?');
+  const canonical = resolvePageSlug(slug);
+  if (slug && slug !== canonical) {
+    history.replaceState(null, '', `${location.pathname}#${canonical}${q ? `?${q}` : ''}`);
+  }
+  return canonical;
 }
 
 function consumeHashQuery() {
@@ -355,7 +539,8 @@ function consumeHashQuery() {
   const [slug, q] = raw.split('?');
   if (!q) return;
   const qp = new URLSearchParams(q);
-  history.replaceState(null, '', `${location.pathname}#${PAGES.includes(slug) ? slug : 'overview'}`);
+  const canonical = resolvePageSlug(slug);
+  history.replaceState(null, '', `${location.pathname}#${canonical}`);
   if (qp.get('oauth_status') === 'connected') {
     toast(`Shared ${qp.get('provider') || 'OAuth'} account connected. Syncing vault...`, 'ok');
     api('/api/admin/hub/sync', { method: 'POST' }).then(() => refreshOverview()).catch(fail);
@@ -371,13 +556,26 @@ function renderShell() {
   $('#main-content')?.classList.add('wide');
 
   const o = state.overview;
+  const auth = state.auth;
   const orgName = o?.organization?.name || 'LNC Care';
   $('#crumb').innerHTML = `<span id="org-name">${esc(orgName)}</span> / <b>${esc(TITLES[page] || 'Overview')}</b>`;
 
-  if (o) {
-    $('#ver').textContent = `v${o.version}`;
-    $('#app-build').textContent = o.version ? `Version ${o.version}` : 'Version unavailable';
+  const ver = o?.version || auth?.version || '';
+  if (ver) {
+    $('#ver').textContent = `v${ver}`;
+    $('#app-build').textContent = `v${ver}`;
+  } else {
+    $('#app-build').textContent = 'v-';
+  }
 
+  if (auth) {
+    const userEl = $('#auth-user');
+    const chipEl = $('#auth-method-chip');
+    if (userEl) userEl.textContent = auth.username || (auth.auth_method === 'oidc' ? 'SSO User' : 'Admin');
+    if (chipEl) chipEl.textContent = auth.auth_method === 'oidc' ? 'SSO' : 'Key';
+  }
+
+  if (o) {
     const hub = o.agent_hub || {};
     const br = o.bridge || {};
     const ssoHub = $('#sso-hub-link');
@@ -403,9 +601,15 @@ function renderShell() {
 }
 
 async function route() {
+  closeAllSelects();
+  cleanupOrphanSelectMenus();
   consumeHashQuery();
   const page = currentPage();
-  if (page !== 'keys') state.createdSecretBanner = null;
+  if (page !== 'api-keys') state.createdSecretBanner = null;
+  if (page !== 'mcp-connectors') {
+    state.mcpSecretBanner = null;
+    state.mcpTestResult = null;
+  }
   renderShell();
   if (page === 'overview') renderOverviewPage();
   if (page === 'inbox') await loadInbox();
@@ -415,10 +619,11 @@ async function route() {
   if (page === 'fleet') await loadFleet();
   if (page === 'channels') renderChannelsPage();
   if (page === 'rules') await loadRules();
-  if (page === 'connector') await loadConnector();
   if (page === 'audit') await loadAudit();
-  if (page === 'keys') await loadKeys();
+  if (page === 'api-keys') await loadKeys();
+  if (page === 'mcp-connectors') await loadMcpConnectors();
   if (page === 'settings') await loadSettings();
+  cleanupOrphanSelectMenus();
 }
 
 async function refreshOverview() {
@@ -1800,23 +2005,108 @@ function renderRulesPage() {
 }
 
 /* ==========================================================================
-   9. BUSINESS MCP CONNECTOR (#connector)
+   9. MCP CONNECTORS (#mcp-connectors)
    ========================================================================== */
-async function loadConnector() {
-  const host = $('#body-connector');
+async function loadMcpConnectors() {
+  const host = $('#body-mcp-connectors');
   try {
     state.connector = await api('/api/admin/connector');
-    renderConnectorPage();
+    renderMcpConnectorsPage();
   } catch (err) {
     host.innerHTML = paintTableError(1, err);
   }
 }
 
-function renderConnectorPage() {
-  const host = $('#body-connector');
-  const c = state.connector;
+function renderMcpConnectorsPage() {
+  const host = $('#body-mcp-connectors');
+  const c = state.connector || {};
   const gw = c.mcp_gateway || {};
-  const srcBadge = src => src === 'environment' ? badge('Env managed', 'b-dim') : (src === 'database' ? badge('Saved in Vault', 'b-ok') : badge('Unset', 'b-warn'));
+  const srcBadge = src => src === 'environment'
+    ? '<span class="badge b-dim badge-lock">&#128274; Env-managed</span>'
+    : (src === 'database' ? badge('Saved in Vault', 'b-ok') : badge('Unset', 'b-warn'));
+
+  let mcpUrl = c.endpoint || '/mcp';
+  try {
+    mcpUrl = new URL(mcpUrl, location.origin).href;
+  } catch {}
+
+  const st = c.status || (c.enabled ? 'active' : 'unpaired');
+  const stBadge = st === 'active'
+    ? badge('Active', 'b-ok')
+    : (st === 'revoked' ? badge('Revoked', 'b-err') : badge('Unpaired', 'b-warn'));
+
+  const bannerHtml = state.mcpSecretBanner
+    ? `<div class="alert alert-success" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px">
+        <div><b>${esc(state.mcpSecretBanner.title)}:</b> ${copyChip(state.mcpSecretBanner.secret)} <span class="cell-sub">Store this secret securely now — plaintext is never listed in tables.</span></div>
+        <div class="btn-grp">
+          <button type="button" class="btn btn-sm btn-primary" data-copy="${esc(state.mcpSecretBanner.secret)}">Copy secret</button>
+          <button type="button" class="btn btn-sm" id="dismiss-mcp-banner">Dismiss</button>
+        </div>
+      </div>`
+    : '';
+
+  const testHtml = state.mcpTestResult
+    ? `<div class="alert ${state.mcpTestResult.ok ? 'alert-success' : 'alert-danger'}" style="margin-bottom:14px">
+        <b>/mcp probe:</b> ${state.mcpTestResult.ok ? 'Reachable' : 'Failed'} &middot;
+        <b>Tools:</b> ${num(state.mcpTestResult.tool_count || 0)} &middot;
+        <b>Paired:</b> ${state.mcpTestResult.paired ? 'Yes' : 'No'}
+        ${Array.isArray(state.mcpTestResult.tools) && state.mcpTestResult.tools.length
+          ? `<div class="cell-sub" style="margin-top:4px">${esc(state.mcpTestResult.tools.slice(0, 12).join(', '))}</div>`
+          : ''}
+      </div>`
+    : '';
+
+  const credDefs = [
+    {
+      field: 'bearer',
+      label: 'Connector bearer',
+      configured: Boolean(c.bearer_configured),
+      source: c.bearer_source || 'unset',
+      copyAvailable: Boolean(c.bearer_copy_available)
+    },
+    {
+      field: 'delegation',
+      label: 'Delegation secret',
+      configured: Boolean(c.delegation_secret_configured),
+      source: c.delegation_secret_source || 'unset',
+      copyAvailable: Boolean(c.delegation_copy_available)
+    }
+  ];
+
+  const credRows = credDefs.map(row => {
+    const isEnv = row.source === 'environment';
+    const isUnset = row.source === 'unset' || !row.configured;
+    const envTitle = 'Managed by container environment variable';
+    const copyDisabled = isEnv || !row.copyAvailable || isUnset;
+    const copyTitle = isEnv ? envTitle : (!row.copyAvailable ? 'Rotate to enable Copy' : 'Copy secret');
+    const rotDisabled = isEnv;
+    const revDisabled = isEnv || st === 'revoked';
+    const remDisabled = isEnv || isUnset;
+
+    return `<tr>
+      <td class="cell-main">${esc(row.label)}</td>
+      <td>${srcBadge(row.source)}</td>
+      <td>${row.configured ? (st === 'revoked' ? badge('Revoked', 'b-err') : badge('Configured', 'b-ok')) : badge('Unset', 'b-warn')}</td>
+      <td class="act"><div class="row-actions">
+        <button type="button" class="btn btn-sm" data-mcp-copy="${esc(row.field)}" ${copyDisabled ? `disabled title="${esc(copyTitle)}"` : ''}>Copy</button>
+        <button type="button" class="btn btn-sm" data-mcp-rotate="${esc(row.field)}" data-label="${esc(row.label)}" ${rotDisabled ? `disabled title="${esc(envTitle)}"` : ''}>Rotate</button>
+        <button type="button" class="btn btn-sm btn-danger" data-mcp-revoke="${esc(row.field)}" ${revDisabled ? `disabled title="${esc(isEnv ? envTitle : 'Already revoked')}"` : ''}>Revoke</button>
+        <button type="button" class="btn btn-sm btn-danger" data-mcp-remove="${esc(row.field)}" data-label="${esc(row.label)}" ${remDisabled ? `disabled title="${esc(isEnv ? envTitle : 'No stored runtime secret')}"` : ''}>Remove</button>
+      </div></td>
+    </tr>`;
+  });
+
+  const inboundHtml = `${bannerHtml}${testHtml}
+    <div class="bar-top" style="margin-bottom:14px">
+      ${copyChip(mcpUrl)}
+      ${stBadge}
+      <span class="cell-sub">Audience: <code>${esc(c.audience || 'lnc-care')}</code> &middot; Namespace: <code>${esc(c.namespace || 'care__*')}</code></span>
+    </div>
+    ${table(['Credential', 'Source', 'Status', 'Actions'], credRows, '')}`;
+
+  const inboundTools = `${stBadge}
+    <button type="button" class="btn btn-sm btn-primary" id="mcp-test-btn">Test /mcp</button>
+    <button type="button" class="btn btn-sm ${st === 'revoked' ? '' : 'btn-danger'}" id="mcp-revoke-toggle-btn">${st === 'revoked' ? 'Reactivate' : 'Revoke /mcp'}</button>`;
 
   const pairHtml = `<dl class="kv">
     <dt>MCP endpoint</dt><dd>${copyChip(c.endpoint || '/mcp')}</dd>
@@ -1844,7 +2134,7 @@ function renderConnectorPage() {
   ].map(([title, prompt]) => `<tr>
     <td class="cell-main">${esc(title)}</td>
     <td class="cell-sub">${esc(prompt)}</td>
-    <td><div class="row-actions"><button type="button" class="btn btn-sm" data-copy="${esc(prompt)}">Copy prompt</button></div></td>
+    <td class="act"><div class="row-actions"><button type="button" class="btn btn-sm" data-copy="${esc(prompt)}">Copy prompt</button></div></td>
   </tr>`);
 
   const toolRows = Object.entries(c.tools || {}).map(([name, scopes]) => `<tr>
@@ -1857,7 +2147,11 @@ function renderConnectorPage() {
     <td>${(c.max_scopes || []).includes(sc) ? badge('Permitted', 'b-ok') : badge('Blocked by max_scopes', 'b-dim')}</td>
   </tr>`);
 
-  host.innerHTML = `<div class="grid-2">
+  host.innerHTML = `${card('Inbound /mcp (Business MCP Hub)', inboundHtml, {
+      sub: 'Streamable-HTTP Business MCP endpoint, pairing credentials and live tool discovery.',
+      tools: inboundTools
+    })}
+    <div class="grid-2">
       ${card('Business MCP Hub pairing', pairHtml, { sub: 'Inbound Hub v3/v4 HMAC delegation contract.' })}
       ${card('Unified Agent Hub MCP gateway', gwHtml, { sub: 'Outbound cross-app calls to LNC Ads via LNC-Agent-Hub.' })}
     </div>
@@ -1868,6 +2162,117 @@ function renderConnectorPage() {
     </div>`;
 
   wireCopyButtons(host);
+
+  $('#dismiss-mcp-banner')?.addEventListener('click', () => {
+    state.mcpSecretBanner = null;
+    renderMcpConnectorsPage();
+  });
+
+  $('#mcp-test-btn')?.addEventListener('click', ev => {
+    busy(ev.currentTarget, async () => {
+      const res = await api('/api/mcp-connectors/inbound-mcp/test', { method: 'POST' });
+      state.mcpTestResult = res;
+      toast(res.ok ? `/mcp healthy (${num(res.tool_count || 0)} tools)` : '/mcp probe failed', res.ok ? 'ok' : 'err');
+      renderMcpConnectorsPage();
+    });
+  });
+
+  $('#mcp-revoke-toggle-btn')?.addEventListener('click', async ev => {
+    const btn = ev.currentTarget;
+    const revoking = st !== 'revoked';
+    if (revoking) {
+      const ok = await confirmModal({
+        title: 'Revoke inbound /mcp connector?',
+        body: 'Incoming Business MCP Hub requests to <code>/mcp</code> will be rejected immediately until reactivated.',
+        confirm: 'Revoke /mcp',
+        danger: true
+      });
+      if (!ok) return;
+    }
+    await busy(btn, async () => {
+      await api('/api/mcp-connectors/inbound-mcp/revoke', { method: 'POST', body: { revoked: revoking } });
+      toast(revoking ? 'Inbound /mcp revoked' : 'Inbound /mcp reactivated', 'ok');
+      await loadMcpConnectors();
+    });
+  });
+
+  host.querySelectorAll('[data-mcp-copy]').forEach(btn => {
+    btn.addEventListener('click', () => busy(btn, async () => {
+      const field = btn.dataset.mcpCopy;
+      const res = await api(`/api/mcp-connectors/inbound-mcp/copy?field=${encodeURIComponent(field)}`, { method: 'POST' });
+      const ok = await copyText(res.secret);
+      if (ok) toast(`${field === 'bearer' ? 'Connector bearer' : 'Delegation secret'} copied`, 'ok');
+    }));
+  });
+
+  host.querySelectorAll('[data-mcp-rotate]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const field = btn.dataset.mcpRotate;
+      const label = btn.dataset.label || field;
+      const m = modal(`<h3>Rotate ${esc(label)}</h3>
+        <p class="cell-sub" style="margin:6px 0 12px">Generates or stores a new secret in Vault immediately. Previous secret stops working at once.</p>
+        <form id="mcp-rotate-form">
+          <label class="field"><span class="field-label">Custom secret (optional, min 24 chars)</span>
+            <input type="password" name="secret" placeholder="Leave blank to auto-generate strong secret" minlength="24" autocomplete="new-password">
+          </label>
+          <div class="acts">
+            <button type="button" class="btn" data-close>Cancel</button>
+            <button type="submit" class="btn btn-danger">Rotate secret</button>
+          </div>
+        </form>`);
+      m.root.querySelector('#mcp-rotate-form').addEventListener('submit', ev => {
+        ev.preventDefault();
+        const fd = new FormData(ev.currentTarget);
+        const secret = String(fd.get('secret') || '').trim();
+        busy(ev.currentTarget.querySelector('[type="submit"]'), async () => {
+          const res = await api(`/api/mcp-connectors/inbound-mcp/rotate?field=${encodeURIComponent(field)}`, {
+            method: 'POST',
+            body: secret ? { secret } : {}
+          });
+          m.close();
+          state.mcpSecretBanner = { title: `Rotated ${label}`, secret: res.secret };
+          toast(`${label} rotated`, 'ok');
+          await loadMcpConnectors();
+        });
+      });
+    });
+  });
+
+  host.querySelectorAll('[data-mcp-revoke]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const ok = await confirmModal({
+        title: 'Revoke inbound /mcp connector?',
+        body: 'Incoming Business MCP Hub calls will be rejected immediately until reactivated.',
+        confirm: 'Revoke /mcp',
+        danger: true
+      });
+      if (!ok) return;
+      await busy(btn, async () => {
+        await api('/api/mcp-connectors/inbound-mcp/revoke', { method: 'POST', body: { revoked: true } });
+        toast('Inbound /mcp revoked', 'ok');
+        await loadMcpConnectors();
+      });
+    });
+  });
+
+  host.querySelectorAll('[data-mcp-remove]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const field = btn.dataset.mcpRemove;
+      const label = btn.dataset.label || field;
+      const ok = await confirmModal({
+        title: `Remove ${label}?`,
+        body: `Clear the runtime Vault secret for <b>${esc(label)}</b>? Inbound Business MCP calls requiring it will fail until re-paired.`,
+        confirm: 'Remove secret',
+        danger: true
+      });
+      if (!ok) return;
+      await busy(btn, async () => {
+        await api(`/api/mcp-connectors/inbound-mcp?field=${encodeURIComponent(field)}`, { method: 'DELETE' });
+        toast(`${label} removed`, 'ok');
+        await loadMcpConnectors();
+      });
+    });
+  });
 }
 
 /* ==========================================================================
@@ -1921,10 +2326,10 @@ function renderAuditPage() {
 }
 
 /* ==========================================================================
-   11. THE API KEYS & MANAGEMENT KEY PAGE (#keys)
+   11. API KEYS & MANAGEMENT KEY (#api-keys)
    ========================================================================== */
 async function loadKeys() {
-  const host = $('#body-keys');
+  const host = $('#body-api-keys');
   try {
     state.keysInventory = await api('/api/keys');
     renderKeysPage();
@@ -1934,7 +2339,7 @@ async function loadKeys() {
 }
 
 function renderKeysPage() {
-  const host = $('#body-keys');
+  const host = $('#body-api-keys');
   const items = state.keysInventory.keys || [];
   const mgmt = state.keysInventory.mgmt || {};
   const o = state.overview || {};
@@ -1960,38 +2365,71 @@ function renderKeysPage() {
 
   const keyRows = items.map(k => {
     const stCls = k.status === 'enabled' ? 'b-ok' : (k.status === 'disabled' ? 'b-warn' : 'b-err');
-    const isRuntime = k.source === 'runtime';
+    const isEnv = Boolean(k.env_managed || k.source === 'environment');
     const isRevoked = k.status === 'revoked';
+    const envTitle = 'Managed by container environment variable';
+    const idAttr = esc(k.id);
+    const labelAttr = esc(k.label);
+    const keyPreview = k.last4 ? `${esc(k.prefix)}...${esc(k.last4)}` : `${esc(k.prefix)}...`;
+    const createdSub = k.last_used_at ? `<div class="cell-sub">Used ${when(k.last_used_at)}</div>` : '';
+
+    const copyDisabled = isEnv || !k.copy_available || isRevoked;
+    const copyTitle = isEnv ? envTitle : (isRevoked ? 'Revoked keys cannot be copied' : (!k.copy_available ? 'Rotate to enable Copy' : 'Copy API key'));
+    const rotateDisabled = isEnv || isRevoked;
+    const rotateTitle = isEnv ? envTitle : (isRevoked ? 'Revoked keys cannot be rotated' : 'Rotate key secret');
+    const revokeDisabled = isEnv || isRevoked;
+    const revokeTitle = isEnv ? envTitle : (isRevoked ? 'Already revoked' : 'Revoke key');
+    const removeDisabled = isEnv;
+    const removeTitle = isEnv ? envTitle : 'Remove key record';
+
     return `<tr>
-      <td class="cell-main">${esc(k.label)}</td>
-      <td class="mono">${esc(k.prefix)}...</td>
-      <td>${k.source === 'environment' ? badge('Env managed', 'b-dim') : badge('Runtime', 'b-acc')}</td>
-      <td>${badge(k.status, stCls)}</td>
-      <td class="cell-sub">${when(k.created_at)}</td>
-      <td><div class="row-actions">
-        ${isRuntime && k.copy_available && !isRevoked ? `<button type="button" class="btn btn-sm" data-key-copy="${k.id}">Copy</button>` : ''}
-        ${isRuntime && !isRevoked ? `<button type="button" class="btn btn-sm" data-key-rename="${k.id}" data-label="${esc(k.label)}">Rename</button>` : ''}
-        ${isRuntime && !isRevoked ? `<button type="button" class="btn btn-sm" data-key-toggle="${k.id}">${k.status === 'enabled' ? 'Disable' : 'Enable'}</button>` : ''}
-        ${isRuntime && !isRevoked ? `<button type="button" class="btn btn-sm btn-danger" data-key-revoke="${k.id}" data-label="${esc(k.label)}">Revoke</button>` : ''}
-        ${isRuntime && isRevoked ? `<button type="button" class="btn btn-sm btn-danger" data-key-delete="${k.id}" data-label="${esc(k.label)}">Delete</button>` : ''}
+      <td class="cell-main">
+        <span>${esc(k.label)}</span>
+        ${!isEnv && !isRevoked ? `<button type="button" class="inline-edit-btn" data-key-rename="${idAttr}" data-label="${labelAttr}" title="Rename label" aria-label="Rename ${labelAttr}">Edit</button>` : ''}
+      </td>
+      <td class="mono">${keyPreview}</td>
+      <td>${isEnv ? '<span class="badge b-dim badge-lock">&#128274; Env-managed</span>' : badge('Runtime', 'b-acc')}</td>
+      <td>
+        ${badge(k.status, stCls)}
+        ${!isEnv && !isRevoked ? `<button type="button" class="inline-edit-btn" data-key-toggle="${idAttr}" title="${k.status === 'enabled' ? 'Disable key' : 'Enable key'}">${k.status === 'enabled' ? 'Disable' : 'Enable'}</button>` : ''}
+      </td>
+      <td class="cell-sub">${when(k.created_at)}${createdSub}</td>
+      <td class="act"><div class="row-actions">
+        <button type="button" class="btn btn-sm" data-key-copy="${idAttr}" ${copyDisabled ? `disabled title="${esc(copyTitle)}"` : ''}>Copy</button>
+        <button type="button" class="btn btn-sm" data-key-rotate="${idAttr}" data-label="${labelAttr}" ${rotateDisabled ? `disabled title="${esc(rotateTitle)}"` : ''}>Rotate</button>
+        <button type="button" class="btn btn-sm btn-danger" data-key-revoke="${idAttr}" data-label="${labelAttr}" ${revokeDisabled ? `disabled title="${esc(revokeTitle)}"` : ''}>Revoke</button>
+        <button type="button" class="btn btn-sm btn-danger" data-key-delete="${idAttr}" data-label="${labelAttr}" ${removeDisabled ? `disabled title="${esc(removeTitle)}"` : ''}>Remove</button>
       </div></td>
     </tr>`;
   });
 
+  const hashAlgo = mgmt.hash_algo || 'argon2id';
+  const isMgmtEnv = mgmt.source === 'environment';
+  const canRotateMgmt = Boolean(mgmt.rotatable && !isMgmtEnv);
+  const authMethodsText = Array.isArray(mgmt.auth_methods) && mgmt.auth_methods.length
+    ? mgmt.auth_methods.join(', ')
+    : (mgmt.oidc_enabled ? 'oidc, management_key' : 'management_key');
+
   const mgmtBody = `<dl class="kv" style="margin-bottom:14px">
-      <dt>Status</dt><dd>${mgmt.configured ? badge('Configured', 'b-ok') : badge('Not configured', 'b-err')}</dd>
+      <dt>Status</dt><dd>${mgmt.configured ? badge('Configured', 'b-ok') : badge('Not configured', 'b-err')} ${badge(hashAlgo === 'argon2id' ? 'Argon2id' : hashAlgo, 'b-acc')}</dd>
       <dt>Key prefix</dt><dd class="mono">${esc(mgmt.prefix || '-')}</dd>
-      <dt>Ownership</dt><dd>${mgmt.source === 'environment' ? badge('Env managed', 'b-dim') : (mgmt.source === 'runtime' ? badge('Runtime (PBKDF2)', 'b-acc') : badge('Unset', 'b-warn'))}</dd>
+      <dt>Ownership</dt><dd>${isMgmtEnv ? '<span class="badge b-dim badge-lock">&#128274; Env-managed</span>' : (mgmt.source === 'runtime' ? badge('Runtime', 'b-acc') : badge('Unset', 'b-warn'))}</dd>
+      <dt>Session epoch</dt><dd class="mono">${esc(mgmt.session_epoch ?? 0)}</dd>
+      <dt>Auth methods</dt><dd><code>${esc(authMethodsText)}</code>${mgmt.oidc_enabled ? ` ${badge('OIDC active', 'b-ok')}` : ''}</dd>
       ${mgmt.created_at ? `<dt>Rotated at</dt><dd>${when(mgmt.created_at)}</dd>` : ''}
     </dl>
     ${mgmt.bootstrap_ignored ? `<div class="alert alert-info" style="margin-bottom:14px">Bootstrap ignored: runtime key exists in database and owns sign-in.</div>` : ''}
-    ${mgmt.source === 'environment'
-      ? `<p class="hint" style="margin:0">Controlled by <code>MANAGEMENT_KEY</code> in stack environment. To enable UI-owned rotation without container restarts, provide <code>CARE_ADMIN_BOOTSTRAP_KEY</code> instead of <code>MANAGEMENT_KEY</code>.</p>`
-      : `<form id="mgmt-rotate-form">
+    ${canRotateMgmt
+      ? `<form id="mgmt-rotate-form" style="margin-bottom:12px">
           ${mgmt.configured ? `<label class="field"><span class="field-label">Current management key</span><input type="password" name="current_key" placeholder="Verify current management key" autocomplete="current-password" required></label>` : ''}
           <label class="field"><span class="field-label">Replacement secret (optional, min 16 chars)</span><input type="password" name="secret" placeholder="Leave blank to auto-generate strong key" minlength="16" autocomplete="new-password"></label>
-          <button type="submit" class="btn btn-danger">Rotate management key</button>
-        </form>`}`;
+          <div class="btn-grp">
+            <button type="submit" class="btn btn-danger">Rotate management key</button>
+            <button type="button" class="btn btn-danger" id="mgmt-revoke-sessions-btn">Revoke all sessions</button>
+          </div>
+        </form>`
+      : `<p class="hint" style="margin:0 0 12px">Env-managed — rotate by changing <code>MANAGEMENT_KEY</code> / use SSO.</p>
+         <div class="btn-grp"><button type="button" class="btn btn-danger" id="mgmt-revoke-sessions-btn">Revoke all sessions</button></div>`}`;
 
   const outboundBody = `<dl class="kv">
     <dt>Local Master Vault</dt><dd>${badge('AES-256-GCM verified', 'b-ok')}</dd>
@@ -2003,10 +2441,10 @@ function renderKeysPage() {
 
   host.innerHTML = `${revealHtml}
     ${card('API keys', `${createFormHtml}${table(['Label', 'Prefix', 'Source', 'Status', 'Created', 'Actions'], keyRows, 'No API keys have been created.')}`, {
-      sub: 'Scoped service keys stored as SHA-256 hashes in SQLite with Vault-encrypted copy envelopes.'
+      sub: 'Scoped service keys with HMAC-SHA256 verification and Vault-encrypted copy envelopes.'
     })}
     <div class="grid-2">
-      ${card('Management key', mgmtBody, { sub: 'Controls operator sign-in sessions at /login.html.' })}
+      ${card('Management key', mgmtBody, { sub: 'Argon2id hash-only break-glass credential and session epoch.' })}
       ${card('Ecosystem credential posture', outboundBody, { sub: 'Masked status of server-to-server secrets.' })}
     </div>`;
 
@@ -2031,16 +2469,49 @@ function renderKeysPage() {
   });
 
   host.querySelectorAll('[data-key-copy]').forEach(btn => {
-    btn.onclick = () => busy(btn, async () => {
-      const res = await api(`/api/keys/${Number(btn.dataset.keyCopy)}/copy`, { method: 'POST' });
-      await copyText(res.secret);
-      toast('API key copied to clipboard', 'ok');
+    btn.addEventListener('click', () => busy(btn, async () => {
+      const res = await api(`/api/keys/${encodeURIComponent(btn.dataset.keyCopy)}/copy`, { method: 'POST' });
+      const ok = await copyText(res.secret);
+      if (ok) toast('API key copied to clipboard', 'ok');
+    }));
+  });
+
+  host.querySelectorAll('[data-key-rotate]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.keyRotate;
+      const label = btn.dataset.label || 'API key';
+      const m = modal(`<h3>Rotate API key</h3>
+        <p class="cell-sub" style="margin:6px 0 12px">Mint a new secret for <b>${esc(label)}</b> in-place. The previous secret stops working immediately (HTTP 401).</p>
+        <form id="rotate-key-form">
+          <label class="field"><span class="field-label">Custom secret (optional, min 24 chars)</span>
+            <input type="password" name="secret" placeholder="Leave blank to auto-generate strong secret" minlength="24" autocomplete="new-password">
+          </label>
+          <div class="acts">
+            <button type="button" class="btn" data-close>Cancel</button>
+            <button type="submit" class="btn btn-danger">Rotate key</button>
+          </div>
+        </form>`);
+      m.root.querySelector('#rotate-key-form').addEventListener('submit', ev => {
+        ev.preventDefault();
+        const fd = new FormData(ev.currentTarget);
+        const secret = String(fd.get('secret') || '').trim();
+        busy(ev.currentTarget.querySelector('[type="submit"]'), async () => {
+          const res = await api(`/api/keys/${encodeURIComponent(id)}/rotate`, {
+            method: 'POST',
+            body: secret ? { secret } : {}
+          });
+          m.close();
+          state.createdSecretBanner = { title: `Rotated API key "${res.item?.label || label}"`, secret: res.secret };
+          toast('API key rotated', 'ok');
+          await loadKeys();
+        });
+      });
     });
   });
 
   host.querySelectorAll('[data-key-rename]').forEach(btn => {
-    btn.onclick = () => {
-      const id = Number(btn.dataset.keyRename);
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.keyRename;
       const m = modal(`<h3>Rename API key</h3>
         <form id="rename-key-form" style="margin-top:12px">
           <label class="field"><span class="field-label">Key label</span>
@@ -2051,59 +2522,59 @@ function renderKeysPage() {
             <button type="submit" class="btn btn-primary">Save label</button>
           </div>
         </form>`);
-      m.root.querySelector('#rename-key-form').onsubmit = ev => {
+      m.root.querySelector('#rename-key-form').addEventListener('submit', ev => {
         ev.preventDefault();
         const fd = new FormData(ev.currentTarget);
         busy(ev.currentTarget.querySelector('[type="submit"]'), async () => {
-          await api(`/api/keys/${id}`, { method: 'PATCH', body: { label: fd.get('label') } });
+          await api(`/api/keys/${encodeURIComponent(id)}`, { method: 'PATCH', body: { label: fd.get('label') } });
           m.close();
           toast('API key renamed', 'ok');
           await loadKeys();
         });
-      };
-    };
-  });
-
-  host.querySelectorAll('[data-key-toggle]').forEach(btn => {
-    btn.onclick = () => busy(btn, async () => {
-      const res = await api(`/api/keys/${Number(btn.dataset.keyToggle)}/toggle`, { method: 'POST' });
-      toast(`API key ${res.status}`, 'ok');
-      await loadKeys();
+      });
     });
   });
 
+  host.querySelectorAll('[data-key-toggle]').forEach(btn => {
+    btn.addEventListener('click', () => busy(btn, async () => {
+      const res = await api(`/api/keys/${encodeURIComponent(btn.dataset.keyToggle)}/toggle`, { method: 'POST' });
+      toast(`API key ${res.status}`, 'ok');
+      await loadKeys();
+    }));
+  });
+
   host.querySelectorAll('[data-key-revoke]').forEach(btn => {
-    btn.onclick = async () => {
+    btn.addEventListener('click', async () => {
       const ok = await confirmModal({
         title: 'Revoke API key permanently?',
-        body: `Revoke <b>${esc(btn.dataset.label)}</b>? Its encrypted copy envelope will be wiped immediately and any client using it will receive HTTP 401.`,
+        body: `Revoke <b>${esc(btn.dataset.label)}</b>? Any client using it will receive HTTP 401 immediately, while the row stays visible for audit.`,
         confirm: 'Revoke key',
         danger: true
       });
       if (!ok) return;
       await busy(btn, async () => {
-        await api(`/api/keys/${Number(btn.dataset.keyRevoke)}/revoke`, { method: 'POST' });
+        await api(`/api/keys/${encodeURIComponent(btn.dataset.keyRevoke)}/revoke`, { method: 'POST' });
         toast('API key revoked', 'ok');
         await loadKeys();
       });
-    };
+    });
   });
 
   host.querySelectorAll('[data-key-delete]').forEach(btn => {
-    btn.onclick = async () => {
+    btn.addEventListener('click', async () => {
       const ok = await confirmModal({
-        title: 'Delete revoked key record?',
-        body: `Remove the tombstoned record for <b>${esc(btn.dataset.label)}</b> from the keys ledger?`,
-        confirm: 'Delete record',
+        title: 'Remove API key?',
+        body: `Permanently delete <b>${esc(btn.dataset.label)}</b> from the keys ledger? Any caller still presenting this token will receive HTTP 401 immediately.`,
+        confirm: 'Remove key',
         danger: true
       });
       if (!ok) return;
       await busy(btn, async () => {
-        await api(`/api/keys/${Number(btn.dataset.keyDelete)}`, { method: 'DELETE' });
-        toast('Revoked key record deleted', 'ok');
+        await api(`/api/keys/${encodeURIComponent(btn.dataset.keyDelete)}`, { method: 'DELETE' });
+        toast('API key removed', 'ok');
         await loadKeys();
       });
-    };
+    });
   });
 
   $('#mgmt-rotate-form')?.addEventListener('submit', async ev => {
@@ -2111,23 +2582,38 @@ function renderKeysPage() {
     const fd = new FormData(ev.currentTarget);
     const ok = await confirmModal({
       title: 'Rotate management key?',
-      body: 'Rotating the management key invalidates all active admin browser sessions immediately. Copy the replacement key before signing in again.',
+      body: 'Rotating the management key bumps the session epoch and invalidates all active admin browser sessions immediately. Copy the replacement key before signing in again.',
       confirm: 'Rotate key',
       danger: true
     });
     if (!ok) return;
-    await busy(ev.currentTarget.querySelector('button'), async () => {
+    await busy(ev.currentTarget.querySelector('[type="submit"]'), async () => {
       const res = await api('/api/mgmt/rotate', {
         method: 'POST',
         body: { current_key: fd.get('current_key') || '', secret: fd.get('secret') || '' }
       });
       modal(`<h3>Management key rotated</h3>
-        <p>Copy your new management key now. Your previous session has been invalidated.</p>
+        <p>Copy your new management key now (session epoch ${esc(res.session_epoch ?? '-')}). Your previous session has been invalidated.</p>
         <div class="alert alert-success" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
           ${copyChip(res.key)}
           <button type="button" class="btn btn-sm btn-primary" data-copy="${esc(res.key)}">Copy key</button>
         </div>
         <div class="acts"><a href="/login.html" class="btn btn-primary">Proceed to sign in</a></div>`);
+    });
+  });
+
+  $('#mgmt-revoke-sessions-btn')?.addEventListener('click', async ev => {
+    const btn = ev.currentTarget;
+    const ok = await confirmModal({
+      title: 'Revoke all active sessions?',
+      body: 'This bumps the session epoch and signs out every active browser session (including your current session) immediately.',
+      confirm: 'Revoke all sessions',
+      danger: true
+    });
+    if (!ok) return;
+    await busy(btn, async () => {
+      await api('/api/mgmt/revoke-sessions', { method: 'POST' });
+      location.assign('/login.html');
     });
   });
 }
@@ -2147,16 +2633,13 @@ async function loadSettings() {
 
 function renderSettingsPage() {
   const host = $('#body-settings');
-  const s = state.settings;
+  const s = state.settings || {};
   const vals = s.values || {};
   const srcs = s.sources || {};
-  const secs = s.secrets || {};
+  const authCfg = s.auth || null;
   const srcTag = src => src === 'environment'
     ? badge('Env managed', 'b-dim')
     : (src === 'database' ? badge('Saved in DB', 'b-acc') : badge('Default', 'b-dim'));
-  const secTag = meta => meta?.source === 'environment'
-    ? badge('Env managed', 'b-dim')
-    : (meta?.source === 'database' ? badge('Saved in Vault', 'b-ok') : badge('Unset', 'b-warn'));
 
   const cfgFormHtml = `<form id="settings-form">
     <label class="field">
@@ -2179,25 +2662,37 @@ function renderSettingsPage() {
     <button type="submit" class="btn btn-primary">Save runtime settings</button>
   </form>`;
 
-  const bearerEnv = secs.connector_bearer?.source === 'environment';
-  const delEnv = secs.delegation_secret?.source === 'environment';
-  const secFormHtml = `<p class="hint">Write-only pairing secrets for Business MCP Hub (<code>env_or_cfg</code>). When an environment variable is set in Portainer, the field is locked so UI edits never silently diverge from runtime env.</p>
-    <form id="pairing-secrets-form">
-      <label class="field">
-        <span class="field-label">Connector bearer token ${secTag(secs.connector_bearer)}</span>
-        <input type="password" name="connector_bearer" placeholder="${secs.connector_bearer?.configured ? 'Stored (enter new value to replace)' : 'Enter LNC_CONNECTOR_TOKEN'}" autocomplete="new-password" ${bearerEnv ? 'disabled' : ''}>
-      </label>
-      <label class="field">
-        <span class="field-label">Delegation HMAC secret ${secTag(secs.delegation_secret)}</span>
-        <input type="password" name="delegation_secret" placeholder="${secs.delegation_secret?.configured ? 'Stored (enter new value to replace)' : 'Enter LNC_DELEGATION_SECRET'}" autocomplete="new-password" ${delEnv ? 'disabled' : ''}>
-      </label>
-      <button type="submit" class="btn btn-primary" ${bearerEnv && delEnv ? 'disabled' : ''}>Save pairing secrets</button>
-    </form>`;
+  const oidcOn = Boolean(authCfg ? authCfg.oidc_enabled : state.auth?.oidc_enabled);
+  const issuerHost = authCfg?.oidc_issuer_host || authCfg?.issuer_host || authCfg?.oidc_issuer || '-';
+  const allowedUsers = Array.isArray(authCfg?.allowed_users)
+    ? authCfg.allowed_users.join(', ')
+    : (Array.isArray(authCfg?.oidc_allowed_users)
+      ? authCfg.oidc_allowed_users.join(', ')
+      : (authCfg?.allowed_users || '-'));
+  const sessionPolicy = authCfg?.session_policy || '12h idle / 7d max';
+  const currentTheme = document.documentElement.dataset.theme === 'light' ? 'Light' : 'Dark';
+  const appVer = state.overview?.version || state.auth?.version || '-';
+  const appSvc = state.auth?.service || 'lnc-care';
+
+  const authHtml = `<dl class="kv" style="margin-bottom:14px">
+    <dt>Keycloak OIDC SSO</dt><dd>${oidcOn ? badge('Enabled', 'b-ok') : badge('Disabled', 'b-dim')}</dd>
+    <dt>Issuer host</dt><dd class="mono">${esc(issuerHost)}</dd>
+    <dt>Allowed users</dt><dd><code>${esc(allowedUsers || '-')}</code></dd>
+    <dt>Session policy</dt><dd>${esc(sessionPolicy)}</dd>
+    <dt>Service &amp; version</dt><dd class="mono">${esc(appSvc)} · v${esc(appVer)}</dd>
+    <dt>Active theme</dt><dd>${esc(currentTheme)} <button type="button" class="btn btn-sm" id="settings-theme-btn" style="margin-left:8px">Switch theme</button></dd>
+  </dl>
+  <p class="hint" style="margin:0">Inbound <code>/mcp</code> pairing secrets have moved to <a href="#mcp-connectors">MCP Connectors</a>. Management key &amp; API keys live under <a href="#api-keys">API Keys</a>.</p>`;
 
   host.innerHTML = `<div class="grid-2">
     ${card('Runtime configuration', cfgFormHtml, { sub: 'Database settings apply immediately unless locked by environment.' })}
-    ${card('Hub pairing secrets', secFormHtml, { sub: 'Encrypted in Vault under pairing/connector when not env-managed.' })}
+    ${card('Authentication & console info', authHtml, { sub: 'Read-only OIDC policy, session TTLs and console theme.' })}
   </div>`;
+
+  $('#settings-theme-btn')?.addEventListener('click', () => {
+    $('#theme-toggle')?.click();
+    renderSettingsPage();
+  });
 
   $('#settings-form')?.addEventListener('submit', ev => {
     ev.preventDefault();
@@ -2210,25 +2705,6 @@ function renderSettingsPage() {
     busy(ev.currentTarget.querySelector('button'), async () => {
       state.settings = await api('/api/settings', { method: 'POST', body: payload });
       toast('Runtime settings saved', 'ok');
-      renderSettingsPage();
-    });
-  });
-
-  $('#pairing-secrets-form')?.addEventListener('submit', ev => {
-    ev.preventDefault();
-    const fd = new FormData(ev.currentTarget);
-    const payload = {};
-    const cb = String(fd.get('connector_bearer') || '').trim();
-    const ds = String(fd.get('delegation_secret') || '').trim();
-    if (cb) payload.connector_bearer = cb;
-    if (ds) payload.delegation_secret = ds;
-    if (!cb && !ds) {
-      toast('Enter a new token or secret to update Vault', 'err');
-      return;
-    }
-    busy(ev.currentTarget.querySelector('button'), async () => {
-      state.settings = await api('/api/settings', { method: 'POST', body: payload });
-      toast('Hub pairing secrets encrypted in Vault', 'ok');
       renderSettingsPage();
     });
   });
@@ -2277,21 +2753,21 @@ $('#shop-select')?.addEventListener('change', async ev => {
 });
 
 $$('[data-refresh]').forEach(btn => {
-  btn.onclick = () => busy(btn, async () => {
+  btn.addEventListener('click', () => busy(btn, async () => {
     state.discovered = {};
     await refreshOverview();
     await route();
     toast('Refreshed', 'ok');
-  });
+  }));
 });
 
 $$('[data-hub-sync]').forEach(btn => {
-  btn.onclick = () => busy(btn, async () => {
+  btn.addEventListener('click', () => busy(btn, async () => {
     const res = await api('/api/admin/hub/sync', { method: 'POST' });
     toast(`Synced via ${res.source}: +${res.pulled_shops} shops, +${res.pulled_channels || 0} channels`, 'ok');
     await refreshOverview();
     await route();
-  });
+  }));
 });
 
 $('#audit-verify-btn')?.addEventListener('click', ev => busy(ev.currentTarget, async () => {
@@ -2302,10 +2778,8 @@ $('#audit-verify-btn')?.addEventListener('click', ev => busy(ev.currentTarget, a
 
 window.addEventListener('hashchange', () => {
   $('#modal-root').innerHTML = '';
-  $$('.select.open').forEach(wrap => {
-    wrap.classList.remove('open');
-    wrap.querySelector('.select-btn')?.setAttribute('aria-expanded', 'false');
-  });
+  closeAllSelects();
+  cleanupOrphanSelectMenus();
   route().catch(fail);
   window.scrollTo(0, 0);
 });
@@ -2332,11 +2806,13 @@ window.addEventListener('scroll', () => {
     if (!location.hash) history.replaceState(null, '', '#overview');
     renderShell();
     const auth = await fetch('/api/auth/status', { credentials: 'same-origin' }).then(r => r.json());
-    if (!auth.ok && !auth.authenticated) {
+    if (!auth || !auth.authenticated) {
       location.replace('/login.html');
       return;
     }
+    state.auth = auth;
     state.csrf = auth.csrf_token || auth.csrf || '';
+    renderShell();
     try {
       const storedShop = localStorage.getItem('lnccare.shop');
       if (storedShop && storedShop !== 'all') state.shopId = Number(storedShop);

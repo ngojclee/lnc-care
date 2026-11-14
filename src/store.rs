@@ -621,6 +621,19 @@ CREATE TABLE IF NOT EXISTS api_keys (
     UNIQUE (organization_id, key_hash)
 );
 
+CREATE TABLE IF NOT EXISTS management_sessions (
+    token_hash TEXT PRIMARY KEY,
+    organization_id TEXT NOT NULL,
+    auth_method TEXT NOT NULL DEFAULT 'management_key',
+    username TEXT NOT NULL DEFAULT 'owner',
+    session_epoch INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    idle_expires_at INTEGER NOT NULL,
+    max_expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mgmt_sessions_exp ON management_sessions(organization_id, max_expires_at);
+
 CREATE INDEX IF NOT EXISTS idx_channels_org ON channels(organization_id, provider);
 CREATE INDEX IF NOT EXISTS idx_posts_channel ON posts(organization_id, channel_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(organization_id, post_id, created_at DESC);
@@ -732,6 +745,8 @@ pub fn initialize(path: &Path, organization_id: &str, organization_name: &str) -
         "TEXT NOT NULL DEFAULT 'xray_tun_failclosed'",
     )?;
     ensure_column(&db, "jobs", "max_attempts", "INTEGER NOT NULL DEFAULT 3")?;
+    ensure_column(&db, "api_keys", "last4", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(&db, "api_keys", "last_used_at", "INTEGER NOT NULL DEFAULT 0")?;
     db.execute(
         "INSERT OR IGNORE INTO organizations (id, name) VALUES (?1, ?2)",
         params![organization_id, organization_name],

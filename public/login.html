@@ -8,48 +8,18 @@
 <link rel="icon" type="image/png" href="/icon.png">
 <link rel="alternate icon" href="/favicon.ico">
 <link rel="apple-touch-icon" href="/icon.png">
-<link rel="stylesheet" href="/admin/style.css?v=0.4.0.0">
-<script>try{document.documentElement.dataset.theme=localStorage.getItem('lnc-care-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}catch(e){document.documentElement.dataset.theme='dark'}</script>
+<link rel="stylesheet" href="/admin/style.css?v=0.7.0.0">
+<script src="/theme-init.js"></script>
 </head>
 <body class="login-body">
-  <form class="login-panel" id="login-form" autocomplete="off">
+  <div class="login-panel" id="login-panel">
     <img class="login-logo" src="/icon.svg" alt="">
     <div class="login-title">LNC Care</div>
-    <div class="login-sub">Owned social care, AI triage &amp; forensic evidence console. Enter the management key to continue.</div>
-    <label class="field" for="key">
-      <span class="field-label">Management key</span>
-      <div class="input-wrap">
-        <input id="key" name="key" type="password" autocomplete="current-password" placeholder="Enter management key" required autofocus>
-        <button type="button" class="btn btn-icon btn-ghost" id="eye" aria-label="Show key" tabindex="-1">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>
-        </button>
-      </div>
-    </label>
+    <div class="login-sub" id="login-sub">Owned social care, AI triage &amp; forensic evidence console.</div>
     <div class="alert alert-danger" id="err" hidden style="margin-bottom:14px"></div>
-    <button class="btn btn-primary" id="signin" type="submit" disabled>Sign in</button>
-    <div class="login-foot">The key lives in the <code>MANAGEMENT_KEY</code> stack variable. Sessions expire automatically.</div>
-  </form>
-<script>
-const f=document.getElementById('login-form'),k=document.getElementById('key'),b=document.getElementById('signin'),e=document.getElementById('err'),eye=document.getElementById('eye');
-let pending=false;
-const syncBtn=()=>{b.disabled=pending||!k.value.trim()};
-k.addEventListener('input',syncBtn);
-eye.onclick=()=>{const on=k.type==='password';k.type=on?'text':'password';eye.setAttribute('aria-label',on?'Hide key':'Show key');k.focus()};
-fetch('/api/auth/status',{credentials:'same-origin'}).then(r=>r.json()).then(s=>{if(s.ok||s.authenticated){location.replace('/admin/#overview');return}k.focus();syncBtn()}).catch(()=>{k.focus();syncBtn()});
-f.addEventListener('submit',async ev=>{
-  ev.preventDefault();if(!k.value.trim()||pending)return;
-  pending=true;syncBtn();e.hidden=true;
-  const submitted=k.value;
-  k.value='';
-  try{
-    const r=await fetch('/api/auth/login',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:submitted})});
-    if(r.ok){location.assign('/admin/#overview');return}
-    const j=await r.json().catch(()=>({}));
-    throw new Error(r.status===429?'Too many attempts. Wait 5 minutes and try again.':r.status===401?'Wrong management key.':(j.detail||'Sign-in failed.'));
-  }catch(x){
-    pending=false;e.textContent=x.message;e.hidden=false;syncBtn();k.focus();
-  }
-});
-</script>
+    <div id="login-methods"></div>
+    <div class="login-foot">Sessions expire automatically after inactivity.</div>
+  </div>
+<script src="/login.js" defer></script>
 </body>
 </html>

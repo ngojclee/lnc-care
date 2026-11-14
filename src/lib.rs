@@ -1,9 +1,10 @@
 //! LNC Care (`v0.6.0.0`) — Owned social care, AI rubric triage, forensic Evidence Vault, Multi-Account Fleet & MCP connector.
 
-pub const VERSION: &str = "0.6.0.0";
+pub const VERSION: &str = "0.7.0.0";
 
 pub mod agent_hub;
 pub mod audit;
+pub mod auth_core;
 pub mod connections;
 pub mod evaluator;
 pub mod evidence;
@@ -11,6 +12,7 @@ pub mod fleet;
 pub mod internal_bridge;
 pub mod mcp_gateway;
 pub mod mcp_server;
+pub mod oidc;
 pub mod providers;
 pub mod routes;
 pub mod settings;

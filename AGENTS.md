@@ -36,3 +36,12 @@ Conventions (same family as `lnc-ads`):
   per `release-portainer-app`.
 - Skill ownership: user-facing skill is `lnm-care`; repo/app/audience stay
   `lnc-care`.
+
+Blueprint v2.0 admin/auth contract (0.7.0.0):
+
+- Sign-in: Keycloak OIDC (`/api/auth/oidc/login` -> `/callback`, Authorization Code + PKCE S256, `OIDC_ALLOWED_USERS` allowlist fail-closed) plus break-glass `MANAGEMENT_KEY` (Argon2id, 8 failures / 5 min / IP -> 429). Legacy PBKDF2 runtime keys are upgraded to Argon2id on first successful sign-in.
+- Sessions are server-side (`management_sessions`): cookie `lnc_care_sess` `HttpOnly; SameSite=Lax; Secure(auto)`, `SESSION_IDLE_TTL_SECONDS` (12h) / `SESSION_MAX_TTL_SECONDS` (7d) and a durable `session_epoch` (rotate management key / `POST /api/mgmt/revoke-sessions` kills every cookie). `POST /api/auth/logout` is local-only (never calls the IdP).
+- CSRF: per-session `X-CSRF-Token` held in JS memory only + same-origin `Origin`/`Referer`/`Sec-Fetch-Site` check; `X-Forwarded-Host` is never trusted. Query-string secrets (`?token=`) are rejected with 400. `MANAGEMENT_KEY` is not an API bearer.
+- Crypto: vault stays AES-256-GCM envelope under `LNC_MASTER_KEY` (+ `LNC_PREVIOUS_MASTER_KEY` decrypt fallback, zero data loss); HKDF-SHA256 subkeys (`csrf`, `oidc-tx`, `api-key-pepper`). New/rotated API keys store `hmac1:` HMAC-SHA256 digests; pre-upgrade SHA-256 rows keep authenticating; Copy needs the vault envelope (legacy rows: `Rotate to enable Copy`).
+- Admin nav: domain pages -> `#api-keys` -> `#mcp-connectors` -> `#settings` (LLM Providers is hidden: lnc-care has no AI consumer). Aliases `#keys`/`#connector` redirect. Every credential row exposes Copy · Rotate · Revoke · Remove (`POST .../copy` is audited, rate limited 15 / 5 min / IP, `no-store`).
+- Inbound `/mcp` pairing is managed under `/api/mcp-connectors/inbound-mcp/{copy,rotate,revoke,test}` and `DELETE`; revoking returns 403 `mcp_connector_revoked`.

@@ -10,11 +10,14 @@ path = "src/main.rs"
 
 [dependencies]
 aes-gcm = "0.10"
+argon2 = "0.5.3"
 axum = { version = "0.7", features = ["macros"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 hex = "0.4"
+hkdf = "0.12.4"
 hmac = "0.12"
+jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
 regex = "1.11"
@@ -31,3 +34,9 @@ url = "2.5"
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3.14"
+
+[profile.dev.package.argon2]
+opt-level = 2
+
+[profile.dev.package.blake2]
+opt-level = 2

@@ -4,9 +4,11 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use hkdf::Hkdf;
 use rand::RngCore;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use sha2::Sha256;
 
 use crate::audit::canonical_ascii_json;
 
@@ -38,7 +40,6 @@ pub fn parse_master_key(value: &str) -> Result<[u8; 32], VaultError> {
 #[derive(Clone)]
 pub struct Vault {
     key: [u8; 32],
-    #[allow(dead_code)]
     previous_key: Option<[u8; 32]>,
     pub ready: bool,
 }
@@ -118,6 +119,38 @@ impl Vault {
     }
 
     pub fn open(&self, org: &str, kind: &str, subject: &str, envelope: &str) -> Result<Value, VaultError> {
+        let current = self.open_with_key(&self.key, org, kind, subject, envelope);
+        if current.is_ok() {
+            return current;
+        }
+        // Zero-loss rotation: records still wrapped under LNC_PREVIOUS_MASTER_KEY stay readable.
+        if let Some(prev) = &self.previous_key {
+            if let Ok(val) = self.open_with_key(prev, org, kind, subject, envelope) {
+                return Ok(val);
+            }
+        }
+        current
+    }
+
+    /// HKDF-SHA256 subkey (`vault-kek`, `session-hmac`, `csrf`, `oidc-tx`, `api-key-pepper`, ...)
+    /// derived from `LNC_MASTER_KEY`; the raw master key never leaves the vault.
+    pub fn derive_key(&self, info: &str) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(None, &self.key);
+        let mut out = [0u8; 32];
+        let label = format!("lnc:lnc-care:{info}:v1");
+        hk.expand(label.as_bytes(), &mut out)
+            .expect("32-byte HKDF output is always valid");
+        out
+    }
+
+    fn open_with_key(
+        &self,
+        key: &[u8; 32],
+        org: &str,
+        kind: &str,
+        subject: &str,
+        envelope: &str,
+    ) -> Result<Value, VaultError> {
         let unreadable = || {
             VaultError("Credential store is unreadable; restore the correct key or backup".to_string())
         };
@@ -143,7 +176,7 @@ impl Vault {
         }
 
         let aad = Self::aad(org, kind, subject);
-        let master_cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| unreadable())?;
+        let master_cipher = Aes256Gcm::new_from_slice(key).map_err(|_| unreadable())?;
         let data_key = master_cipher
             .decrypt(
                 Nonce::from_slice(&kn),

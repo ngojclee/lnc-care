@@ -21,11 +21,22 @@ services:
       MANAGEMENT_KEY: ${MANAGEMENT_KEY:-}
       CARE_ADMIN_BOOTSTRAP_KEY: ${CARE_ADMIN_BOOTSTRAP_KEY:-}
       LNC_API_KEYS: ${LNC_API_KEYS:-}
-      SESSION_SECRET: ${SESSION_SECRET:?set-session-secret}
+      SESSION_SECRET: ${SESSION_SECRET:-}
       LNC_MASTER_KEY: ${LNC_MASTER_KEY:?set-64-hex-master-key}
       LNC_PREVIOUS_MASTER_KEY: ${LNC_PREVIOUS_MASTER_KEY:-}
       ORGANIZATION_ID: ${ORGANIZATION_ID:?set-organization-id}
       ORGANIZATION_NAME: ${ORGANIZATION_NAME:-}
+      # Blueprint v2.0 sign-in: Keycloak OIDC (Authorization Code + PKCE S256) + break-glass MANAGEMENT_KEY
+      OIDC_ENABLED: ${OIDC_ENABLED:-true}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-https://auth.lengoc.me/realms/lengoc}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-lnc-care}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-https://care-mcp.lengoc.me/api/auth/oidc/callback}
+      OIDC_ALLOWED_USERS: ${OIDC_ALLOWED_USERS:-louis}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email}
+      COOKIE_SECURE: ${COOKIE_SECURE:-auto}
+      SESSION_IDLE_TTL_SECONDS: ${SESSION_IDLE_TTL_SECONDS:-43200}
+      SESSION_MAX_TTL_SECONDS: ${SESSION_MAX_TTL_SECONDS:-604800}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://care-mcp.lengoc.me}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,10.21.4.101,care-mcp.lengoc.me}
       PROVIDER_WRITES_ENABLED: ${PROVIDER_WRITES_ENABLED:-false}
@@ -101,6 +112,17 @@ services:
       LNC_PREVIOUS_MASTER_KEY: ${LNC_PREVIOUS_MASTER_KEY:-}
       ORGANIZATION_ID: ${ORGANIZATION_ID:?set-organization-id}
       ORGANIZATION_NAME: ${ORGANIZATION_NAME:-}
+      # Blueprint v2.0 sign-in: Keycloak OIDC (Authorization Code + PKCE S256) + break-glass MANAGEMENT_KEY
+      OIDC_ENABLED: ${OIDC_ENABLED:-true}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-https://auth.lengoc.me/realms/lengoc}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-lnc-care}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-https://care-mcp.lengoc.me/api/auth/oidc/callback}
+      OIDC_ALLOWED_USERS: ${OIDC_ALLOWED_USERS:-louis}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email}
+      COOKIE_SECURE: ${COOKIE_SECURE:-auto}
+      SESSION_IDLE_TTL_SECONDS: ${SESSION_IDLE_TTL_SECONDS:-43200}
+      SESSION_MAX_TTL_SECONDS: ${SESSION_MAX_TTL_SECONDS:-604800}
       PROVIDER_WRITES_ENABLED: ${PROVIDER_WRITES_ENABLED:-false}
       LNC_AGENT_HUB_URL: ${LNC_AGENT_HUB_URL:-http://10.21.4.101:8380}
       LNC_AGENT_HUB_API_KEY: ${LNC_AGENT_HUB_API_KEY:-}

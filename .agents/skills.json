@@ -14,8 +14,9 @@
         "lnm-ui-ux",
         "lnm-care",
         "lnc-cygnus-telegram-notify",
-        "w5-versioningconvention",
-        "w13-skill-safety-review"
+        "lnc-keycloak",
+        "w13-githubmainbackup",
+        "w17-skill-safety-review"
       ]
     }
   ]

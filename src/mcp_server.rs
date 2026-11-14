@@ -2575,7 +2575,7 @@ pub fn handle_mcp_http(
         }
     }
 
-    let (loaded_cfg, pairing_ui) = match store::connect_readonly(&cfg.path) {
+    let (loaded_cfg, pairing_ui, connector_revoked) = match store::connect_readonly(&cfg.path) {
         Ok(db) => {
             let loaded = settings::load(&db, &cfg.org, &cfg.env_map);
             let p_ui = if cfg.vault.ready {
@@ -2583,7 +2583,15 @@ pub fn handle_mcp_http(
             } else {
                 None
             };
-            (loaded, p_ui.unwrap_or_else(|| json!({})))
+            let revoked = db
+                .query_row(
+                    "SELECT value FROM runtime_settings WHERE organization_id=?1 AND key='__connector_revoked'",
+                    rusqlite::params![cfg.org],
+                    |r| r.get::<_, String>(0),
+                )
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            (loaded, p_ui.unwrap_or_else(|| json!({})), revoked)
         }
         Err(e) => {
             return json_resp(
@@ -2621,6 +2629,13 @@ pub fn handle_mcp_http(
         return json_resp(
             StatusCode::UNAUTHORIZED,
             &json!({ "error": "Invalid MCP bearer token" }),
+            &[],
+        );
+    }
+    if connector_revoked {
+        return json_resp(
+            StatusCode::FORBIDDEN,
+            &json!({ "error": "mcp_connector_revoked" }),
             &[],
         );
     }

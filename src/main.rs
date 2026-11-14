@@ -191,7 +191,12 @@ async fn main() {
                 }
             };
             eprintln!("lnc-care v{} listening on http://{addr}", lnc_care::VERSION);
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
                 eprintln!("server error: {e}");
                 std::process::exit(1);
             }

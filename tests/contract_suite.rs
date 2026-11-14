@@ -981,9 +981,9 @@ async fn test_static_blueprint_assets_icons_and_english_only_ui() {
         "fleet",
         "channels",
         "rules",
-        "connector",
         "audit",
-        "keys",
+        "api-keys",
+        "mcp-connectors",
         "settings",
     ] {
         assert!(
@@ -1004,6 +1004,11 @@ async fn test_static_blueprint_assets_icons_and_english_only_ui() {
     assert!(css.contains(".table-err"));
     assert!(css.contains(".content{flex:1;padding:22px 28px;max-width:none;width:100%;margin:0}"));
 
+    // Blueprint v2.0: no inline script (CSP script-src 'self'), external theme/login scripts served.
+    assert_eq!(c.get("/theme-init.js").await.status, 200);
+    assert_eq!(c.get("/login.js").await.status, 200);
+    assert!(!login_html.contains("<script>"), "inline script blocked by CSP");
+    assert!(!index_html.contains("<script>"), "inline script blocked by CSP");
     let js = c.get("/app.js").await.text();
     assert!(js.contains("function enhanceSelect"));
     assert!(js.contains("enhanceAllSelects"));
@@ -1069,7 +1074,10 @@ async fn test_api_keys_lifecycle_and_cookie_free_bearer_status() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(stored_hash, hex::encode(Sha256::digest(raw_key.as_bytes())));
+    // Dual persistence: HMAC-SHA256(pepper) auth digest (never the raw secret / plain SHA-256).
+    assert!(stored_hash.starts_with("hmac1:"));
+    assert_ne!(stored_hash, hex::encode(Sha256::digest(raw_key.as_bytes())));
+    assert!(!stored_hash.contains(&raw_key));
 
     // Cookie-free Bearer call to `/api/status` succeeds
     let mut probe = TestClient::new(router);
@@ -1132,12 +1140,31 @@ async fn test_api_keys_lifecycle_and_cookie_free_bearer_status() {
         200
     );
 
-    // DELETE before revoke returns 409 Conflict
+    // Rotate mints a fresh secret in place: old Bearer dies at once, new one works, Copy follows.
+    let rot = c
+        .post_json(
+            &format!("/api/keys/{key_id}/rotate"),
+            &json!({}),
+            &[("x-csrf-token", &csrf)],
+        )
+        .await;
+    assert_eq!(rot.status, 200);
+    let rotated_key = rot.json()["secret"].as_str().unwrap().to_string();
+    assert_ne!(rotated_key, raw_key);
     assert_eq!(
-        c.delete(&format!("/api/keys/{key_id}"), &[("x-csrf-token", &csrf)])
+        probe
+            .get_with_headers("/api/status", &[("authorization", &bearer_hdr)])
             .await
             .status,
-        409
+        401
+    );
+    let bearer_hdr = format!("Bearer {rotated_key}");
+    assert_eq!(
+        probe
+            .get_with_headers("/api/status", &[("authorization", &bearer_hdr)])
+            .await
+            .status,
+        200
     );
 
     // Revoke wipes Vault copy & blocks Bearer; DELETE then returns 200
