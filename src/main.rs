@@ -95,7 +95,12 @@ fn run_rotate_vault(args: &[String]) -> Result<(), String> {
 
     let prev_env = std::env::var("LNC_PREVIOUS_MASTER_KEY")
         .ok()
-        .filter(|s| !s.trim().is_empty());
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("LNC_MASTER_KEY_OLD")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
     let cur_env = std::env::var("LNC_MASTER_KEY")
         .ok()
         .filter(|s| !s.trim().is_empty());

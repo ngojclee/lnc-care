@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as StdPath, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -82,7 +82,8 @@ pub struct AppState {
     pub env_map: HashMap<String, String>,
     pub local_hosts: HashSet<String>,
     pub attempts: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
-    pub oidc: OidcConfig,
+    pub oidc: Arc<RwLock<OidcConfig>>,
+    pub oidc_env: OidcConfig,
     pub oidc_cache: Arc<Mutex<OidcCache>>,
     pub transport: SharedTransport,
     /// `COOKIE_SECURE`: Some(true|false) forces the flag, None = auto (HTTPS request / X-Forwarded-Proto).
@@ -371,10 +372,20 @@ impl AppState {
             .unwrap_or(1)
     }
 
+    pub fn current_oidc(&self) -> OidcConfig {
+        self.oidc.read().expect("oidc read lock").clone()
+    }
+
+    pub fn reload_oidc(&self, cfg: OidcConfig) {
+        *self.oidc.write().expect("oidc write lock") = cfg;
+        *self.oidc_cache.lock().expect("oidc cache poisoned") = OidcCache::default();
+    }
+
     fn mgmt_inventory(&self) -> Result<Value, AppError> {
         let epoch = self.session_epoch();
+        let oidc = self.current_oidc();
         let mut auth_methods = vec!["management_key"];
-        if self.oidc.is_active() {
+        if oidc.is_active() {
             auth_methods.push("oidc");
         }
         let common = |v: Value| -> Value {
@@ -382,7 +393,7 @@ impl AppState {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("hash_algo".into(), json!("argon2id"));
                 obj.insert("session_epoch".into(), json!(epoch));
-                obj.insert("oidc_enabled".into(), json!(self.oidc.is_active()));
+                obj.insert("oidc_enabled".into(), json!(oidc.is_active()));
                 obj.insert("auth_methods".into(), json!(auth_methods));
             }
             v
@@ -529,7 +540,7 @@ impl AppState {
         if let Some(h) = auth_core::url_host(&self.public_base_env) {
             hosts.push(h);
         }
-        if let Some(h) = auth_core::url_host(&self.oidc.redirect_uri) {
+        if let Some(h) = auth_core::url_host(&self.current_oidc().redirect_uri) {
             hosts.push(h);
         }
         hosts.retain(|h| !h.is_empty());
@@ -859,7 +870,10 @@ impl AppState {
 
 async fn host_gate_mw(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let req_path = req.uri().path();
-    if req_path != "/health" && req_path != "/webhooks/meta" {
+    if req_path != "/health"
+        && req_path != "/webhooks/meta"
+        && !req_path.starts_with("/v1/app-connectors/")
+    {
         if let Ok(cfg) = state.current_settings() {
             let raw_host = header_str(req.headers(), "host");
             let host = if raw_host.starts_with('[') {
@@ -1088,38 +1102,93 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
     let pk_ref = cfg
         .previous_master_key
         .as_deref()
-        .or_else(|| env_map.get("LNC_PREVIOUS_MASTER_KEY").map(|s| s.as_str()));
+        .or_else(|| {
+            env_map
+                .get("LNC_PREVIOUS_MASTER_KEY")
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| env_map.get("LNC_MASTER_KEY_OLD"))
+                .map(|s| s.as_str())
+        });
     let vault = Vault::new(mk_ref, pk_ref).map_err(|e| e.0)?;
 
-    {
+    let oidc_env = OidcConfig::from_env(&env_map);
+    let oidc_eff = {
         let db = store::connect(&path).map_err(|e| e.to_string())?;
         vault.verify_master(&db, &org).map_err(|e| e.0)?;
-        if env_mgmt_key.is_empty() && !bootstrap_mgmt_key.is_empty() {
-            let exists: Option<String> = db
-                .query_row(
-                    "SELECT value FROM runtime_settings WHERE organization_id=?1 AND key='__mgmt_state'",
-                    params![org],
-                    |r| r.get(0),
-                )
-                .ok();
-            if exists.is_none() {
-                let phc = auth_core::hash_argon2id(&bootstrap_mgmt_key)
-                    .map_err(|e| format!("management key hash failed: {e}"))?;
-                let pfx: String = bootstrap_mgmt_key.chars().take(12).collect();
-                let state_obj = json!({
-                    "algo": "argon2id",
-                    "phc": phc,
-                    "prefix": pfx,
-                    "created_at": now_unix(),
-                });
-                db.execute(
-                    "INSERT INTO runtime_settings(organization_id, key, value) VALUES (?1, '__mgmt_state', ?2)",
-                    params![org, state_obj.to_string()],
-                )
-                .map_err(|e| e.to_string())?;
+        drop(db);
+        store::with_write_tx_str(&path, |db| -> Result<OidcConfig, String> {
+            if let Some(prev_key) = vault.previous_key_bytes() {
+                if prev_key != vault.master_key_bytes() {
+                    let rewrapped = vault.rewrap_from_previous(db, &org).map_err(|e| e.0)?;
+                    let new_pepper = vault.derive_key("api-key-pepper");
+                    let rows = query_maps(
+                        db,
+                        "SELECT id, key_hash FROM api_keys WHERE organization_id=?",
+                        &[org.clone().into()],
+                    );
+                    let mut repeppered = 0usize;
+                    for r in rows {
+                        let id_val = r.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let kh = r.get("key_hash").and_then(|v| v.as_str()).unwrap_or("");
+                        if id_val > 0 && kh.starts_with("hmac1:") {
+                            if let Ok(Some(sec_val)) = vault.get(db, &org, "api_key", &id_val.to_string()) {
+                                if let Some(secret) = sec_val.get("secret").and_then(|v| v.as_str()) {
+                                    let new_digest = auth_core::api_key_digest(&new_pepper, secret);
+                                    if new_digest != kh {
+                                        db.execute(
+                                            "UPDATE api_keys SET key_hash=?1 WHERE organization_id=?2 AND id=?3",
+                                            params![new_digest, org, id_val],
+                                        )
+                                        .map_err(|e| e.to_string())?;
+                                        repeppered += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if rewrapped > 0 || repeppered > 0 {
+                        let _ = audit::append(
+                            db,
+                            &org,
+                            "system",
+                            "vault.master_key_rotated",
+                            "vault",
+                            &json!({
+                                "rewrapped_envelopes": rewrapped,
+                                "repeppered_api_keys": repeppered,
+                            }),
+                        );
+                    }
+                }
             }
-        }
-    }
+            if env_mgmt_key.is_empty() && !bootstrap_mgmt_key.is_empty() {
+                let exists: Option<String> = db
+                    .query_row(
+                        "SELECT value FROM runtime_settings WHERE organization_id=?1 AND key='__mgmt_state'",
+                        params![org],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if exists.is_none() {
+                    let phc = auth_core::hash_argon2id(&bootstrap_mgmt_key)
+                        .map_err(|e| format!("management key hash failed: {e}"))?;
+                    let pfx: String = bootstrap_mgmt_key.chars().take(12).collect();
+                    let state_obj = json!({
+                        "algo": "argon2id",
+                        "phc": phc,
+                        "prefix": pfx,
+                        "created_at": now_unix(),
+                    });
+                    db.execute(
+                        "INSERT INTO runtime_settings(organization_id, key, value) VALUES (?1, '__mgmt_state', ?2)",
+                        params![org, state_obj.to_string()],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            oidc::load_effective_config(db, &org, &oidc_env, &vault)
+        })?
+    };
 
     let bridge = match cfg.bridge_config {
         Some(b) => Some(b),
@@ -1224,7 +1293,6 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
         30 * 24 * 3600,
     )
     .max(session_idle_secs);
-    let oidc_cfg = OidcConfig::from_env(&env_map);
     let public_base_env = env_first(&env_map, &["PUBLIC_BASE_URL"]);
     let oidc_transport: SharedTransport = cfg
         .transport
@@ -1254,7 +1322,8 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
         env_map,
         local_hosts,
         attempts: Arc::new(Mutex::new(HashMap::new())),
-        oidc: oidc_cfg,
+        oidc: Arc::new(RwLock::new(oidc_eff)),
+        oidc_env,
         oidc_cache: Arc::new(Mutex::new(OidcCache::default())),
         transport: oidc_transport,
         cookie_secure_mode,
@@ -1521,6 +1590,29 @@ pub fn build_router(cfg: AppConfig) -> Result<Router, String> {
             "/api/settings",
             get(get_settings_handler).post(post_settings_handler),
         )
+        .route(
+            "/api/admin/oidc",
+            get(get_oidc_handler)
+                .put(save_oidc_handler)
+                .post(save_oidc_handler)
+                .patch(save_oidc_handler),
+        )
+        .route(
+            "/api/oidc",
+            get(get_oidc_handler)
+                .put(save_oidc_handler)
+                .post(save_oidc_handler)
+                .patch(save_oidc_handler),
+        )
+        .route("/api/admin/oidc/test", post(test_oidc_handler))
+        .route("/api/oidc/test", post(test_oidc_handler))
+        .route("/api/admin/oidc/reset", post(reset_oidc_handler))
+        .route("/api/oidc/reset", post(reset_oidc_handler))
+        .route("/v1/app-connectors/lnc-care/health", get(connector_app_health_handler))
+        .route("/v1/app-connectors/lnc-care/healthz", get(connector_app_health_handler))
+        .route("/v1/app-connectors/lnc-care/mcp/health", get(connector_app_health_handler))
+        .route("/v1/app-connectors/lnc-care/mcp", any(connector_app_mcp_handler))
+        .route("/v1/app-connectors/lnc-care/mcp/", any(connector_app_mcp_handler))
         .route("/", get(root_handler))
         .route("/login.html", get(login_page_handler))
         .route("/admin", get(admin_page_handler))
@@ -1735,7 +1827,7 @@ async fn auth_status_handler(
         "authenticated": authenticated,
         "service": st.audience,
         "version": crate::VERSION,
-        "oidc_enabled": st.oidc.is_active(),
+        "oidc_enabled": st.current_oidc().is_active(),
         "management_configured": st.mgmt_configured(),
         "auth_method": sess.as_ref().map(|s| s.auth_method.clone()),
         "username": sess.as_ref().map(|s| s.username.clone()),
@@ -1946,7 +2038,7 @@ async fn sso_consume_handler(
     uri: Uri,
 ) -> Result<Response, AppError> {
     st.check_rate("sso_consume:local", 20, 60)?;
-    if !st.mgmt_configured() && !st.oidc.is_active() {
+    if !st.mgmt_configured() && !st.current_oidc().is_active() {
         return Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "management_key_not_configured",
@@ -5080,6 +5172,11 @@ async fn connector_info_handler(
         "audience": st.audience,
         "namespace": "care__*",
         "endpoint": if !base.is_empty() { format!("{base}/mcp") } else { "/mcp".to_string() },
+        "app_connector_endpoint": if !base.is_empty() {
+            format!("{base}/v1/app-connectors/lnc-care/mcp")
+        } else {
+            "/v1/app-connectors/lnc-care/mcp".to_string()
+        },
         "transport": "streamable-http",
         "ready": paired && !revoked,
         "paired": paired,
@@ -5348,14 +5445,15 @@ async fn get_settings_handler(
     st.require_admin(&method, &headers)?;
     let db = store::connect_readonly(&st.path)?;
     let mut res = settings::load_with_sources(&db, &st.org, &st.env_map);
+    let oidc = st.current_oidc();
     if let Some(obj) = res.as_object_mut() {
         obj.insert("secrets".to_string(), st.pairing_secrets_summary(&db));
         obj.insert(
             "auth".to_string(),
             json!({
-                "oidc_enabled": st.oidc.is_active(),
-                "oidc_issuer_host": st.oidc.issuer_host(),
-                "oidc_allowed_users": st.oidc.allowed_users,
+                "oidc_enabled": oidc.is_active(),
+                "oidc_issuer_host": oidc.issuer_host(),
+                "oidc_allowed_users": oidc.allowed_users,
                 "session_idle_seconds": st.session_idle_secs,
                 "session_max_seconds": st.session_max_secs,
                 "management_hash_algo": "argon2id",
@@ -5532,4 +5630,209 @@ async fn connector_mcp_handler(
     raw_body: Bytes,
 ) -> Response {
     mcp_server::handle_mcp_http(&st.mcp_cfg, &method, &headers, &raw_body)
+}
+
+async fn connector_app_mcp_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Response {
+    mcp_server::handle_app_connector_mcp_http(&st.mcp_cfg, &method, &headers, &raw_body)
+}
+
+async fn connector_app_health_handler(State(st): State<Arc<AppState>>) -> Json<Value> {
+    let revoked = store::connect_readonly(&st.path)
+        .map(|db| st.connector_revoked(&db))
+        .unwrap_or(false);
+    Json(json!({
+        "status": "ok",
+        "service": "lnc-care",
+        "app_id": st.audience,
+        "version": crate::VERSION,
+        "protocol": "v4s",
+        "connector_enabled": !revoked,
+        "tool_count": mcp_server::tool_scopes_map().len(),
+    }))
+}
+
+fn merge_oidc_candidate(
+    base: &OidcConfig,
+    body: &Value,
+) -> Result<(OidcConfig, Option<String>), AppError> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| AppError::new(StatusCode::UNPROCESSABLE_ENTITY, "JSON object expected"))?;
+    let enabled = obj
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(base.enabled);
+    let issuer_url = match obj.get("issuer_url").and_then(|v| v.as_str()) {
+        Some(raw) => oidc::validate_http_url(raw, "issuer_url")
+            .map_err(|e| AppError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?,
+        None => base.issuer_url.clone(),
+    };
+    let redirect_uri = match obj.get("redirect_uri").and_then(|v| v.as_str()) {
+        Some(raw) => oidc::validate_http_url(raw, "redirect_uri")
+            .map_err(|e| AppError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?,
+        None => base.redirect_uri.clone(),
+    };
+    let client_id = match obj.get("client_id").and_then(|v| v.as_str()) {
+        Some(s) => s.trim().to_string(),
+        None => base.client_id.clone(),
+    };
+    let allowed_users = match obj.get("allowed_users") {
+        Some(v) => oidc::parse_allowed_users_value(v)
+            .map_err(|e| AppError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?,
+        None => base.allowed_users.clone(),
+    };
+    let scopes = match obj.get("scopes").and_then(|v| v.as_str()) {
+        Some(s) => oidc::normalize_scopes(s),
+        None => base.scopes.clone(),
+    };
+    let submitted_secret = obj
+        .get("client_secret")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "********")
+        .map(|s| s.to_string());
+    let client_secret = submitted_secret
+        .clone()
+        .unwrap_or_else(|| base.client_secret.clone());
+    Ok((
+        OidcConfig {
+            enabled,
+            issuer_url,
+            client_id,
+            client_secret,
+            redirect_uri,
+            allowed_users,
+            scopes,
+            source: "database".to_string(),
+        },
+        submitted_secret,
+    ))
+}
+
+async fn get_oidc_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    Ok(Json(oidc::effective_summary(
+        &st.current_oidc(),
+        &st.oidc_env,
+    )))
+}
+
+async fn save_oidc_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let body = parse_json_body(&raw_body)?;
+    let current = st.current_oidc();
+    let (candidate, new_secret) = merge_oidc_candidate(&current, &body)?;
+    if candidate.enabled {
+        if candidate.issuer_url.is_empty() || candidate.client_id.is_empty() || candidate.client_secret.is_empty() {
+            return Err(AppError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "issuer_url, client_id, and client_secret are required when OIDC is enabled",
+            ));
+        }
+        if candidate.allowed_users.is_empty() {
+            return Err(AppError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "allowed_users must list at least one authorized user when OIDC is enabled",
+            ));
+        }
+    }
+    let stored_cfg = json!({
+        "enabled": candidate.enabled,
+        "issuer_url": candidate.issuer_url,
+        "client_id": candidate.client_id,
+        "redirect_uri": candidate.redirect_uri,
+        "allowed_users": candidate.allowed_users,
+        "scopes": candidate.scopes,
+    });
+    store::with_write_tx(&st.path, |db| -> Result<(), AppError> {
+        db.execute(
+            "INSERT INTO runtime_settings(organization_id, key, value) VALUES (?1, '__oidc_config', ?2)
+             ON CONFLICT(organization_id, key) DO UPDATE SET value=excluded.value",
+            params![st.org, stored_cfg.to_string()],
+        )?;
+        if let Some(sec) = &new_secret {
+            st.vault.put(
+                db,
+                &st.org,
+                "auth",
+                "oidc_client_secret",
+                &json!({ "client_secret": sec }),
+            )?;
+        }
+        audit::append(
+            db,
+            &st.org,
+            "owner",
+            "oidc.updated",
+            "oidc",
+            &json!({
+                "enabled": candidate.enabled,
+                "issuer_host": candidate.issuer_host(),
+                "allowed_users_count": candidate.allowed_users.len(),
+                "secret_updated": new_secret.is_some(),
+            }),
+        )?;
+        Ok(())
+    })?;
+    let eff = {
+        let db = store::connect_readonly(&st.path)?;
+        oidc::load_effective_config(&db, &st.org, &st.oidc_env, &st.vault)
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    };
+    st.reload_oidc(eff.clone());
+    Ok(Json(oidc::effective_summary(&eff, &st.oidc_env)))
+}
+
+async fn test_oidc_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    let base = st.current_oidc();
+    let candidate = if raw_body.is_empty() {
+        base
+    } else {
+        let body = parse_json_body(&raw_body)?;
+        merge_oidc_candidate(&base, &body)?.0
+    };
+    match oidc::probe_discovery_and_jwks(st.transport.clone(), &candidate.issuer_url).await {
+        Ok(res) => Ok(Json(res)),
+        Err((status, detail)) => Err(AppError::new(status, detail)),
+    }
+}
+
+async fn reset_oidc_handler(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    st.require_admin(&method, &headers)?;
+    store::with_write_tx(&st.path, |db| -> Result<(), AppError> {
+        db.execute(
+            "DELETE FROM runtime_settings WHERE organization_id=?1 AND key='__oidc_config'",
+            params![st.org],
+        )?;
+        st.vault.delete(db, &st.org, "auth", "oidc_client_secret");
+        audit::append(db, &st.org, "owner", "oidc.reset", "oidc", &json!({}))?;
+        Ok(())
+    })?;
+    let eff = st.oidc_env.clone();
+    st.reload_oidc(eff.clone());
+    Ok(Json(oidc::effective_summary(&eff, &st.oidc_env)))
 }

@@ -9,6 +9,8 @@ const PAGES = [
 const PAGE_ALIASES = {
   keys: 'api-keys',
   tokens: 'api-keys',
+  oidc: 'api-keys',
+  sso: 'api-keys',
   connector: 'mcp-connectors',
   mcp: 'mcp-connectors',
   integrations: 'mcp-connectors',
@@ -73,14 +75,14 @@ const ERRORS = {
   provider_unavailable: 'The provider could not be reached. Check network egress and stored credentials.',
   reauthorization_required: 'This connection expired and must be authorized again.',
   provider_rate_limited: 'Provider rate limit reached. Try again shortly.',
-  master_key_not_configured: 'LNC_MASTER_KEY is not configured on this service.',
+  master_key_not_configured: 'Vault encryption key is not configured on this service.',
   agent_hub_or_bridge_not_configured: 'Neither LNC Agent Hub nor the LNC Ads LAN bridge is configured.',
   shared_oauth_broker_unavailable: 'Shared OAuth broker is currently unreachable.',
-  management_key_env_managed: 'Management key is controlled by environment variable and cannot be rotated in UI.',
-  mcp_gateway_not_configured: 'LNC_MCP_GATEWAY_URL is not configured on this service.',
+  management_key_env_managed: 'Management key is controlled by environment configuration and cannot be rotated in UI.',
+  mcp_gateway_not_configured: 'Outbound MCP gateway URL is not configured on this service.',
   copy_unavailable_rotate_required: 'Copy is unavailable for this legacy key. Rotate it to enable Copy.',
   copy_rate_limited: 'Too many copy requests. Wait 5 minutes and try again.',
-  env_managed_immutable: 'Managed by container environment variable — cannot be modified in UI.'
+  env_managed_immutable: 'Managed by deployment environment configuration — cannot be modified in UI.'
 };
 
 const ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
@@ -118,6 +120,8 @@ const state = {
   auditFilter: '',
   keysInventory: { keys: [], mgmt: {} },
   createdSecretBanner: null,
+  oidcConfig: null,
+  oidcTestResult: null,
   settings: null
 };
 
@@ -166,12 +170,23 @@ function paintTableError(cols, err) {
   return `<div class="table-wrap"><table class="data-table"><tbody><tr><td colspan="${cols}" class="table-err">Failed to load: ${esc(errorText(err))}</td></tr></tbody></table></div>`;
 }
 
-/* ---------- lite-select (portaled popup matching trigger radius) ---------- */
+/* ---------- lite-select (custom .select + body-portaled .select-menu, zero native select elements) ---------- */
+function lncSelect({ id = '', name = '', value = '', options = [], ariaLabel = '', attrs = '', style = '' }) {
+  const opts = (options || []).map(o => typeof o === 'string'
+    ? { value: o, label: o, disabled: false }
+    : { value: String(o.value ?? ''), label: String(o.label ?? o.value ?? ''), disabled: Boolean(o.disabled) });
+  const strVal = String(value ?? '');
+  const sel = opts.find(o => o.value === strVal) || opts[0] || { value: '', label: '' };
+  return `<div class="select" data-lnc-select${id ? ` id="${esc(id)}"` : ''}${name ? ` data-name="${esc(name)}"` : ''} data-value="${esc(sel.value)}" data-options="${esc(JSON.stringify(opts))}"${ariaLabel ? ` aria-label="${esc(ariaLabel)}"` : ''}${style ? ` style="${esc(style)}"` : ''}${attrs ? ` ${attrs}` : ''}>` +
+    `${name ? `<input type="hidden" name="${esc(name)}" value="${esc(sel.value)}">` : ''}` +
+    `<button type="button" class="select-btn" aria-haspopup="listbox" aria-expanded="false"${ariaLabel ? ` aria-label="${esc(ariaLabel)}"` : ''}><span class="select-value">${esc(sel.label)}</span><span class="select-arrow" aria-hidden="true">&#9662;</span></button>` +
+    `</div>`;
+}
+
 function cleanupOrphanSelectMenus() {
   document.querySelectorAll('body > .select-menu').forEach(menu => {
-    const sel = menu._selectEl;
     const wrap = menu._selectWrap;
-    if (!sel || !sel.isConnected || !wrap || !wrap.isConnected) {
+    if (!wrap || !wrap.isConnected) {
       menu.remove();
     }
   });
@@ -192,55 +207,92 @@ function closeAllSelects(exceptWrap = null) {
   });
 }
 
-function enhanceSelect(select) {
-  if (!select) return;
-  if (select._enhanceRender) {
-    if (select._selectMenu && !select._selectMenu.isConnected) {
-      document.body.appendChild(select._selectMenu);
+function enhanceSelect(el) {
+  if (!el) return;
+  if (el.tagName === 'SELECT') {
+    const opts = [...el.options].map(o => ({ value: o.value, label: o.textContent || '', disabled: o.disabled }));
+    const tmp = document.createElement('div');
+    tmp.innerHTML = lncSelect({
+      id: el.id || '',
+      name: el.getAttribute('name') || '',
+      value: el.value,
+      options: opts,
+      ariaLabel: el.getAttribute('aria-label') || '',
+      style: el.getAttribute('style') || ''
+    });
+    const replacement = tmp.firstElementChild;
+    el.replaceWith(replacement);
+    el = replacement;
+  }
+  if (el._enhanceRender) {
+    if (el._selectMenu && !el._selectMenu.isConnected) {
+      document.body.appendChild(el._selectMenu);
     }
-    select._enhanceRender();
+    el._enhanceRender();
     return;
   }
-  select.classList.add('select-src');
-  const wrap = document.createElement('div');
-  wrap.className = 'select';
-  if (select.style.flex) wrap.style.flex = select.style.flex;
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'select-btn';
-  btn.setAttribute('aria-haspopup', 'listbox');
-  btn.setAttribute('aria-expanded', 'false');
-  if (select.disabled) btn.disabled = true;
-  if (select.getAttribute('aria-label')) btn.setAttribute('aria-label', select.getAttribute('aria-label'));
-  btn.innerHTML = '<span class="select-value"></span><span class="select-arrow" aria-hidden="true">&#9662;</span>';
+
+  let btn = el.querySelector('.select-btn');
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'select-btn';
+    btn.setAttribute('aria-haspopup', 'listbox');
+    btn.setAttribute('aria-expanded', 'false');
+    if (el.getAttribute('aria-label')) btn.setAttribute('aria-label', el.getAttribute('aria-label'));
+    btn.innerHTML = '<span class="select-value"></span><span class="select-arrow" aria-hidden="true">&#9662;</span>';
+    el.appendChild(btn);
+  }
+
+  const getOpts = () => {
+    try {
+      const parsed = JSON.parse(el.dataset.options || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
+  Object.defineProperty(el, 'value', {
+    configurable: true,
+    get() {
+      return el.dataset.value ?? '';
+    },
+    set(next) {
+      el.dataset.value = String(next ?? '');
+      const hidden = el.querySelector('input[type="hidden"]');
+      if (hidden) hidden.value = el.dataset.value;
+      renderMenu();
+    }
+  });
 
   const menu = document.createElement('div');
   menu.className = 'select-menu';
   menu.setAttribute('role', 'listbox');
-  menu._selectEl = select;
-  menu._selectWrap = wrap;
+  menu._selectWrap = el;
   document.body.appendChild(menu);
-  select._selectMenu = menu;
+  el._selectMenu = menu;
 
   let activeIdx = 0;
 
   const closeMenu = (restoreFocus = false) => {
-    wrap.classList.remove('open', 'above');
+    el.classList.remove('open', 'above');
     menu.classList.remove('open', 'above');
     btn.setAttribute('aria-expanded', 'false');
     if (restoreFocus && btn.isConnected) btn.focus();
   };
 
   const positionMenu = () => {
-    if (!select.isConnected || !wrap.isConnected || btn.offsetParent === null) {
+    if (!el.isConnected || btn.offsetParent === null) {
       closeMenu(false);
-      if (!select.isConnected) menu.remove();
+      if (!el.isConnected) menu.remove();
       return;
     }
+    const opts = getOpts();
     const rect = btn.getBoundingClientRect();
     const spaceBelow = window.innerHeight - rect.bottom - 12;
     const spaceAbove = rect.top - 12;
-    const estHeight = Math.min(280, menu.scrollHeight || (select.options.length * 36 + 12));
+    const estHeight = Math.min(280, menu.scrollHeight || (opts.length * 36 + 12));
     const dropUp = spaceBelow < estHeight && spaceAbove > spaceBelow;
     menu.style.minWidth = `${Math.round(rect.width)}px`;
     menu.style.maxWidth = 'min(440px, calc(100vw - 24px))';
@@ -250,38 +302,47 @@ function enhanceSelect(select) {
       menu.style.top = 'auto';
       menu.style.bottom = `${Math.max(32, Math.round(window.innerHeight - rect.top + 6))}px`;
       menu.classList.add('above');
-      wrap.classList.add('above');
+      el.classList.add('above');
     } else {
       menu.style.bottom = 'auto';
       menu.style.top = `${Math.round(rect.bottom + 5)}px`;
       menu.classList.remove('above');
-      wrap.classList.remove('above');
+      el.classList.remove('above');
     }
   };
 
   const renderMenu = () => {
-    const value = select.value;
-    btn.disabled = select.disabled;
-    btn.querySelector('.select-value').textContent = select.selectedOptions[0]?.textContent ?? '';
+    const opts = getOpts();
+    const cur = el.dataset.value ?? '';
+    const match = opts.find(o => String(o.value) === cur) || opts[0] || { value: '', label: '' };
+    if (cur !== String(match.value)) {
+      el.dataset.value = String(match.value);
+    }
+    const hidden = el.querySelector('input[type="hidden"]');
+    if (hidden) hidden.value = el.dataset.value;
+    btn.disabled = el.hasAttribute('data-disabled');
+    const valSpan = btn.querySelector('.select-value');
+    if (valSpan) valSpan.textContent = match.label || '';
     menu.innerHTML = '';
-    const opts = [...select.options];
-    activeIdx = Math.max(0, opts.findIndex(o => o.value === value));
+    activeIdx = Math.max(0, opts.findIndex(o => String(o.value) === el.dataset.value));
     opts.forEach((option, idx) => {
       const item = document.createElement('button');
       item.type = 'button';
-      item.disabled = option.disabled;
+      item.disabled = Boolean(option.disabled);
       item.setAttribute('role', 'option');
-      item.setAttribute('aria-selected', String(option.value === value));
+      item.setAttribute('aria-selected', String(String(option.value) === el.dataset.value));
       if (idx === activeIdx) item.classList.add('is-active');
-      item.textContent = option.textContent;
+      item.textContent = option.label;
       item.addEventListener('click', ev => {
         ev.preventDefault();
         ev.stopPropagation();
         if (option.disabled) return;
-        select.value = option.value;
-        select.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dataset.value = String(option.value);
+        const h = el.querySelector('input[type="hidden"]');
+        if (h) h.value = el.dataset.value;
         renderMenu();
         closeMenu(true);
+        el.dispatchEvent(new Event('change', { bubbles: true }));
       });
       menu.append(item);
     });
@@ -291,7 +352,7 @@ function enhanceSelect(select) {
     const items = [...menu.querySelectorAll('button[role="option"]:not(:disabled)')];
     if (!items.length) return;
     activeIdx = (activeIdx + delta + items.length) % items.length;
-    items.forEach((el, i) => el.classList.toggle('is-active', i === activeIdx));
+    items.forEach((it, i) => it.classList.toggle('is-active', i === activeIdx));
     items[activeIdx]?.scrollIntoView({ block: 'nearest' });
   };
 
@@ -299,14 +360,14 @@ function enhanceSelect(select) {
     ev.preventDefault();
     ev.stopPropagation();
     if (btn.disabled) return;
-    const next = !wrap.classList.contains('open');
-    closeAllSelects(wrap);
+    const next = !el.classList.contains('open');
+    closeAllSelects(el);
     if (!next) {
       closeMenu(false);
       return;
     }
     renderMenu();
-    wrap.classList.add('open');
+    el.classList.add('open');
     menu.classList.add('open');
     btn.setAttribute('aria-expanded', 'true');
     positionMenu();
@@ -315,16 +376,16 @@ function enhanceSelect(select) {
   const onKey = ev => {
     if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
       ev.preventDefault();
-      if (!wrap.classList.contains('open')) {
+      if (!el.classList.contains('open')) {
         btn.click();
       } else {
         moveActive(ev.key === 'ArrowDown' ? 1 : -1);
       }
-    } else if (ev.key === 'Enter' && wrap.classList.contains('open')) {
+    } else if (ev.key === 'Enter' && el.classList.contains('open')) {
       ev.preventDefault();
       const items = [...menu.querySelectorAll('button[role="option"]:not(:disabled)')];
       (items[activeIdx] || menu.querySelector('button[role="option"].is-active'))?.click();
-    } else if (ev.key === 'Escape' && wrap.classList.contains('open')) {
+    } else if (ev.key === 'Escape' && el.classList.contains('open')) {
       ev.preventDefault();
       closeMenu(true);
     }
@@ -333,20 +394,23 @@ function enhanceSelect(select) {
   btn.addEventListener('keydown', onKey);
   menu.addEventListener('keydown', onKey);
 
-  select.addEventListener('change', renderMenu);
-  if (select.form) select.form.addEventListener('reset', () => setTimeout(renderMenu, 0));
-  wrap._closeMenu = closeMenu;
-  wrap._positionMenu = positionMenu;
-  wrap._menu = menu;
-  select._enhanceRender = renderMenu;
-  select.after(wrap);
-  wrap.append(btn);
+  if (el.closest('form')) {
+    el.closest('form').addEventListener('reset', () => setTimeout(() => {
+      const opts = getOpts();
+      el.dataset.value = opts[0] ? String(opts[0].value) : '';
+      renderMenu();
+    }, 0));
+  }
+  el._closeMenu = closeMenu;
+  el._positionMenu = positionMenu;
+  el._menu = menu;
+  el._enhanceRender = renderMenu;
   renderMenu();
 }
 
 function enhanceAllSelects(root = document) {
   cleanupOrphanSelectMenus();
-  root.querySelectorAll('select').forEach(enhanceSelect);
+  root.querySelectorAll('[data-lnc-select], select').forEach(enhanceSelect);
 }
 
 document.addEventListener('mousedown', ev => {
@@ -585,8 +649,11 @@ function renderShell() {
 
     const shopSel = $('#shop-select');
     if (shopSel) {
-      shopSel.innerHTML = `<option value="">All shops</option>` +
-        (o.shops || []).map(s => `<option value="${s.id}"${String(state.shopId) === String(s.id) ? ' selected' : ''}>${esc(s.name)}</option>`).join('');
+      const shopOpts = [{ value: '', label: 'All shops' }].concat(
+        (o.shops || []).map(s => ({ value: String(s.id), label: s.name }))
+      );
+      shopSel.dataset.options = JSON.stringify(shopOpts);
+      shopSel.dataset.value = state.shopId ? String(state.shopId) : '';
       enhanceSelect(shopSel);
     }
 
@@ -830,10 +897,12 @@ function renderInboxStudio() {
         <div class="triage-queue-controls">
           <div class="triage-subtabs">${subtabsHtml}</div>
           <div class="triage-filters-row">
-            <select id="inbox-channel-filter" aria-label="Filter by channel">
-              <option value="">All channels</option>
-              ${channels.map(ch => `<option value="${ch.id}"${String(state.selectedChannelId) === String(ch.id) ? ' selected' : ''}>${esc(ch.name)}</option>`).join('')}
-            </select>
+            ${lncSelect({
+              id: 'inbox-channel-filter',
+              ariaLabel: 'Filter by channel',
+              value: state.selectedChannelId || '',
+              options: [{ value: '', label: 'All channels' }].concat(channels.map(ch => ({ value: String(ch.id), label: ch.name })))
+            })}
             <input type="search" id="inbox-search" value="${esc(state.searchQuery)}" placeholder="Search author or text...">
           </div>
           <div class="triage-sort-row"><span>Grouped by priority bucket</span><span>Highest score &#8595;</span></div>
@@ -1244,7 +1313,17 @@ function renderConversationsPage() {
         <form id="handoff-form">
           <div class="field-grid">
             <label class="field"><span class="field-label">Priority</span>
-              <select name="priority"><option value="normal">Normal</option><option value="high">High</option><option value="urgent">Urgent</option><option value="low">Low</option></select>
+              ${lncSelect({
+                name: 'priority',
+                value: 'normal',
+                ariaLabel: 'Priority',
+                options: [
+                  { value: 'normal', label: 'Normal' },
+                  { value: 'high', label: 'High' },
+                  { value: 'urgent', label: 'Urgent' },
+                  { value: 'low', label: 'Low' }
+                ]
+              })}
             </label>
             <label class="field"><span class="field-label">Assignee</span><input type="text" name="assignee" value="care-team" required></label>
           </div>
@@ -1525,23 +1604,43 @@ function renderFleetPage() {
     <div class="field-grid">
       <label class="field"><span class="field-label">Runtime label</span><input type="text" name="label" placeholder="FB Care Consultant #03" required></label>
       <label class="field"><span class="field-label">Platform</span>
-        <select name="platform"><option value="facebook">Facebook</option><option value="instagram">Instagram</option><option value="tiktok">TikTok</option><option value="youtube">YouTube</option></select>
+        ${lncSelect({
+          name: 'platform',
+          value: 'facebook',
+          ariaLabel: 'Platform',
+          options: [
+            { value: 'facebook', label: 'Facebook' },
+            { value: 'instagram', label: 'Instagram' },
+            { value: 'tiktok', label: 'TikTok' },
+            { value: 'youtube', label: 'YouTube' }
+          ]
+        })}
       </label>
       <label class="field"><span class="field-label">Account role</span>
-        <select name="account_role">
-          <option value="care_consultant">Care consultant (human-assisted)</option>
-          <option value="owned_page">Owned page (Graph API)</option>
-          <option value="evidence_scout">Evidence scout (read-only)</option>
-          <option value="personal_main">Personal main (0 auto-writes)</option>
-        </select>
+        ${lncSelect({
+          name: 'account_role',
+          value: 'care_consultant',
+          ariaLabel: 'Account role',
+          options: [
+            { value: 'care_consultant', label: 'Care consultant (human-assisted)' },
+            { value: 'owned_page', label: 'Owned page (Graph API)' },
+            { value: 'evidence_scout', label: 'Evidence scout (read-only)' },
+            { value: 'personal_main', label: 'Personal main (0 auto-writes)' }
+          ]
+        })}
       </label>
       <label class="field"><span class="field-label">Runtime adapter</span>
-        <select name="adapter">
-          <option value="veilbrowser">VeilBrowser (Camoufox + Xray TUN)</option>
-          <option value="meta_api">Official Meta Graph API</option>
-          <option value="orbine_mobile">Orbine ARM64 mobile container</option>
-          <option value="scrapling_public">Scrapling public fetch</option>
-        </select>
+        ${lncSelect({
+          name: 'adapter',
+          value: 'veilbrowser',
+          ariaLabel: 'Runtime adapter',
+          options: [
+            { value: 'veilbrowser', label: 'VeilBrowser (Camoufox + Xray TUN)' },
+            { value: 'meta_api', label: 'Official Meta Graph API' },
+            { value: 'orbine_mobile', label: 'Orbine ARM64 mobile container' },
+            { value: 'scrapling_public', label: 'Scrapling public fetch' }
+          ]
+        })}
       </label>
       <label class="field"><span class="field-label">Profile / container ID</span><input type="text" name="runtime_profile_id" placeholder="vb_prof_fb_03" required></label>
       <label class="field"><span class="field-label">Sticky residential exit IP</span><input type="text" name="expected_exit_ip" placeholder="82.64.110.25"></label>
@@ -1700,7 +1799,16 @@ function renderChannelsPage() {
       <dt>LNC Ads LAN bridge</dt><dd><code>${esc(br.ads_internal_url || 'not set')}</code> (${hub.bridge_fallback_ready ? 'ready' : 'standby'})</dd>
     </dl>
     <form id="shared-oauth-form" class="inline-form">
-      <select name="provider" aria-label="Provider"><option value="meta">Meta (FB Page &amp; Instagram)</option><option value="tiktok">TikTok Business</option><option value="youtube">YouTube</option></select>
+      ${lncSelect({
+        name: 'provider',
+        value: 'meta',
+        ariaLabel: 'Provider',
+        options: [
+          { value: 'meta', label: 'Meta (FB Page & Instagram)' },
+          { value: 'tiktok', label: 'TikTok Business' },
+          { value: 'youtube', label: 'YouTube' }
+        ]
+      })}
       <input type="text" name="shop" value="${esc(defaultShop)}" placeholder="Shop name (e.g. LuxeClaw)" required>
       <input type="text" name="label" placeholder="Connection label (optional)">
       <button type="submit" class="btn btn-primary">Connect shared account &#8599;</button>
@@ -1709,9 +1817,13 @@ function renderChannelsPage() {
   const appCfg = o.integrations?.apps?.[state.selectedAppProvider] || {};
   const appFormHtml = `<form id="app-form" data-revision="${appCfg.revision || 0}">
     <label class="field"><span class="field-label">Provider</span>
-      <select name="provider" id="app-provider-select">
-        ${Object.entries(PROVIDERS).map(([k, v]) => `<option value="${k}"${state.selectedAppProvider === k ? ' selected' : ''}>${esc(v)}</option>`).join('')}
-      </select>
+      ${lncSelect({
+        id: 'app-provider-select',
+        name: 'provider',
+        value: state.selectedAppProvider,
+        ariaLabel: 'App provider',
+        options: Object.entries(PROVIDERS).map(([k, v]) => ({ value: k, label: v }))
+      })}
     </label>
     <label class="field"><span class="field-label">Client / App ID</span><input type="text" name="client_id" value="${esc(appCfg.client_id || '')}" required></label>
     <label class="field"><span class="field-label">Client / App secret</span><input type="password" name="client_secret" value="${appCfg.configured ? '********' : ''}" placeholder="Encrypted in Vault" required></label>
@@ -1736,7 +1848,16 @@ function renderChannelsPage() {
   });
 
   const connCardHtml = `<form id="connection-form" class="inline-form" style="margin-bottom:14px">
-      <select name="provider" aria-label="Connection provider"><option value="meta">Meta</option><option value="tiktok">TikTok</option><option value="youtube">YouTube</option></select>
+      ${lncSelect({
+        name: 'provider',
+        value: 'meta',
+        ariaLabel: 'Connection provider',
+        options: [
+          { value: 'meta', label: 'Meta' },
+          { value: 'tiktok', label: 'TikTok' },
+          { value: 'youtube', label: 'YouTube' }
+        ]
+      })}
       <input type="text" name="label" placeholder="Connection label (e.g. Brand Meta Business)" required>
       <button type="submit" class="btn btn-primary">Add connection</button>
     </form>
@@ -1751,7 +1872,7 @@ function renderChannelsPage() {
     });
   });
 
-  const shopOpts = (o.shops || []).map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('');
+  const shopSelectOptions = (o.shops || []).map(s => ({ value: String(s.id), label: s.name }));
   const chRows = allChannels.map(ch => `<tr>
     <td><div class="cell-main">${esc(ch.name)}</div><div class="cell-sub">${esc(ch.handle || ch.external_id)}</div></td>
     <td>${provBadge(ch.provider || 'meta')}</td>
@@ -1761,7 +1882,12 @@ function renderChannelsPage() {
     <td>${ch.approved ? badge('Approved', 'b-ok') : badge('Pending approval', 'b-warn')} ${ch.approved && ch.adapter === 'meta_api' ? (ch.webhook_subscribed ? badge('Webhook active', 'b-acc') : badge('Polling', 'b-dim')) : ''}</td>
     <td><div class="row-actions">
       ${ch.connection_id && o.shops.length && !ch.approved
-        ? `<select data-shop-for="${esc(ch.external_id)}" aria-label="Target shop">${shopOpts}</select>
+        ? `${lncSelect({
+            value: shopSelectOptions[0]?.value || '',
+            options: shopSelectOptions,
+            ariaLabel: 'Target shop',
+            attrs: `data-shop-for="${esc(ch.external_id)}"`
+          })}
            <button type="button" class="btn btn-sm btn-primary" data-approve="${esc(ch.external_id)}" data-conn="${ch.connection_id}">Approve</button>`
         : ''}
       ${ch.id && ch.approved ? `<button type="button" class="btn btn-sm" data-policy-channel="${ch.id}" data-policy="${esc(ch.reply_policy || 'draft_only')}" data-threshold="${ch.auto_suggest_threshold || 80}" data-name="${esc(ch.name)}">Policy</button>` : ''}
@@ -1908,11 +2034,16 @@ function renderChannelsPage() {
       const m = modal(`<h3>Channel reply policy · ${esc(btn.dataset.name)}</h3>
         <form id="channel-policy-modal-form" style="margin-top:12px">
           <label class="field"><span class="field-label">Reply policy</span>
-            <select name="reply_policy">
-              <option value="draft_only"${btn.dataset.policy === 'draft_only' ? ' selected' : ''}>Draft only (human approval required)</option>
-              <option value="operator_direct"${btn.dataset.policy === 'operator_direct' ? ' selected' : ''}>Operator direct (idempotent + audited)</option>
-              <option value="agent_direct"${btn.dataset.policy === 'agent_direct' ? ' selected' : ''}>Agent direct (explicit owner policy)</option>
-            </select>
+            ${lncSelect({
+              name: 'reply_policy',
+              value: btn.dataset.policy || 'draft_only',
+              ariaLabel: 'Reply policy',
+              options: [
+                { value: 'draft_only', label: 'Draft only (human approval required)' },
+                { value: 'operator_direct', label: 'Operator direct (idempotent + audited)' },
+                { value: 'agent_direct', label: 'Agent direct (explicit owner policy)' }
+              ]
+            })}
           </label>
           <label class="field"><span class="field-label">Auto-suggest score threshold (10-99)</span>
             <input type="number" name="auto_suggest_threshold" min="10" max="99" value="${esc(btn.dataset.threshold)}" required>
@@ -1960,17 +2091,31 @@ function renderRulesPage() {
     <label class="field"><span class="field-label">Pattern</span><input type="text" name="pattern" placeholder="wholesale|distributor|bulk order" required></label>
     <div class="field-grid">
       <label class="field"><span class="field-label">Match kind</span>
-        <select name="match_kind"><option value="keyword">Keyword</option><option value="regex">Regular expression</option><option value="author">Author handle</option></select>
+        ${lncSelect({
+          name: 'match_kind',
+          value: 'keyword',
+          ariaLabel: 'Match kind',
+          options: [
+            { value: 'keyword', label: 'Keyword' },
+            { value: 'regex', label: 'Regular expression' },
+            { value: 'author', label: 'Author handle' }
+          ]
+        })}
       </label>
       <label class="field"><span class="field-label">Target bucket</span>
-        <select name="auto_bucket">
-          <option value="should_consult">Should consult</option>
-          <option value="complaint">Complaints</option>
-          <option value="evidence">Defamation / evidence</option>
-          <option value="spam_clone">Spam / clone</option>
-          <option value="praise">VIP &amp; praise</option>
-          <option value="needs_review">Needs review</option>
-        </select>
+        ${lncSelect({
+          name: 'auto_bucket',
+          value: 'should_consult',
+          ariaLabel: 'Target bucket',
+          options: [
+            { value: 'should_consult', label: 'Should consult' },
+            { value: 'complaint', label: 'Complaints' },
+            { value: 'evidence', label: 'Defamation / evidence' },
+            { value: 'spam_clone', label: 'Spam / clone' },
+            { value: 'praise', label: 'VIP & praise' },
+            { value: 'needs_review', label: 'Needs review' }
+          ]
+        })}
       </label>
     </div>
     <button type="submit" class="btn btn-primary">Save rule</button>
@@ -2017,17 +2162,32 @@ async function loadMcpConnectors() {
   }
 }
 
+function secretCopySlotHtml(slotState, dismissId, idleText) {
+  if (slotState && slotState.secret) {
+    return `<div class="secret-copy-slot active" role="status" aria-live="polite">
+      <div class="slot-main"><b>${esc(slotState.title)}:</b> ${copyChip(slotState.secret)} <span class="cell-sub">${esc(slotState.note || 'Store this value securely; tables remain masked.')}</span></div>
+      <div class="row-actions">
+        <button type="button" class="btn btn-sm btn-primary" data-copy="${esc(slotState.secret)}">Copy</button>
+        <button type="button" class="btn btn-sm" id="${esc(dismissId)}">Clear</button>
+      </div>
+    </div>`;
+  }
+  return `<div class="secret-copy-slot" role="status" aria-live="polite"><span class="slot-empty">${esc(idleText)}</span></div>`;
+}
+
 function renderMcpConnectorsPage() {
   const host = $('#body-mcp-connectors');
   const c = state.connector || {};
   const gw = c.mcp_gateway || {};
   const srcBadge = src => src === 'environment'
-    ? '<span class="badge b-dim badge-lock">&#128274; Env-managed</span>'
+    ? badge('Environment', 'b-dim')
     : (src === 'database' ? badge('Saved in Vault', 'b-ok') : badge('Unset', 'b-warn'));
 
   let mcpUrl = c.endpoint || '/mcp';
+  let appConnUrl = c.app_connector_endpoint || '/v1/app-connectors/lnc-care/mcp';
   try {
     mcpUrl = new URL(mcpUrl, location.origin).href;
+    appConnUrl = new URL(appConnUrl, location.origin).href;
   } catch {}
 
   const st = c.status || (c.enabled ? 'active' : 'unpaired');
@@ -2035,15 +2195,11 @@ function renderMcpConnectorsPage() {
     ? badge('Active', 'b-ok')
     : (st === 'revoked' ? badge('Revoked', 'b-err') : badge('Unpaired', 'b-warn'));
 
-  const bannerHtml = state.mcpSecretBanner
-    ? `<div class="alert alert-success" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px">
-        <div><b>${esc(state.mcpSecretBanner.title)}:</b> ${copyChip(state.mcpSecretBanner.secret)} <span class="cell-sub">Store this secret securely now — plaintext is never listed in tables.</span></div>
-        <div class="btn-grp">
-          <button type="button" class="btn btn-sm btn-primary" data-copy="${esc(state.mcpSecretBanner.secret)}">Copy secret</button>
-          <button type="button" class="btn btn-sm" id="dismiss-mcp-banner">Dismiss</button>
-        </div>
-      </div>`
-    : '';
+  const bannerHtml = `<div style="margin-bottom:14px">${secretCopySlotHtml(
+    state.mcpSecretBanner,
+    'dismiss-mcp-banner',
+    'Revealed or rotated connector secrets appear here for one-click copy without shifting layout.'
+  )}</div>`;
 
   const testHtml = state.mcpTestResult
     ? `<div class="alert ${state.mcpTestResult.ok ? 'alert-success' : 'alert-danger'}" style="margin-bottom:14px">
@@ -2076,7 +2232,7 @@ function renderMcpConnectorsPage() {
   const credRows = credDefs.map(row => {
     const isEnv = row.source === 'environment';
     const isUnset = row.source === 'unset' || !row.configured;
-    const envTitle = 'Managed by container environment variable';
+    const envTitle = 'Managed by environment configuration';
     const copyDisabled = isEnv || !row.copyAvailable || isUnset;
     const copyTitle = isEnv ? envTitle : (!row.copyAvailable ? 'Rotate to enable Copy' : 'Copy secret');
     const rotDisabled = isEnv;
@@ -2099,6 +2255,7 @@ function renderMcpConnectorsPage() {
   const inboundHtml = `${bannerHtml}${testHtml}
     <div class="bar-top" style="margin-bottom:14px">
       ${copyChip(mcpUrl)}
+      ${copyChip(appConnUrl)}
       ${stBadge}
       <span class="cell-sub">Audience: <code>${esc(c.audience || 'lnc-care')}</code> &middot; Namespace: <code>${esc(c.namespace || 'care__*')}</code></span>
     </div>
@@ -2200,8 +2357,11 @@ function renderMcpConnectorsPage() {
     btn.addEventListener('click', () => busy(btn, async () => {
       const field = btn.dataset.mcpCopy;
       const res = await api(`/api/mcp-connectors/inbound-mcp/copy?field=${encodeURIComponent(field)}`, { method: 'POST' });
-      const ok = await copyText(res.secret);
-      if (ok) toast(`${field === 'bearer' ? 'Connector bearer' : 'Delegation secret'} copied`, 'ok');
+      const label = field === 'bearer' ? 'Connector bearer' : 'Delegation secret';
+      state.mcpSecretBanner = { title: `${label} ready to copy`, secret: res.secret };
+      renderMcpConnectorsPage();
+      const ok = await copyText(res.secret, () => {});
+      toast(ok ? `${label} copied to clipboard` : `${label} revealed in copy bar above`, 'ok');
     }));
   });
 
@@ -2331,7 +2491,12 @@ function renderAuditPage() {
 async function loadKeys() {
   const host = $('#body-api-keys');
   try {
-    state.keysInventory = await api('/api/keys');
+    const [inv, oidc] = await Promise.all([
+      api('/api/keys'),
+      api('/api/admin/oidc').catch(() => null)
+    ]);
+    state.keysInventory = inv;
+    if (oidc) state.oidcConfig = oidc;
     renderKeysPage();
   } catch (err) {
     host.innerHTML = paintTableError(1, err);
@@ -2342,20 +2507,17 @@ function renderKeysPage() {
   const host = $('#body-api-keys');
   const items = state.keysInventory.keys || [];
   const mgmt = state.keysInventory.mgmt || {};
+  const oidc = state.oidcConfig || {};
   const o = state.overview || {};
   const hub = o.agent_hub || {};
   const br = o.bridge || {};
   const gw = o.mcp_gateway || {};
 
-  const revealHtml = state.createdSecretBanner
-    ? `<div class="alert alert-success" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
-        <div><b>${esc(state.createdSecretBanner.title)}:</b> ${copyChip(state.createdSecretBanner.secret)} <span class="cell-sub">Store this secret securely now — plaintext is never listed in key tables.</span></div>
-        <div class="btn-grp">
-          <button type="button" class="btn btn-sm btn-primary" data-copy="${esc(state.createdSecretBanner.secret)}">Copy secret</button>
-          <button type="button" class="btn btn-sm" id="dismiss-secret-banner">Dismiss</button>
-        </div>
-      </div>`
-    : '';
+  const revealHtml = secretCopySlotHtml(
+    state.createdSecretBanner,
+    'dismiss-secret-banner',
+    'Newly created, rotated, or copied secrets appear here with zero layout shift.'
+  );
 
   const createFormHtml = `<form id="api-key-form" class="inline-form" style="margin-bottom:16px">
     <input type="text" name="label" placeholder="Key label (e.g. LNC Agent Hub poller)" maxlength="80" required>
@@ -2367,7 +2529,7 @@ function renderKeysPage() {
     const stCls = k.status === 'enabled' ? 'b-ok' : (k.status === 'disabled' ? 'b-warn' : 'b-err');
     const isEnv = Boolean(k.env_managed || k.source === 'environment');
     const isRevoked = k.status === 'revoked';
-    const envTitle = 'Managed by container environment variable';
+    const envTitle = 'Managed by environment configuration';
     const idAttr = esc(k.id);
     const labelAttr = esc(k.label);
     const keyPreview = k.last4 ? `${esc(k.prefix)}...${esc(k.last4)}` : `${esc(k.prefix)}...`;
@@ -2388,7 +2550,7 @@ function renderKeysPage() {
         ${!isEnv && !isRevoked ? `<button type="button" class="inline-edit-btn" data-key-rename="${idAttr}" data-label="${labelAttr}" title="Rename label" aria-label="Rename ${labelAttr}">Edit</button>` : ''}
       </td>
       <td class="mono">${keyPreview}</td>
-      <td>${isEnv ? '<span class="badge b-dim badge-lock">&#128274; Env-managed</span>' : badge('Runtime', 'b-acc')}</td>
+      <td>${isEnv ? badge('Environment', 'b-dim') : badge('Runtime', 'b-acc')}</td>
       <td>
         ${badge(k.status, stCls)}
         ${!isEnv && !isRevoked ? `<button type="button" class="inline-edit-btn" data-key-toggle="${idAttr}" title="${k.status === 'enabled' ? 'Disable key' : 'Enable key'}">${k.status === 'enabled' ? 'Disable' : 'Enable'}</button>` : ''}
@@ -2403,7 +2565,6 @@ function renderKeysPage() {
     </tr>`;
   });
 
-  const hashAlgo = mgmt.hash_algo || 'argon2id';
   const isMgmtEnv = mgmt.source === 'environment';
   const canRotateMgmt = Boolean(mgmt.rotatable && !isMgmtEnv);
   const authMethodsText = Array.isArray(mgmt.auth_methods) && mgmt.auth_methods.length
@@ -2411,9 +2572,9 @@ function renderKeysPage() {
     : (mgmt.oidc_enabled ? 'oidc, management_key' : 'management_key');
 
   const mgmtBody = `<dl class="kv" style="margin-bottom:14px">
-      <dt>Status</dt><dd>${mgmt.configured ? badge('Configured', 'b-ok') : badge('Not configured', 'b-err')} ${badge(hashAlgo === 'argon2id' ? 'Argon2id' : hashAlgo, 'b-acc')}</dd>
+      <dt>Status</dt><dd>${mgmt.configured ? badge('Configured', 'b-ok') : badge('Not configured', 'b-err')}</dd>
       <dt>Key prefix</dt><dd class="mono">${esc(mgmt.prefix || '-')}</dd>
-      <dt>Ownership</dt><dd>${isMgmtEnv ? '<span class="badge b-dim badge-lock">&#128274; Env-managed</span>' : (mgmt.source === 'runtime' ? badge('Runtime', 'b-acc') : badge('Unset', 'b-warn'))}</dd>
+      <dt>Ownership</dt><dd>${isMgmtEnv ? badge('Environment', 'b-dim') : (mgmt.source === 'runtime' ? badge('Runtime', 'b-acc') : badge('Unset', 'b-warn'))}</dd>
       <dt>Session epoch</dt><dd class="mono">${esc(mgmt.session_epoch ?? 0)}</dd>
       <dt>Auth methods</dt><dd><code>${esc(authMethodsText)}</code>${mgmt.oidc_enabled ? ` ${badge('OIDC active', 'b-ok')}` : ''}</dd>
       ${mgmt.created_at ? `<dt>Rotated at</dt><dd>${when(mgmt.created_at)}</dd>` : ''}
@@ -2428,23 +2589,54 @@ function renderKeysPage() {
             <button type="button" class="btn btn-danger" id="mgmt-revoke-sessions-btn">Revoke all sessions</button>
           </div>
         </form>`
-      : `<p class="hint" style="margin:0 0 12px">Env-managed — rotate by changing <code>MANAGEMENT_KEY</code> / use SSO.</p>
+      : `<p class="hint" style="margin:0 0 12px">Managed by deployment environment or SSO sign-in.</p>
          <div class="btn-grp"><button type="button" class="btn btn-danger" id="mgmt-revoke-sessions-btn">Revoke all sessions</button></div>`}`;
 
   const outboundBody = `<dl class="kv">
-    <dt>Local Master Vault</dt><dd>${badge('AES-256-GCM verified', 'b-ok')}</dd>
-    <dt>LNC Agent Hub</dt><dd>${hub.has_api_key ? badge('svc:lnc-care configured', 'b-ok') : badge('API key unset', 'b-dim')}</dd>
-    <dt>LNC Ads LAN Bridge</dt><dd>${br.enabled ? badge('HMAC shared secret active', 'b-ok') : badge('Disabled', 'b-dim')}</dd>
+    <dt>Local Master Vault</dt><dd>${badge('Vault encrypted & verified', 'b-ok')}</dd>
+    <dt>LNC Agent Hub</dt><dd>${hub.has_api_key ? badge('Configured', 'b-ok') : badge('API key unset', 'b-dim')}</dd>
+    <dt>LNC Ads LAN Bridge</dt><dd>${br.enabled ? badge('Shared signature active', 'b-ok') : badge('Disabled', 'b-dim')}</dd>
     <dt>Unified MCP Gateway</dt><dd>${gw.configured ? badge('Gateway ready', 'b-ok') : badge('Unset', 'b-dim')}</dd>
   </dl>
   <p class="hint" style="margin:12px 0 0">Service API keys authenticate programmatic <code>GET /api/status</code> probes via <code>Authorization: Bearer &lt;key&gt;</code> or <code>X-API-Key</code>.</p>`;
 
+  const oidcSrcBadge = oidc.source === 'database'
+    ? badge('Saved in DB', 'b-acc')
+    : (oidc.source === 'environment' ? badge('Environment', 'b-dim') : badge('Unset', 'b-warn'));
+  const oidcStatusBadge = oidc.active ? badge('Active', 'b-ok') : (oidc.enabled ? badge('Incomplete', 'b-warn') : badge('Disabled', 'b-dim'));
+  const oidcProbeHtml = `<div id="oidc-probe-slot">${
+    state.oidcTestResult
+      ? `<div class="alert ${state.oidcTestResult.ok ? 'alert-success' : 'alert-danger'}" style="margin-bottom:14px">${esc(state.oidcTestResult.message)}</div>`
+      : ''
+  }</div>`;
+  const oidcCardBody = `${oidcProbeHtml}
+    <div class="bar-top" style="margin-bottom:14px">${oidcStatusBadge} ${oidcSrcBadge} ${oidc.has_client_secret ? badge('Client secret stored', 'b-ok') : badge('Client secret unset', 'b-warn')}</div>
+    <form id="oidc-form">
+      <label class="check"><input type="checkbox" name="enabled"${oidc.enabled ? ' checked' : ''}><span>Enable Keycloak OIDC (PKCE S256) sign-in</span></label>
+      <div class="field-grid">
+        <label class="field"><span class="field-label">Issuer URL</span><input type="url" name="issuer_url" value="${esc(oidc.issuer_url || '')}" placeholder="https://auth.lengoc.me/realms/lengoc"></label>
+        <label class="field"><span class="field-label">Client ID</span><input type="text" name="client_id" value="${esc(oidc.client_id || '')}" placeholder="lnc-care"></label>
+        <label class="field"><span class="field-label">Client secret (leave blank to keep stored secret)</span><input type="password" name="client_secret" value="" placeholder="${oidc.has_client_secret ? '******** (stored in Vault)' : 'Enter Keycloak client secret'}" autocomplete="new-password"></label>
+        <label class="field"><span class="field-label">Redirect URI</span><input type="url" name="redirect_uri" value="${esc(oidc.redirect_uri || '')}" placeholder="${esc(location.origin + '/api/auth/oidc/callback')}"></label>
+        <label class="field"><span class="field-label">Allowed users (comma-separated, no wildcards)</span><input type="text" name="allowed_users" value="${esc((oidc.allowed_users || []).join(', '))}" placeholder="owner@example.com, admin"></label>
+        <label class="field"><span class="field-label">Scopes</span><input type="text" name="scopes" value="${esc(oidc.scopes || 'openid profile email')}" placeholder="openid profile email"></label>
+      </div>
+      <div class="oidc-actions">
+        <button type="submit" class="btn btn-primary">Save OIDC</button>
+        <button type="button" class="btn" id="oidc-test-btn">Test discovery</button>
+        <button type="button" class="btn btn-danger" id="oidc-reset-btn">Reset to env</button>
+      </div>
+    </form>`;
+
   host.innerHTML = `${revealHtml}
     ${card('API keys', `${createFormHtml}${table(['Label', 'Prefix', 'Source', 'Status', 'Created', 'Actions'], keyRows, 'No API keys have been created.')}`, {
-      sub: 'Scoped service keys with HMAC-SHA256 verification and Vault-encrypted copy envelopes.'
+      sub: 'Scoped service keys with hashed authentication and encrypted copy envelopes.'
+    })}
+    ${card('Keycloak OIDC SSO (PKCE S256)', oidcCardBody, {
+      sub: 'Runtime identity provider configuration with encrypted secret storage and instant hot-reload.'
     })}
     <div class="grid-2">
-      ${card('Management key', mgmtBody, { sub: 'Argon2id hash-only break-glass credential and session epoch.' })}
+      ${card('Management key', mgmtBody, { sub: 'Hash-only break-glass operator credential and session epoch.' })}
       ${card('Ecosystem credential posture', outboundBody, { sub: 'Masked status of server-to-server secrets.' })}
     </div>`;
 
@@ -2452,6 +2644,85 @@ function renderKeysPage() {
   $('#dismiss-secret-banner')?.addEventListener('click', () => {
     state.createdSecretBanner = null;
     renderKeysPage();
+  });
+
+  const collectOidcPayload = formEl => {
+    const fd = new FormData(formEl);
+    const allowedRaw = String(fd.get('allowed_users') || '');
+    const payload = {
+      enabled: formEl.querySelector('[name="enabled"]')?.checked || false,
+      issuer_url: String(fd.get('issuer_url') || '').trim(),
+      client_id: String(fd.get('client_id') || '').trim(),
+      redirect_uri: String(fd.get('redirect_uri') || '').trim(),
+      allowed_users: allowedRaw.split(',').map(s => s.trim()).filter(Boolean),
+      scopes: String(fd.get('scopes') || '').trim()
+    };
+    const sec = String(fd.get('client_secret') || '').trim();
+    if (sec && sec !== '********') {
+      payload.client_secret = sec;
+    }
+    return payload;
+  };
+
+  $('#oidc-form')?.addEventListener('submit', ev => {
+    ev.preventDefault();
+    const formEl = ev.currentTarget;
+    busy(formEl.querySelector('[type="submit"]'), async () => {
+      state.oidcTestResult = null;
+      const saved = await api('/api/admin/oidc', {
+        method: 'PUT',
+        body: collectOidcPayload(formEl)
+      });
+      state.oidcConfig = saved;
+      state.auth = await fetch('/api/auth/status', { credentials: 'same-origin' }).then(r => r.json()).catch(() => state.auth);
+      toast('Keycloak OIDC settings saved and hot-reloaded', 'ok');
+      await loadKeys();
+    });
+  });
+
+  $('#oidc-test-btn')?.addEventListener('click', ev => {
+    const formEl = $('#oidc-form');
+    if (!formEl) return;
+    busy(ev.currentTarget, async () => {
+      try {
+        const res = await api('/api/admin/oidc/test', {
+          method: 'POST',
+          body: collectOidcPayload(formEl)
+        });
+        state.oidcTestResult = {
+          ok: true,
+          message: `Discovery ok: ${res.issuer || '-'} (${num(res.jwk_count || 0)} JWKs loaded)`
+        };
+        toast('OIDC discovery probe succeeded', 'ok');
+      } catch (err) {
+        state.oidcTestResult = { ok: false, message: errorText(err) };
+        toast(errorText(err), 'err');
+      }
+      const probeSlot = $('#oidc-probe-slot');
+      if (probeSlot) {
+        probeSlot.innerHTML = `<div class="alert ${state.oidcTestResult.ok ? 'alert-success' : 'alert-danger'}" style="margin-bottom:14px">${esc(state.oidcTestResult.message)}</div>`;
+      } else {
+        renderKeysPage();
+      }
+    });
+  });
+
+  $('#oidc-reset-btn')?.addEventListener('click', async ev => {
+    const btn = ev.currentTarget;
+    const ok = await confirmModal({
+      title: 'Reset OIDC overrides to environment?',
+      body: 'Removes database OIDC overrides and restores environment configuration defaults immediately.',
+      confirm: 'Reset OIDC',
+      danger: true
+    });
+    if (!ok) return;
+    await busy(btn, async () => {
+      state.oidcTestResult = null;
+      state.oidcConfig = await api('/api/admin/oidc/reset', { method: 'POST' });
+      state.auth = await fetch('/api/auth/status', { credentials: 'same-origin' }).then(r => r.json()).catch(() => state.auth);
+      toast('OIDC configuration reset', 'ok');
+      await loadKeys();
+    });
   });
 
   $('#api-key-form')?.addEventListener('submit', ev => {
@@ -2471,8 +2742,10 @@ function renderKeysPage() {
   host.querySelectorAll('[data-key-copy]').forEach(btn => {
     btn.addEventListener('click', () => busy(btn, async () => {
       const res = await api(`/api/keys/${encodeURIComponent(btn.dataset.keyCopy)}/copy`, { method: 'POST' });
-      const ok = await copyText(res.secret);
-      if (ok) toast('API key copied to clipboard', 'ok');
+      state.createdSecretBanner = { title: 'API key ready to copy', secret: res.secret };
+      renderKeysPage();
+      const ok = await copyText(res.secret, () => {});
+      toast(ok ? 'API key copied to clipboard' : 'API key revealed in copy bar above', 'ok');
     }));
   });
 
@@ -2638,7 +2911,7 @@ function renderSettingsPage() {
   const srcs = s.sources || {};
   const authCfg = s.auth || null;
   const srcTag = src => src === 'environment'
-    ? badge('Env managed', 'b-dim')
+    ? badge('Environment', 'b-dim')
     : (src === 'database' ? badge('Saved in DB', 'b-acc') : badge('Default', 'b-dim'));
 
   const cfgFormHtml = `<form id="settings-form">

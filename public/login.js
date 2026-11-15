@@ -13,16 +13,38 @@
     generic: 'Sign-in failed. Please try again.'
   };
 
+  let toastTimer = null;
   const showError = msg => {
     if (!errEl) return;
-    errEl.textContent = msg;
+    errEl.textContent = '';
+    const span = document.createElement('span');
+    span.className = 'msg';
+    span.textContent = msg;
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'x';
+    closeBtn.setAttribute('aria-label', 'Dismiss');
+    closeBtn.textContent = '×';
+    closeBtn.addEventListener('click', () => {
+      errEl.hidden = true;
+    });
+    errEl.appendChild(span);
+    errEl.appendChild(closeBtn);
     errEl.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      errEl.hidden = true;
+    }, 8500);
   };
 
-  const params = new URLSearchParams(location.search);
-  const errCode = params.get('error');
+  const url = new URL(location.href);
+  const errCode = url.searchParams.get('oidc_error') || url.searchParams.get('error');
   if (errCode) {
     showError(OIDC_ERRORS[errCode] || OIDC_ERRORS.generic);
+    url.searchParams.delete('error');
+    url.searchParams.delete('oidc_error');
+    const clean = url.pathname + (url.searchParams.toString() ? `?${url.searchParams.toString()}` : '') + url.hash;
+    history.replaceState(null, '', clean);
   }
 
   function renderMethods(status) {

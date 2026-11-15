@@ -259,7 +259,11 @@ pub fn build_connections_from_env(
     env_map: &HashMap<String, String>,
 ) -> Option<Connections> {
     let mk = env_map.get("LNC_MASTER_KEY").map(|s| s.as_str());
-    let pk = env_map.get("LNC_PREVIOUS_MASTER_KEY").map(|s| s.as_str());
+    let pk = env_map
+        .get("LNC_PREVIOUS_MASTER_KEY")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env_map.get("LNC_MASTER_KEY_OLD"))
+        .map(|s| s.as_str());
     let vault = Vault::new(mk, pk).ok()?;
     let bridge = internal_bridge::bridge_config(env_map).ok().flatten();
     let ads_bridge = bridge

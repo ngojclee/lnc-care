@@ -611,3 +611,515 @@ async fn legacy_pbkdf2_runtime_key_and_legacy_sha256_api_key_keep_working() {
         200
     );
 }
+
+#[tokio::test]
+async fn cfg_or_env_oidc_management_hot_reload_validation_and_logout_405() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("care.db");
+    let enc = ed25519_encoding_key();
+
+    // Seed env OIDC values on boot, then test DB override + hot-reload + reset.
+    let mut env = HashMap::new();
+    env.insert("OIDC_ISSUER_URL".to_string(), "https://env-sso.example/realms/care".to_string());
+    env.insert("OIDC_CLIENT_ID".to_string(), "env-client".to_string());
+    env.insert("OIDC_CLIENT_SECRET".to_string(), "env-client-secret-123".to_string());
+    env.insert("OIDC_ALLOWED_USERS".to_string(), "env-user@lengoc.me".to_string());
+
+    let transport = mock_transport(move |req: TransportRequest| {
+        if req.url == "https://hot-sso.example/realms/lnc/.well-known/openid-configuration" {
+            return Ok(TransportResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: json!({
+                    "issuer": "https://hot-sso.example/realms/lnc",
+                    "authorization_endpoint": "https://hot-sso.example/realms/lnc/protocol/openid-connect/auth",
+                    "token_endpoint": "https://hot-sso.example/realms/lnc/protocol/openid-connect/token",
+                    "jwks_uri": "https://hot-sso.example/realms/lnc/protocol/openid-connect/certs"
+                })
+                .to_string()
+                .into_bytes(),
+            });
+        }
+        if req.url == "https://hot-sso.example/realms/lnc/protocol/openid-connect/certs" {
+            return Ok(TransportResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: json!({
+                    "keys": [{
+                        "kty": "OKP", "crv": "Ed25519", "kid": "k1", "alg": "EdDSA", "use": "sig",
+                        "x": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw"
+                    }]
+                })
+                .to_string()
+                .into_bytes(),
+            });
+        }
+        if req.url == "https://hot-sso.example/realms/lnc/protocol/openid-connect/token" {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let mut h = Header::new(Algorithm::EdDSA);
+            h.kid = Some("k1".to_string());
+            let claims = json!({
+                "iss": "https://hot-sso.example/realms/lnc",
+                "sub": "u-hot",
+                "aud": "lnc-care-hot",
+                "exp": now + 600,
+                "iat": now,
+                "email": "admin@lengoc.me",
+                "preferred_username": "admin@lengoc.me"
+            });
+            let id_token = encode(&h, &claims, &enc).unwrap();
+            return Ok(TransportResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: json!({ "access_token": "at", "id_token": id_token })
+                    .to_string()
+                    .into_bytes(),
+            });
+        }
+        Err(format!("unexpected url: {}", req.url))
+    });
+
+    let router = build_router(AppConfig {
+        db_path: Some(db_path.clone()),
+        management_key: Some(MGMT_KEY.to_string()),
+        master_key: Some(KEY_1.to_string()),
+        env_overrides: Some(env.clone()),
+        transport: Some(transport),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut c = Client::new(router);
+    // Unauthenticated admin OIDC read must fail closed; GET logout must return 405
+    assert_eq!(c.send(Method::GET, "/api/admin/oidc", &[], None).await.status, 401);
+    assert_eq!(c.send(Method::GET, "/api/auth/logout", &[], None).await.status, 405);
+
+    let csrf = c.login().await;
+    let h = [("origin", "http://localhost"), ("x-csrf-token", csrf.as_str())];
+
+    // Initial summary reflects env config with masked secret + no-store header
+    let initial = c.send(Method::GET, "/api/admin/oidc", &[], None).await;
+    assert_eq!(initial.status, 200);
+    assert_eq!(initial.header("cache-control"), Some("no-store, private"));
+    let init_j = initial.json();
+    assert_eq!(init_j["source"], "environment");
+    assert_eq!(init_j["client_secret_masked"], "********");
+    assert_eq!(init_j["client_secret_configured"], true);
+
+    // Wildcard '*' and empty allowed_users rejected with 422
+    let wild = c
+        .send(
+            Method::PUT,
+            "/api/admin/oidc",
+            &h,
+            Some(json!({
+                "enabled": true,
+                "issuer_url": "https://hot-sso.example/realms/lnc",
+                "client_id": "lnc-care-hot",
+                "client_secret": "hot-secret-value-123",
+                "allowed_users": "*"
+            })),
+        )
+        .await;
+    assert_eq!(wild.status, 422);
+
+    let empty_users = c
+        .send(
+            Method::PUT,
+            "/api/admin/oidc",
+            &h,
+            Some(json!({
+                "enabled": true,
+                "issuer_url": "https://hot-sso.example/realms/lnc",
+                "client_id": "lnc-care-hot",
+                "client_secret": "hot-secret-value-123",
+                "allowed_users": ""
+            })),
+        )
+        .await;
+    assert_eq!(empty_users.status, 422);
+
+    // SSRF metadata endpoint blocked on /test
+    let ssrf = c
+        .send(
+            Method::POST,
+            "/api/admin/oidc/test",
+            &h,
+            Some(json!({ "issuer_url": "http://169.254.169.254/latest/meta-data" })),
+        )
+        .await;
+    assert_eq!(ssrf.status, 422);
+
+    // Probe valid OIDC discovery + JWKS before saving
+    let probe = c
+        .send(
+            Method::POST,
+            "/api/admin/oidc/test",
+            &h,
+            Some(json!({ "issuer_url": "https://hot-sso.example/realms/lnc" })),
+        )
+        .await;
+    assert_eq!(probe.status, 200);
+    assert_eq!(probe.json()["ok"], true);
+    assert_eq!(probe.json()["jwk_count"], 1);
+
+    // Save DB override (even though env OIDC_* vars exist -> cfg_or_env allows DB override + hot-reload!)
+    let saved = c
+        .send(
+            Method::PUT,
+            "/api/admin/oidc",
+            &h,
+            Some(json!({
+                "enabled": true,
+                "issuer_url": "https://hot-sso.example/realms/lnc",
+                "client_id": "lnc-care-hot",
+                "client_secret": "hot-secret-xyz-999",
+                "redirect_uri": "https://care.example/api/auth/oidc/callback",
+                "allowed_users": ["Admin@lengoc.me"],
+                "scopes": "openid profile email"
+            })),
+        )
+        .await;
+    assert_eq!(saved.status, 200);
+    let saved_j = saved.json();
+    assert_eq!(saved_j["source"], "database");
+    assert_eq!(saved_j["active"], true);
+    assert_eq!(saved_j["client_secret_masked"], "********");
+    assert!(!String::from_utf8_lossy(&saved.body).contains("hot-secret-xyz-999"));
+
+    // Blank/masked secret update preserves the encrypted vault client_secret (omitBlankSecrets)
+    let updated_blank = c
+        .send(
+            Method::PATCH,
+            "/api/oidc",
+            &h,
+            Some(json!({
+                "enabled": true,
+                "issuer_url": "https://hot-sso.example/realms/lnc",
+                "client_id": "lnc-care-hot",
+                "client_secret": "",
+                "allowed_users": ["admin@lengoc.me", "ops@lengoc.me"]
+            })),
+        )
+        .await;
+    assert_eq!(updated_blank.status, 200);
+
+    // Secret in vault must be encrypted (never plaintext in sqlite)
+    {
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        let raw_blobs: String = db
+            .query_row("SELECT envelope FROM secret_envelopes WHERE kind='auth' AND subject='oidc_client_secret'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!raw_blobs.contains("hot-secret-xyz-999"));
+    }
+
+    // Immediate hot-reload verified: fresh browser can initiate PKCE S256 against the newly saved issuer WITHOUT restart
+    let mut oidc_client = Client::new(c.router.clone());
+    let start = oidc_client.send(Method::GET, "/api/auth/oidc/login", &[], None).await;
+    assert_eq!(start.status, 303);
+    let loc = start.header("location").unwrap();
+    assert!(loc.starts_with("https://hot-sso.example/realms/lnc/protocol/openid-connect/auth?"));
+    assert!(loc.contains("client_id=lnc-care-hot"));
+
+    // Verify local-only POST /api/auth/logout returns JSON ok without Keycloak end_session redirect
+    let logout = c
+        .send(Method::POST, "/api/auth/logout", &h, None)
+        .await;
+    assert_eq!(logout.status, 200);
+    assert_eq!(logout.json()["ok"], true);
+    assert!(logout.header("location").is_none());
+
+    // Sign back in and reset OIDC overrides back to env defaults
+    let csrf2 = c.login().await;
+    let h2 = [("origin", "http://localhost"), ("x-csrf-token", csrf2.as_str())];
+    let reset = c
+        .send(Method::POST, "/api/admin/oidc/reset", &h2, None)
+        .await;
+    assert_eq!(reset.status, 200);
+    assert_eq!(reset.json()["source"], "environment");
+    assert_eq!(reset.json()["client_id"], "env-client");
+}
+
+#[tokio::test]
+async fn automatic_master_key_boot_rotation_preserves_vault_and_api_keys() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("care.db");
+    let key_v1 = KEY_1;
+    let key_v2 = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    // Boot 1 (V1): store encrypted OIDC secret, inbound pairing secrets, and create an API key.
+    let mut c1 = Client::new(
+        build_router(AppConfig {
+            db_path: Some(db_path.clone()),
+            management_key: Some(MGMT_KEY.to_string()),
+            master_key: Some(key_v1.to_string()),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let csrf1 = c1.login().await;
+    let h1 = [("origin", "http://localhost"), ("x-csrf-token", csrf1.as_str())];
+
+    assert_eq!(
+        c1.send(
+            Method::PUT,
+            "/api/admin/oidc",
+            &h1,
+            Some(json!({
+                "enabled": true,
+                "issuer_url": "https://sso.lengoc.me/realms/lnc",
+                "client_id": "lnc-care",
+                "client_secret": "v1-oidc-secret-preserve-me",
+                "allowed_users": ["boss@lengoc.me"]
+            })),
+        )
+        .await
+        .status,
+        200
+    );
+
+    let created_key = c1
+        .send(
+            Method::POST,
+            "/api/keys",
+            &h1,
+            Some(json!({ "label": "ci-runner" })),
+        )
+        .await;
+    assert_eq!(created_key.status, 200);
+    let key_id = created_key.json()["item"]["id"].as_i64().unwrap();
+    let key_secret = created_key.json()["secret"].as_str().unwrap().to_string();
+
+    let rot_mcp = c1
+        .send(
+            Method::POST,
+            "/api/mcp-connectors/inbound-mcp/rotate?field=bearer",
+            &h1,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(rot_mcp.status, 200);
+    let mcp_bearer = rot_mcp.json()["secret"].as_str().unwrap().to_string();
+    drop(c1);
+
+    // Boot 2 (V2 + LNC_MASTER_KEY_OLD=V1): automatic boot rotation rewraps envelopes + re-peppers hmac1: API keys.
+    let mut env_v2_old = HashMap::new();
+    env_v2_old.insert("LNC_MASTER_KEY_OLD".to_string(), key_v1.to_string());
+    let mut c2 = Client::new(
+        build_router(AppConfig {
+            db_path: Some(db_path.clone()),
+            management_key: Some(MGMT_KEY.to_string()),
+            master_key: Some(key_v2.to_string()),
+            env_overrides: Some(env_v2_old),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    c2.login().await;
+    let audit = c2.send(Method::GET, "/api/admin/audit", &[], None).await.json();
+    let actions: Vec<&str> = audit["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x["action"].as_str())
+        .collect();
+    assert!(actions.contains(&"vault.master_key_rotated"), "expected vault.master_key_rotated audit entry, got {actions:?}");
+    drop(c2);
+
+    // Boot 3 (V2 only, NO old key): everything must decrypt, verify, copy, and authenticate with V2 alone!
+    let mut c3 = Client::new(
+        build_router(AppConfig {
+            db_path: Some(db_path.clone()),
+            management_key: Some(MGMT_KEY.to_string()),
+            master_key: Some(key_v2.to_string()),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+
+    // API key Bearer auth must pass with new V2 HMAC pepper
+    let auth_hdr = format!("Bearer {key_secret}");
+    assert_eq!(
+        c3.send(Method::GET, "/api/status", &[("authorization", &auth_hdr)], None)
+            .await
+            .status,
+        200
+    );
+
+    let csrf3 = c3.login().await;
+    let h3 = [("origin", "http://localhost"), ("x-csrf-token", csrf3.as_str())];
+    // Copy API key still returns exact original secret
+    let copy_key = c3
+        .send(
+            Method::POST,
+            &format!("/api/keys/{key_id}/copy"),
+            &h3,
+            None,
+        )
+        .await;
+    assert_eq!(copy_key.status, 200);
+    assert_eq!(copy_key.json()["secret"], key_secret);
+
+    // Copy inbound MCP bearer still returns exact original secret
+    let copy_mcp = c3
+        .send(
+            Method::POST,
+            "/api/mcp-connectors/inbound-mcp/copy?field=bearer",
+            &h3,
+            None,
+        )
+        .await;
+    assert_eq!(copy_mcp.status, 200);
+    assert_eq!(copy_mcp.json()["secret"], mcp_bearer);
+
+    // OIDC config survived V1 -> V2 rotation active and secret-intact
+    let oidc_sum = c3.send(Method::GET, "/api/admin/oidc", &[], None).await.json();
+    assert_eq!(oidc_sum["active"], true);
+    assert_eq!(oidc_sum["client_secret_configured"], true);
+    assert_eq!(oidc_sum["client_id"], "lnc-care");
+}
+
+#[tokio::test]
+async fn rule_t2_agent_hub_env_aliases_and_v4s_contract_a_connector() {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<Sha256>;
+
+    let dir = TempDir::new().unwrap();
+    let hub_token = "hub-shared-v4s-token-9876543210";
+    let mut env = HashMap::new();
+    env.insert("LNC_AGENTS_HUB_URL".to_string(), "http://127.0.0.1:49999".to_string());
+    env.insert("LNC_AGENTS_HUB_PUBLIC_URL".to_string(), "https://agents.lengoc.me".to_string());
+    env.insert("LNC_AGENTS_HUB_TOKEN".to_string(), hub_token.to_string());
+    env.insert("MCP_CONNECTOR_AUDIENCE".to_string(), "lnc-care".to_string());
+
+    let mut c = Client::new(
+        build_router(AppConfig {
+            db_path: Some(dir.path().join("care.db")),
+            management_key: Some(MGMT_KEY.to_string()),
+            master_key: Some(KEY_1.to_string()),
+            env_overrides: Some(env),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+
+    // Health routes bypass Host header gate cleanly and advertise protocol=v4s
+    for path in [
+        "/v1/app-connectors/lnc-care/health",
+        "/v1/app-connectors/lnc-care/healthz",
+        "/v1/app-connectors/lnc-care/mcp/health",
+    ] {
+        let r = c
+            .send(Method::GET, path, &[("host", "internal-docker-service:8000")], None)
+            .await;
+        assert_eq!(r.status, 200, "{path}");
+        assert_eq!(r.json()["protocol"], "v4s");
+    }
+
+    // Also verify LNC_AGENTS_HUB_* aliases surfaced on /api/admin/hub/status once signed in
+    c.login().await;
+    let hub_sum = c.send(Method::GET, "/api/admin/hub/status", &[], None).await;
+    assert_eq!(hub_sum.status, 200);
+    assert_eq!(hub_sum.json()["agent_hub"]["configured"], true);
+    assert_eq!(hub_sum.json()["agent_hub"]["has_api_key"], true);
+    assert_eq!(hub_sum.json()["agent_hub"]["public_url"], "https://agents.lengoc.me");
+
+    let sign_v4s = |nonce: &str, scopes: &[&str], secret: &str| -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut sorted: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        sorted.sort();
+        sorted.dedup();
+        let ctx_sha = hex::encode(Sha256::digest(b"{}"));
+        let canonical = format!(
+            "v4s\nlnc-care\nagent-iris\nboss@lengoc.me\nlnc-care\n{now}\n{nonce}\n{}\n{ctx_sha}",
+            sorted.join(",")
+        );
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(canonical.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+        B64_URL.encode(
+            serde_json::to_vec(&json!({
+                "version": "v4s",
+                "audience": "lnc-care",
+                "caller_agent": "agent-iris",
+                "delegated_user": "boss@lengoc.me",
+                "app_id": "lnc-care",
+                "timestamp": now,
+                "expires_at": now + 120,
+                "nonce": nonce,
+                "scopes": scopes,
+                "resource_ctx": {},
+                "resource_ctx_sha256": ctx_sha,
+                "signature": sig
+            }))
+            .unwrap(),
+        )
+    };
+
+    let rpc_list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
+    let auth_hdr = format!("Bearer {hub_token}");
+
+    // Missing X-Lnc-V4s-Grant -> 401
+    let missing = c
+        .send(
+            Method::POST,
+            "/v1/app-connectors/lnc-care/mcp",
+            &[("authorization", &auth_hdr), ("host", "care-mcp-internal:8000")],
+            Some(rpc_list.clone()),
+        )
+        .await;
+    assert_eq!(missing.status, 401);
+
+    // Bad HMAC signature -> 403
+    let bad_grant = sign_v4s("nonce_bad_sig_000001", &["lnc:read"], "wrong-secret");
+    let bad_sig = c
+        .send(
+            Method::POST,
+            "/v1/app-connectors/lnc-care/mcp",
+            &[
+                ("authorization", &auth_hdr),
+                ("x-lnc-v4s-grant", &bad_grant),
+                ("host", "care-mcp-internal:8000"),
+            ],
+            Some(rpc_list.clone()),
+        )
+        .await;
+    assert_eq!(bad_sig.status, 403);
+
+    // Valid Contract A call succeeds (even over non-allowed Docker host header)
+    let good_grant = sign_v4s("nonce_valid_v4s_00001", &["lnc:read"], hub_token);
+    let ok = c
+        .send(
+            Method::POST,
+            "/v1/app-connectors/lnc-care/mcp",
+            &[
+                ("authorization", &auth_hdr),
+                ("x-lnc-v4s-grant", &good_grant),
+                ("host", "care-mcp-internal:8000"),
+            ],
+            Some(rpc_list.clone()),
+        )
+        .await;
+    assert_eq!(ok.status, 200);
+    assert!(ok.json()["result"]["tools"].is_array());
+
+    // Single-use nonce replay rejected -> 403
+    let replay = c
+        .send(
+            Method::POST,
+            "/v1/app-connectors/lnc-care/mcp",
+            &[
+                ("authorization", &auth_hdr),
+                ("x-lnc-v4s-grant", &good_grant),
+            ],
+            Some(rpc_list),
+        )
+        .await;
+    assert_eq!(replay.status, 403);
+}

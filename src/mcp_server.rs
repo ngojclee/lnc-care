@@ -2562,11 +2562,257 @@ fn json_resp(status: StatusCode, body: &Value, extra_headers: &[(&str, String)])
     resp
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct V4sGrantEnvelope {
+    #[serde(default, alias = "v")]
+    version: String,
+    #[serde(default, alias = "aud")]
+    audience: String,
+    #[serde(default, alias = "agent")]
+    caller_agent: String,
+    #[serde(default, alias = "user")]
+    delegated_user: String,
+    #[serde(default, alias = "app")]
+    app_id: String,
+    #[serde(default, alias = "ts")]
+    timestamp: i64,
+    #[serde(default, alias = "exp")]
+    expires_at: i64,
+    #[serde(default)]
+    nonce: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    resource_ctx: Value,
+    #[serde(default)]
+    resource_ctx_sha256: String,
+    #[serde(default, alias = "sig")]
+    signature: String,
+}
+
+fn collect_v4s_secrets(cfg: &McpServerConfig, eff_bearer: &str, eff_secret: &str) -> Vec<String> {
+    let mut secrets = Vec::new();
+    let mut push_unique = |raw: &str| {
+        let t = raw.trim();
+        if !t.is_empty() && !secrets.iter().any(|existing| existing == t) {
+            secrets.push(t.to_string());
+        }
+    };
+    for key in ["LNC_AGENT_HUB_API_KEY", "LNC_AGENTS_HUB_TOKEN"] {
+        if let Some(v) = cfg.env_map.get(key) {
+            push_unique(v);
+        }
+    }
+    push_unique(eff_bearer);
+    push_unique(eff_secret);
+    secrets
+}
+
+/// Rule T2 `LNC-Agent-Hub` zero-trust Contract A verifier (`X-Lnc-V4s-Grant` + Hub Bearer).
+pub fn authenticate_v4s(
+    path: &Path,
+    org: &str,
+    headers: &HashMap<String, String>,
+    secrets: &[String],
+    expected_audience: &str,
+    max_scopes: &[String],
+) -> Result<McpCaller, (StatusCode, &'static str)> {
+    let active_secrets: Vec<&str> = secrets
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if active_secrets.is_empty() {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "connector_not_configured"));
+    }
+
+    let raw_v4s = headers
+        .get("x-lnc-v4s-grant")
+        .map(|s| s.trim())
+        .unwrap_or("");
+    if raw_v4s.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "v4s_grant_required"));
+    }
+
+    let auth = headers
+        .get("authorization")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let bearer = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    if bearer.is_empty()
+        || !active_secrets
+            .iter()
+            .any(|s| bearer.as_bytes().ct_eq(s.as_bytes()).unwrap_u8() == 1)
+    {
+        return Err((StatusCode::UNAUTHORIZED, "connector_auth_required"));
+    }
+
+    let decoded_bytes = if raw_v4s.starts_with('{') {
+        raw_v4s.as_bytes().to_vec()
+    } else {
+        decode_b64url_flexible(raw_v4s).map_err(|_| (StatusCode::FORBIDDEN, "v4s_grant_invalid"))?
+    };
+    let grant: V4sGrantEnvelope = serde_json::from_slice(&decoded_bytes)
+        .map_err(|_| (StatusCode::FORBIDDEN, "v4s_grant_invalid"))?;
+    if grant.version.trim() != "v4s" {
+        return Err((StatusCode::FORBIDDEN, "v4s_grant_invalid"));
+    }
+
+    let aud = grant.audience.trim();
+    let app = grant.app_id.trim();
+    if (!aud.is_empty() && aud != expected_audience) || (!app.is_empty() && app != expected_audience)
+    {
+        return Err((StatusCode::FORBIDDEN, "v4s_audience_mismatch"));
+    }
+
+    let now = now_unix();
+    let nonce_re = Regex::new(r"^[A-Za-z0-9_-]{16,128}$").unwrap();
+    if (now - grant.timestamp).abs() > MAX_HUB_SKEW_SECONDS
+        || (grant.expires_at > 0 && now > grant.expires_at + 15)
+        || !nonce_re.is_match(grant.nonce.trim())
+    {
+        return Err((StatusCode::FORBIDDEN, "v4s_grant_expired"));
+    }
+
+    let mut sorted_scopes: Vec<String> = grant
+        .scopes
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    sorted_scopes.sort();
+    sorted_scopes.dedup();
+    if sorted_scopes.is_empty() {
+        return Err((StatusCode::FORBIDDEN, "v4s_scope_denied"));
+    }
+
+    let canonical_ctx = match &grant.resource_ctx {
+        Value::Null => "{}".to_string(),
+        other => canonical_json(other),
+    };
+    let expected_ctx_sha = hex::encode(Sha256::digest(canonical_ctx.as_bytes()));
+    if !grant.resource_ctx_sha256.is_empty()
+        && grant.resource_ctx_sha256.trim().to_ascii_lowercase() != expected_ctx_sha
+    {
+        return Err((StatusCode::FORBIDDEN, "v4s_context_mismatch"));
+    }
+    let ctx_sha = if grant.resource_ctx_sha256.is_empty() {
+        expected_ctx_sha
+    } else {
+        grant.resource_ctx_sha256.trim().to_ascii_lowercase()
+    };
+
+    let canonical = format!(
+        "v4s\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        aud,
+        grant.caller_agent.trim(),
+        grant.delegated_user.trim(),
+        app,
+        grant.timestamp,
+        grant.nonce.trim(),
+        sorted_scopes.join(","),
+        ctx_sha,
+    );
+    let provided_sig = grant.signature.trim().to_ascii_lowercase();
+    if provided_sig.is_empty()
+        || !active_secrets.iter().any(|s| {
+            let expected = hex::encode(hmac_sha256_bytes(s, canonical.as_bytes()));
+            expected.as_bytes().ct_eq(provided_sig.as_bytes()).unwrap_u8() == 1
+        })
+    {
+        return Err((StatusCode::FORBIDDEN, "v4s_signature_invalid"));
+    }
+
+    claim_nonce(
+        path,
+        org,
+        &format!("v4s:{}", grant.nonce.trim()),
+        now + NONCE_TTL_SECONDS,
+    )
+    .map_err(|_| (StatusCode::FORBIDDEN, "v4s_nonce_replayed"))?;
+
+    let known = known_scopes_set();
+    let max_set: BTreeSet<String> = max_scopes
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| known.contains(s))
+        .collect();
+    let mut granted = BTreeSet::new();
+    for s in &sorted_scopes {
+        match s.as_str() {
+            "lnc:execute" | "execute" | "lnc:read" | "read" => {
+                for allowed in &max_set {
+                    if allowed.starts_with("care:read") {
+                        granted.insert(allowed.clone());
+                    }
+                }
+            }
+            "lnc:write" | "write" => {
+                for allowed in &max_set {
+                    if allowed.starts_with("care:write") {
+                        granted.insert(allowed.clone());
+                    }
+                }
+            }
+            "care:*" | "admin" => {
+                granted.extend(max_set.iter().cloned());
+            }
+            _ if max_set.contains(s) => {
+                granted.insert(s.clone());
+            }
+            _ => {}
+        }
+    }
+    if granted.is_empty() {
+        return Err((StatusCode::FORBIDDEN, "v4s_scope_denied"));
+    }
+
+    let sub = if !grant.delegated_user.trim().is_empty() {
+        grant.delegated_user.trim().to_string()
+    } else if !grant.caller_agent.trim().is_empty() {
+        grant.caller_agent.trim().to_string()
+    } else {
+        "lnc-agent-hub".to_string()
+    };
+    Ok(McpCaller {
+        sub,
+        app_id: if app.is_empty() {
+            aud.to_string()
+        } else {
+            app.to_string()
+        },
+        scopes: granted,
+    })
+}
+
 pub fn handle_mcp_http(
     cfg: &McpServerConfig,
     method: &Method,
     req_headers: &HeaderMap,
     raw_body: &[u8],
+) -> Response {
+    handle_mcp_http_inner(cfg, method, req_headers, raw_body, false)
+}
+
+pub fn handle_app_connector_mcp_http(
+    cfg: &McpServerConfig,
+    method: &Method,
+    req_headers: &HeaderMap,
+    raw_body: &[u8],
+) -> Response {
+    handle_mcp_http_inner(cfg, method, req_headers, raw_body, true)
+}
+
+fn handle_mcp_http_inner(
+    cfg: &McpServerConfig,
+    method: &Method,
+    req_headers: &HeaderMap,
+    raw_body: &[u8],
+    app_connector_lane: bool,
 ) -> Response {
     let mut headers_map = HashMap::new();
     for (k, v) in req_headers.iter() {
@@ -2621,42 +2867,74 @@ pub fn handle_mcp_http(
             .to_string()
     };
 
-    let auth = headers_map.get("authorization").map(|s| s.as_str()).unwrap_or("");
-    let bearer_ok = !eff_bearer.is_empty()
-        && auth.starts_with("Bearer ")
-        && auth[7..].as_bytes().ct_eq(eff_bearer.as_bytes()).unwrap_u8() == 1;
-    if !bearer_ok {
-        return json_resp(
-            StatusCode::UNAUTHORIZED,
-            &json!({ "error": "Invalid MCP bearer token" }),
-            &[],
-        );
-    }
-    if connector_revoked {
-        return json_resp(
-            StatusCode::FORBIDDEN,
-            &json!({ "error": "mcp_connector_revoked" }),
-            &[],
-        );
-    }
+    let has_v4s = headers_map
+        .get("x-lnc-v4s-grant")
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_legacy_del = headers_map.contains_key("x-lnc-delegation")
+        || HUB_DELEGATION_HEADERS
+            .iter()
+            .any(|k| headers_map.contains_key(*k));
 
-    let caller = match verify_delegation(
-        &cfg.path,
-        &cfg.org,
-        headers_map.get("x-lnc-delegation").map(|s| s.as_str()),
-        &eff_secret,
-        cfg.require_delegation,
-        &loaded_cfg.mcp_max_scopes,
-        Some(&headers_map),
-        &cfg.audience,
-    ) {
-        Ok(c) => c,
-        Err(err) => {
+    let caller = if has_v4s || (app_connector_lane && !has_legacy_del) {
+        if connector_revoked {
             return json_resp(
                 StatusCode::FORBIDDEN,
-                &json!({ "error": err.to_string() }),
+                &json!({ "error": "mcp_connector_revoked" }),
                 &[],
             );
+        }
+        let secrets = collect_v4s_secrets(cfg, &eff_bearer, &eff_secret);
+        match authenticate_v4s(
+            &cfg.path,
+            &cfg.org,
+            &headers_map,
+            &secrets,
+            &cfg.audience,
+            &loaded_cfg.mcp_max_scopes,
+        ) {
+            Ok(c) => c,
+            Err((status, code)) => {
+                return json_resp(status, &json!({ "error": code, "detail": code }), &[]);
+            }
+        }
+    } else {
+        let auth = headers_map.get("authorization").map(|s| s.as_str()).unwrap_or("");
+        let bearer_ok = !eff_bearer.is_empty()
+            && auth.starts_with("Bearer ")
+            && auth.as_bytes()[7..].ct_eq(eff_bearer.as_bytes()).unwrap_u8() == 1;
+        if !bearer_ok {
+            return json_resp(
+                StatusCode::UNAUTHORIZED,
+                &json!({ "error": "Invalid MCP bearer token" }),
+                &[],
+            );
+        }
+        if connector_revoked {
+            return json_resp(
+                StatusCode::FORBIDDEN,
+                &json!({ "error": "mcp_connector_revoked" }),
+                &[],
+            );
+        }
+
+        match verify_delegation(
+            &cfg.path,
+            &cfg.org,
+            headers_map.get("x-lnc-delegation").map(|s| s.as_str()),
+            &eff_secret,
+            cfg.require_delegation,
+            &loaded_cfg.mcp_max_scopes,
+            Some(&headers_map),
+            &cfg.audience,
+        ) {
+            Ok(c) => c,
+            Err(err) => {
+                return json_resp(
+                    StatusCode::FORBIDDEN,
+                    &json!({ "error": err.to_string() }),
+                    &[],
+                );
+            }
         }
     };
 

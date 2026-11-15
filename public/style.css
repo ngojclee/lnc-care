@@ -455,6 +455,15 @@ html,body{max-width:100%;overflow-x:hidden}
 .inline-edit-btn{background:transparent;border:0;color:var(--muted);cursor:pointer;padding:2px 5px;border-radius:5px;font-size:11.5px;margin-left:4px;vertical-align:middle}
 .inline-edit-btn:hover{background:var(--surface-hover);color:var(--foreground)}
 .copy-chip code{min-width:0;max-width:100%}
+.login-toast{position:fixed;top:18px;right:18px;z-index:95;max-width:min(380px,calc(100vw - 32px));display:flex;align-items:flex-start;gap:10px;box-shadow:var(--shadow-popover);margin:0}
+.login-toast .msg{flex:1;word-break:break-word}
+.login-toast .x{background:none;border:0;color:inherit;cursor:pointer;font-size:16px;line-height:1;padding:0 2px;opacity:.75}
+.login-toast .x:hover{opacity:1}
+.secret-copy-slot{min-height:60px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 14px;border:1px dashed var(--border-strong);border-radius:var(--radius-sm);background:var(--surface-2);color:var(--muted);font-size:13px}
+.secret-copy-slot.active{border-style:solid;border-color:rgba(10,144,104,.4);background:var(--success-bg);color:var(--success)}
+.secret-copy-slot .slot-main{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;flex:1}
+.secret-copy-slot .slot-empty{color:var(--faint);font-size:12.5px}
+.oidc-actions{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;white-space:nowrap}
 @media (max-width:900px){
   .side-id{display:none}
   .side-foot{flex-direction:row;align-items:center}
@@ -462,4 +471,15 @@ html,body{max-width:100%;overflow-x:hidden}
   .side-foot .side-out span{display:none}
   .topbar{height:auto;min-height:56px}
   .row-actions{justify-content:flex-start}
+}
+@media (max-width:640px){
+  .content{padding:14px}
+  .grid-2,.field-grid,.triage-filters-row{grid-template-columns:1fr}
+  .shop-switch,.shop-switch .select{min-width:0;flex:1;max-width:100%}
+  .card-header{padding:12px 14px}
+  .card-body{padding:14px}
+  .oidc-actions{flex-wrap:wrap}
+  .rubric-head,.rubric-row{grid-template-columns:minmax(0,1fr) 44px minmax(60px,1fr) 68px;gap:6px}
+  .triage-detail-scroll,.triage-bottom-bar{padding:14px}
+  .login-toast{left:16px;right:16px;top:12px;max-width:none}
 }

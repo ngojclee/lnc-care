@@ -125,18 +125,24 @@ fn bare_origin(value: &str, env_name: &str) -> Result<String, String> {
 }
 
 pub fn agent_hub_config(env: &HashMap<String, String>) -> Result<Option<AgentHubConfig>, String> {
-    let url = bare_origin(
-        env.get("LNC_AGENT_HUB_URL").map(|s| s.as_str()).unwrap_or(""),
-        "LNC_AGENT_HUB_URL",
-    )?;
-    let public_url = bare_origin(
-        env.get("LNC_AGENT_HUB_PUBLIC_URL")
-            .map(|s| s.as_str())
-            .unwrap_or(""),
-        "LNC_AGENT_HUB_PUBLIC_URL",
-    )?;
+    let url_raw = env
+        .get("LNC_AGENT_HUB_URL")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env.get("LNC_AGENTS_HUB_URL"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let url = bare_origin(url_raw, "LNC_AGENT_HUB_URL")?;
+    let pub_raw = env
+        .get("LNC_AGENT_HUB_PUBLIC_URL")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env.get("LNC_AGENTS_HUB_PUBLIC_URL"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let public_url = bare_origin(pub_raw, "LNC_AGENT_HUB_PUBLIC_URL")?;
     let api_key = env
         .get("LNC_AGENT_HUB_API_KEY")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env.get("LNC_AGENTS_HUB_TOKEN"))
         .map(|s| s.trim())
         .unwrap_or_default()
         .to_string();

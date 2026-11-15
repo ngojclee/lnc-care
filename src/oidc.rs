@@ -38,6 +38,89 @@ pub struct OidcConfig {
     pub redirect_uri: String,
     pub allowed_users: Vec<String>,
     pub scopes: String,
+    pub source: String,
+}
+
+pub fn validate_http_url(raw: &str, label: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    let parsed = Url::parse(trimmed)
+        .map_err(|_| format!("{label} must be a valid HTTP(S) URL"))?;
+    let scheme = parsed.scheme();
+    if !matches!(scheme, "http" | "https") {
+        return Err(format!("{label} must use http:// or https://"));
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err(format!("{label} must include a host"));
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!("{label} must not embed credentials"));
+    }
+    if parsed.fragment().is_some() {
+        return Err(format!("{label} must not include a URL fragment"));
+    }
+    let h_low = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if h_low == "metadata.google.internal"
+        || h_low == "0.0.0.0"
+        || h_low == "::"
+        || h_low.starts_with("169.254.")
+        || h_low.starts_with("fe80:")
+    {
+        return Err(format!("{label} host is blocked by SSRF policy"));
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+pub fn normalize_scopes(raw: &str) -> String {
+    let mut parts: Vec<String> = raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !parts.iter().any(|s| s == "openid") {
+        parts.insert(0, "openid".to_string());
+    }
+    if parts.len() == 1 && parts[0] == "openid" && raw.trim().is_empty() {
+        return "openid profile email".to_string();
+    }
+    let mut deduped = Vec::new();
+    for p in parts {
+        if !deduped.contains(&p) {
+            deduped.push(p);
+        }
+    }
+    deduped.join(" ")
+}
+
+pub fn parse_allowed_users_value(val: &serde_json::Value) -> Result<Vec<String>, String> {
+    let raw_items: Vec<String> = match val {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .flat_map(|s| s.split(','))
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        serde_json::Value::String(s) => s
+            .split([',', '\n', '\r'])
+            .map(|x| x.trim().to_ascii_lowercase())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        serde_json::Value::Null => Vec::new(),
+        _ => return Err("allowed_users must be a string or list of strings".to_string()),
+    };
+    let mut out = Vec::new();
+    for item in raw_items {
+        if item.contains('*') {
+            return Err("Wildcard '*' is not allowed in allowed_users".to_string());
+        }
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    Ok(out)
 }
 
 impl OidcConfig {
@@ -57,7 +140,7 @@ impl OidcConfig {
             .unwrap_or_default()
             .split(',')
             .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.contains('*'))
             .collect();
         let has_fields = !issuer_url.is_empty() && !client_id.is_empty() && !client_secret.is_empty();
         let enabled = match get("OIDC_ENABLED").map(|v| v.to_ascii_lowercase()).as_deref() {
@@ -68,6 +151,11 @@ impl OidcConfig {
             .map(|s| s.replace(',', " "))
             .filter(|s| s.split_whitespace().any(|x| x == "openid"))
             .unwrap_or_else(|| "openid profile email".to_string());
+        let env_any = !issuer_url.is_empty()
+            || !client_id.is_empty()
+            || !client_secret.is_empty()
+            || !redirect_uri.is_empty()
+            || !allowed_users.is_empty();
         Self {
             enabled,
             scopes,
@@ -76,6 +164,11 @@ impl OidcConfig {
             client_secret,
             redirect_uri,
             allowed_users,
+            source: if env_any {
+                "environment".to_string()
+            } else {
+                "unset".to_string()
+            },
         }
     }
 
@@ -90,9 +183,9 @@ impl OidcConfig {
         auth_core::url_host(&self.issuer_url).unwrap_or_default()
     }
 
-    /// Fail closed when `OIDC_ALLOWED_USERS` is empty.
+    /// Fail closed when `OIDC_ALLOWED_USERS` is empty or contains a wildcard.
     pub fn user_allowed(&self, candidates: &[Option<&str>]) -> Option<String> {
-        if self.allowed_users.is_empty() {
+        if self.allowed_users.is_empty() || self.allowed_users.iter().any(|u| u.contains('*')) {
             return None;
         }
         for cand in candidates.iter().flatten() {
@@ -103,6 +196,145 @@ impl OidcConfig {
         }
         None
     }
+}
+
+pub fn load_effective_config(
+    db: &rusqlite::Connection,
+    org: &str,
+    env_cfg: &OidcConfig,
+    vault: &crate::vault::Vault,
+) -> Result<OidcConfig, String> {
+    let db_raw: Option<String> = db
+        .query_row(
+            "SELECT value FROM runtime_settings WHERE organization_id=?1 AND key='__oidc_config'",
+            rusqlite::params![org],
+            |r| r.get(0),
+        )
+        .ok();
+    let vault_secret = if vault.ready {
+        vault
+            .get(db, org, "auth", "oidc_client_secret")
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                v.get("client_secret")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.trim().to_string())
+            })
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    let Some(raw) = db_raw.filter(|s| !s.trim().is_empty()) else {
+        let mut eff = env_cfg.clone();
+        if let Some(sec) = vault_secret {
+            eff.client_secret = sec;
+            eff.source = "database".to_string();
+        }
+        return Ok(eff);
+    };
+
+    let obj: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| "Corrupt runtime OIDC configuration".to_string())?;
+    let issuer_url = obj
+        .get("issuer_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .unwrap_or_else(|| env_cfg.issuer_url.clone());
+    let client_id = obj
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| env_cfg.client_id.clone());
+    let redirect_uri = obj
+        .get("redirect_uri")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| env_cfg.redirect_uri.clone());
+    let allowed_users = match obj.get("allowed_users") {
+        Some(v) => parse_allowed_users_value(v).unwrap_or_default(),
+        None => env_cfg.allowed_users.clone(),
+    };
+    let scopes = obj
+        .get("scopes")
+        .and_then(|v| v.as_str())
+        .map(normalize_scopes)
+        .unwrap_or_else(|| env_cfg.scopes.clone());
+    let enabled = obj
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let client_secret = vault_secret.unwrap_or_else(|| env_cfg.client_secret.clone());
+
+    Ok(OidcConfig {
+        enabled,
+        issuer_url,
+        client_id,
+        client_secret,
+        redirect_uri,
+        allowed_users,
+        scopes,
+        source: "database".to_string(),
+    })
+}
+
+pub fn effective_summary(cfg: &OidcConfig, env_cfg: &OidcConfig) -> serde_json::Value {
+    let has_secret = !cfg.client_secret.is_empty();
+    let env_present = !env_cfg.issuer_url.is_empty()
+        || !env_cfg.client_id.is_empty()
+        || !env_cfg.client_secret.is_empty()
+        || !env_cfg.allowed_users.is_empty();
+    json!({
+        "enabled": cfg.enabled,
+        "active": cfg.is_active(),
+        "source": if cfg.source.is_empty() { "unset" } else { cfg.source.as_str() },
+        "issuer_url": cfg.issuer_url,
+        "issuer_host": cfg.issuer_host(),
+        "client_id": cfg.client_id,
+        "client_secret_configured": has_secret,
+        "client_secret_masked": if has_secret { "********" } else { "" },
+        "has_client_secret": has_secret,
+        "redirect_uri": cfg.redirect_uri,
+        "allowed_users": cfg.allowed_users,
+        "scopes": cfg.scopes,
+        "env_present": env_present,
+    })
+}
+
+pub async fn probe_discovery_and_jwks(
+    transport: SharedTransport,
+    issuer_url: &str,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let clean_iss = validate_http_url(issuer_url, "issuer_url")
+        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    if clean_iss.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "issuer_url is required to test OIDC discovery".to_string(),
+        ));
+    }
+    let disc_url = format!("{clean_iss}/.well-known/openid-configuration");
+    let body = http_get_json(transport.clone(), disc_url)
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "oidc_discovery_unreachable".to_string()))?;
+    let doc: DiscoveryDoc = serde_json::from_slice(&body)
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "oidc_discovery_invalid".to_string()))?;
+    let jwks_url = validate_http_url(&doc.jwks_uri, "jwks_uri")
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
+    let jwks_body = http_get_json(transport, jwks_url)
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "oidc_jwks_unreachable".to_string()))?;
+    let set: JwkSet = serde_json::from_slice(&jwks_body)
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "oidc_jwks_invalid".to_string()))?;
+    Ok(json!({
+        "ok": true,
+        "issuer": doc.issuer,
+        "authorization_endpoint": doc.authorization_endpoint,
+        "token_endpoint": doc.token_endpoint,
+        "jwks_uri": doc.jwks_uri,
+        "jwk_count": set.keys.len(),
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,9 +388,9 @@ fn pkce_challenge_s256(verifier: &str) -> String {
     B64_URL.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn effective_redirect_uri(st: &AppState, headers: &HeaderMap, uri: &Uri) -> Result<String, &'static str> {
-    if !st.oidc.redirect_uri.is_empty() {
-        return Ok(st.oidc.redirect_uri.clone());
+fn effective_redirect_uri(oidc: &OidcConfig, st: &AppState, headers: &HeaderMap, uri: &Uri) -> Result<String, &'static str> {
+    if !oidc.redirect_uri.is_empty() {
+        return Ok(oidc.redirect_uri.clone());
     }
     if let Ok(base) = st.public_base(headers, uri) {
         if !base.is_empty() {
@@ -222,7 +454,7 @@ async fn http_post_form(
     })
 }
 
-async fn load_discovery(st: &AppState) -> Result<DiscoveryDoc, &'static str> {
+async fn load_discovery(st: &AppState, oidc: &OidcConfig) -> Result<DiscoveryDoc, &'static str> {
     let now = now_unix();
     if let Some((at, doc)) = st.oidc_cache.lock().expect("oidc cache poisoned").discovery.clone() {
         if now - at < DISCOVERY_TTL_SECS {
@@ -231,7 +463,7 @@ async fn load_discovery(st: &AppState) -> Result<DiscoveryDoc, &'static str> {
     }
     let url = format!(
         "{}/.well-known/openid-configuration",
-        st.oidc.issuer_url.trim_end_matches('/')
+        oidc.issuer_url.trim_end_matches('/')
     );
     let body = http_get_json(st.transport.clone(), url).await?;
     let doc: DiscoveryDoc = serde_json::from_slice(&body).map_err(|_| "oidc_unavailable")?;
@@ -313,18 +545,19 @@ pub async fn oidc_login(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if !st.oidc.is_active() {
+    let oidc = st.current_oidc();
+    if !oidc.is_active() {
         return redirect_login_error(&st, &headers, &uri, "oidc_unavailable");
     }
     let ip = st.client_ip(peer.as_ref().map(|p| p.0 .0.ip()), &headers);
     if st.check_rate(&format!("oidc:{ip}"), 20, 60).is_err() {
         return (StatusCode::TOO_MANY_REQUESTS, "oidc_rate_limited").into_response();
     }
-    let doc = match load_discovery(&st).await {
+    let doc = match load_discovery(&st, &oidc).await {
         Ok(d) => d,
         Err(code) => return redirect_login_error(&st, &headers, &uri, code),
     };
-    let redirect_uri = match effective_redirect_uri(&st, &headers, &uri) {
+    let redirect_uri = match effective_redirect_uri(&oidc, &st, &headers, &uri) {
         Ok(u) => u,
         Err(code) => return redirect_login_error(&st, &headers, &uri, code),
     };
@@ -350,9 +583,9 @@ pub async fn oidc_login(
     auth_url
         .query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", &st.oidc.client_id)
+        .append_pair("client_id", &oidc.client_id)
         .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("scope", &st.oidc.scopes)
+        .append_pair("scope", &oidc.scopes)
         .append_pair("state", &state_val)
         .append_pair("nonce", &nonce_val)
         .append_pair("code_challenge", &challenge)
@@ -378,7 +611,8 @@ pub async fn oidc_callback(
     uri: Uri,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    if !st.oidc.is_active() {
+    let oidc = st.current_oidc();
+    if !oidc.is_active() {
         return redirect_login_error(&st, &headers, &uri, "oidc_unavailable");
     }
     let ip = st.client_ip(peer.as_ref().map(|p| p.0 .0.ip()), &headers);
@@ -405,7 +639,7 @@ pub async fn oidc_callback(
     if now_unix() - tx.created_at > OIDC_TX_TTL_SECS || !auth_core::ct_eq(&tx.state, incoming_state) {
         return redirect_login_error(&st, &headers, &uri, "oidc_state");
     }
-    let doc = match load_discovery(&st).await {
+    let doc = match load_discovery(&st, &oidc).await {
         Ok(d) => d,
         Err(code) => return redirect_login_error(&st, &headers, &uri, code),
     };
@@ -413,8 +647,8 @@ pub async fn oidc_callback(
         .append_pair("grant_type", "authorization_code")
         .append_pair("code", code)
         .append_pair("redirect_uri", &tx.redirect_uri)
-        .append_pair("client_id", &st.oidc.client_id)
-        .append_pair("client_secret", &st.oidc.client_secret)
+        .append_pair("client_id", &oidc.client_id)
+        .append_pair("client_secret", &oidc.client_secret)
         .append_pair("code_verifier", &tx.code_verifier)
         .finish();
     let body = match http_post_form(st.transport.clone(), doc.token_endpoint.clone(), form).await {
@@ -427,28 +661,28 @@ pub async fn oidc_callback(
     let Some(id_token) = tok.id_token.as_deref().filter(|s| !s.is_empty()) else {
         return redirect_login_error(&st, &headers, &uri, "oidc_exchange_failed");
     };
-    let configured_iss = st.oidc.issuer_url.trim_end_matches('/').to_string();
+    let configured_iss = oidc.issuer_url.trim_end_matches('/').to_string();
     let doc_iss = doc.issuer.trim_end_matches('/').to_string();
     let issuers = [configured_iss.as_str(), doc_iss.as_str()];
     let jwks = match load_jwks(&st, &doc.jwks_uri, false).await {
         Ok(j) => j,
         Err(code) => return redirect_login_error(&st, &headers, &uri, code),
     };
-    let claims = match verify_id_token_claims(id_token, &jwks, &issuers, &st.oidc.client_id, &tx.nonce) {
+    let claims = match verify_id_token_claims(id_token, &jwks, &issuers, &oidc.client_id, &tx.nonce) {
         Ok(c) => c,
         Err("oidc_unknown_kid") => {
             let fresh = match load_jwks(&st, &doc.jwks_uri, true).await {
                 Ok(j) => j,
                 Err(code) => return redirect_login_error(&st, &headers, &uri, code),
             };
-            match verify_id_token_claims(id_token, &fresh, &issuers, &st.oidc.client_id, &tx.nonce) {
+            match verify_id_token_claims(id_token, &fresh, &issuers, &oidc.client_id, &tx.nonce) {
                 Ok(c) => c,
                 Err(code) => return redirect_login_error(&st, &headers, &uri, code),
             }
         }
         Err(code) => return redirect_login_error(&st, &headers, &uri, code),
     };
-    let allowed = st.oidc.user_allowed(&[
+    let allowed = oidc.user_allowed(&[
         claims.preferred_username.as_deref(),
         claims.email.as_deref(),
         claims.sub.as_deref(),

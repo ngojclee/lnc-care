@@ -133,14 +133,26 @@ impl Vault {
     }
 
     /// HKDF-SHA256 subkey (`vault-kek`, `session-hmac`, `csrf`, `oidc-tx`, `api-key-pepper`, ...)
-    /// derived from `LNC_MASTER_KEY`; the raw master key never leaves the vault.
-    pub fn derive_key(&self, info: &str) -> [u8; 32] {
-        let hk = Hkdf::<Sha256>::new(None, &self.key);
+    /// derived from an explicit 32-byte master key; the raw master key never leaves the vault.
+    pub fn derive_key_for(master_key: &[u8; 32], info: &str) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(None, master_key);
         let mut out = [0u8; 32];
         let label = format!("lnc:lnc-care:{info}:v1");
         hk.expand(label.as_bytes(), &mut out)
             .expect("32-byte HKDF output is always valid");
         out
+    }
+
+    pub fn derive_key(&self, info: &str) -> [u8; 32] {
+        Self::derive_key_for(&self.key, info)
+    }
+
+    pub fn master_key_bytes(&self) -> &[u8; 32] {
+        &self.key
+    }
+
+    pub fn previous_key_bytes(&self) -> Option<&[u8; 32]> {
+        self.previous_key.as_ref()
     }
 
     fn open_with_key(
@@ -280,12 +292,97 @@ impl Vault {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn rewrap_envelope_with(
+        &self,
+        db: &Connection,
+        org: &str,
+        kind: &str,
+        subject: &str,
+        env_str: &str,
+        unwrap_key: &[u8; 32],
+        replacement_cipher: &Aes256Gcm,
+    ) -> Result<(), VaultError> {
+        // Verify full envelope integrity under `unwrap_key` first.
+        let _ = self.open_with_key(unwrap_key, org, kind, subject, env_str)?;
+        let mut item: Value = serde_json::from_str(env_str)
+            .map_err(|_| VaultError("Invalid envelope JSON".to_string()))?;
+        let aad = Self::aad(org, kind, subject);
+        let kn = B64
+            .decode(item["kn"].as_str().unwrap_or_default())
+            .map_err(|_| VaultError("Invalid nonce".to_string()))?;
+        let enc_key = B64
+            .decode(item["key"].as_str().unwrap_or_default())
+            .map_err(|_| VaultError("Invalid wrapped key".to_string()))?;
+        let unwrap_cipher = Aes256Gcm::new_from_slice(unwrap_key)
+            .map_err(|_| VaultError("Invalid master key".to_string()))?;
+        let data_key = unwrap_cipher
+            .decrypt(
+                Nonce::from_slice(&kn),
+                Payload {
+                    msg: &enc_key,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| VaultError("Failed to unwrap data key".to_string()))?;
+
+        let mut new_kn = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut new_kn);
+        let rewrapped = replacement_cipher
+            .encrypt(
+                Nonce::from_slice(&new_kn),
+                Payload {
+                    msg: &data_key,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| VaultError("Failed to rewrap data key".to_string()))?;
+
+        item["kn"] = Value::String(B64.encode(new_kn));
+        item["key"] = Value::String(B64.encode(rewrapped));
+        let updated_env = canonical_ascii_json(&item);
+        db.execute(
+            "UPDATE secret_envelopes SET envelope=?1 WHERE organization_id=?2 AND kind=?3 AND subject=?4",
+            params![updated_env, org, kind, subject],
+        )
+        .map_err(|e| VaultError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Automatic boot rotation: re-wraps any envelope still wrapped under `previous_key` onto `self.key`.
+    pub fn rewrap_from_previous(&self, db: &Connection, org: &str) -> Result<usize, VaultError> {
+        let Some(prev_key) = self.previous_key.as_ref() else {
+            return Ok(0);
+        };
+        if prev_key == &self.key {
+            return Ok(0);
+        }
+        let target_cipher = Aes256Gcm::new_from_slice(&self.key)
+            .map_err(|_| VaultError("Invalid current key".to_string()))?;
+        let mut stmt = db
+            .prepare("SELECT kind, subject, envelope FROM secret_envelopes WHERE organization_id=?1")
+            .map_err(|e| VaultError(e.to_string()))?;
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map(params![org], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| VaultError(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| VaultError(e.to_string()))?;
+
+        let mut rotated = 0usize;
+        for (kind, subject, env_str) in &rows {
+            if self.open_with_key(&self.key, org, kind, subject, env_str).is_ok() {
+                continue;
+            }
+            self.rewrap_envelope_with(db, org, kind, subject, env_str, prev_key, &target_cipher)?;
+            rotated += 1;
+        }
+        Ok(rotated)
+    }
+
     pub fn rewrap(&self, db: &Connection, org: &str, new_key_hex: &str) -> Result<usize, VaultError> {
         let replacement = parse_master_key(new_key_hex)?;
         let replacement_cipher = Aes256Gcm::new_from_slice(&replacement)
             .map_err(|_| VaultError("Invalid replacement key".to_string()))?;
-        let current_cipher = Aes256Gcm::new_from_slice(&self.key)
-            .map_err(|_| VaultError("Invalid current key".to_string()))?;
 
         let mut stmt = db
             .prepare("SELECT kind, subject, envelope FROM secret_envelopes WHERE organization_id=?1")
@@ -296,49 +393,23 @@ impl Vault {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| VaultError(e.to_string()))?;
 
-        let mut rng = rand::thread_rng();
         for (kind, subject, env_str) in &rows {
-            // Verify full envelope integrity first
-            let _ = self.open(org, kind, subject, env_str)?;
-            let mut item: Value = serde_json::from_str(env_str)
-                .map_err(|_| VaultError("Invalid envelope JSON".to_string()))?;
-            let aad = Self::aad(org, kind, subject);
-            let kn = B64
-                .decode(item["kn"].as_str().unwrap_or_default())
-                .map_err(|_| VaultError("Invalid nonce".to_string()))?;
-            let enc_key = B64
-                .decode(item["key"].as_str().unwrap_or_default())
-                .map_err(|_| VaultError("Invalid wrapped key".to_string()))?;
-            let data_key = current_cipher
-                .decrypt(
-                    Nonce::from_slice(&kn),
-                    Payload {
-                        msg: &enc_key,
-                        aad: &aad,
-                    },
-                )
-                .map_err(|_| VaultError("Failed to unwrap data key".to_string()))?;
-
-            let mut new_kn = [0u8; 12];
-            rng.fill_bytes(&mut new_kn);
-            let rewrapped = replacement_cipher
-                .encrypt(
-                    Nonce::from_slice(&new_kn),
-                    Payload {
-                        msg: &data_key,
-                        aad: &aad,
-                    },
-                )
-                .map_err(|_| VaultError("Failed to rewrap data key".to_string()))?;
-
-            item["kn"] = Value::String(B64.encode(new_kn));
-            item["key"] = Value::String(B64.encode(rewrapped));
-            let updated_env = canonical_ascii_json(&item);
-            db.execute(
-                "UPDATE secret_envelopes SET envelope=?1 WHERE organization_id=?2 AND kind=?3 AND subject=?4",
-                params![updated_env, org, kind, subject],
-            )
-            .map_err(|e| VaultError(e.to_string()))?;
+            let unwrap_key = if self.open_with_key(&self.key, org, kind, subject, env_str).is_ok() {
+                &self.key
+            } else if let Some(prev) = self.previous_key.as_ref() {
+                prev
+            } else {
+                &self.key
+            };
+            self.rewrap_envelope_with(
+                db,
+                org,
+                kind,
+                subject,
+                env_str,
+                unwrap_key,
+                &replacement_cipher,
+            )?;
         }
         Ok(rows.len())
     }

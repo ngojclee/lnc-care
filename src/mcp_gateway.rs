@@ -48,6 +48,8 @@ pub fn mcp_gateway_config(env: &HashMap<String, String>) -> Result<Option<McpGat
         .unwrap_or_default();
     let hub_url = env
         .get("LNC_AGENT_HUB_URL")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env.get("LNC_AGENTS_HUB_URL"))
         .map(|s| s.trim().trim_end_matches('/'))
         .unwrap_or_default();
     let gateway_url = if !raw_url.is_empty() {
@@ -67,6 +69,8 @@ pub fn mcp_gateway_config(env: &HashMap<String, String>) -> Result<Option<McpGat
     }
     let api_key = env
         .get("LNC_AGENT_HUB_API_KEY")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env.get("LNC_AGENTS_HUB_TOKEN"))
         .map(|s| s.trim())
         .unwrap_or_default()
         .to_string();

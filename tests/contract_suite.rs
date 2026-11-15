@@ -1010,10 +1010,17 @@ async fn test_static_blueprint_assets_icons_and_english_only_ui() {
     assert!(!login_html.contains("<script>"), "inline script blocked by CSP");
     assert!(!index_html.contains("<script>"), "inline script blocked by CSP");
     let js = c.get("/app.js").await.text();
+    let login_js = c.get("/login.js").await.text();
     assert!(js.contains("function enhanceSelect"));
     assert!(js.contains("enhanceAllSelects"));
 
-    let combined_ui = format!("{index_html}\n{login_html}\n{js}");
+    let combined_ui = format!("{index_html}\n{login_html}\n{js}\n{login_js}");
+    for forbidden in ["<select", "<datalist"] {
+        assert!(
+            !combined_ui.to_ascii_lowercase().contains(forbidden),
+            "Native {forbidden} tag must not exist in Blueprint v3.0 UI"
+        );
+    }
     for forbidden in [
         "label_vi",
         "Nên tư vấn",
